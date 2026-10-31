@@ -45,6 +45,13 @@ public:
     // Get hardware UUID seed for DNA binding
     static uint64_t get_hardware_uuid_seed() noexcept;
 
+    // Capability probe: true iff the environment permits mlock of `size`
+    // bytes (RLIMIT_MEMLOCK, container restrictions). Purely observational —
+    // locks and immediately unlocks a scratch page range, no arena touched.
+    // Tests use it to skip locked-arena coverage in restricted environments
+    // (CI containers); the arena constructor itself stays strict.
+    static bool mlock_supported(size_t size = DEFAULT_ARENA_SIZE) noexcept;
+
     // Initialize with user master key (XORed with hw_uuid)
     void initialize(uint64_t user_master_key);
 

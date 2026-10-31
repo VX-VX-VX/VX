@@ -19,6 +19,17 @@
 
 namespace vx::core {
 
+bool MemoryCore::mlock_supported(size_t size) noexcept {
+    if (size == 0) size = PAGE_SIZE;
+    size = ((size + 4095) / 4096) * 4096;
+    void* probe = aligned_alloc(4096, size);
+    if (!probe) return false;
+    const bool ok = (mlock(probe, size) == 0);
+    if (ok) munlock(probe, size);
+    free(probe);
+    return ok;
+}
+
 uint64_t MemoryCore::get_hardware_uuid_seed() noexcept {
     uint64_t seed = 0;
     std::ifstream cpuinfo("/proc/cpuinfo");

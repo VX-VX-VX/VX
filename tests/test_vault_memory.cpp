@@ -4,6 +4,10 @@
 #include <cstring>
 
 TEST(VortexVaultMemoryTest, PageStateTransitionsAndBurning) {
+    if (!vx::core::MemoryCore::mlock_supported()) {
+        GTEST_SKIP() << "mlock unavailable in this environment (CI container); "
+                        "locked-arena coverage requires RLIMIT_MEMLOCK >= arena size";
+    }
     vx::core::MemoryCore core(vx::core::MemoryCore::DEFAULT_ARENA_SIZE);
     core.initialize(0x123456789ABCDEF0ULL);
 
@@ -33,6 +37,10 @@ TEST(VortexVaultMemoryTest, HardwareUuidBindingSeed) {
 }
 
 TEST(VortexVaultMemoryTest, EmergencyBurnAll) {
+    if (!vx::core::MemoryCore::mlock_supported()) {
+        GTEST_SKIP() << "mlock unavailable in this environment (CI container); "
+                        "locked-arena coverage requires RLIMIT_MEMLOCK >= arena size";
+    }
     vx::core::MemoryCore core(vx::core::MemoryCore::DEFAULT_ARENA_SIZE);
     core.initialize(0x9999999999999999ULL);
 
