@@ -13,8 +13,49 @@
 #include <chrono>
 #include <ctime>
 #include <csignal>
+#include <cstdlib>
 #include <string>
 #include <vector>
+
+namespace {
+
+void print_usage() {
+    std::cout << R"(VX node — Vortex Sovereign OS (VX L1), experimental
+
+Usage:
+  vx_node [options] [rounds]
+
+Options:
+  --serve [PORT]     Run the node and serve the JSON RPC API
+                     (optional inline port; default 8088)
+  --port PORT        HTTP/RPC port (default 8088)
+  --p2p PORT         VX60 P2P wire protocol port (default 19088)
+  --peer HOST:PORT   Connect to a peer at startup (repeatable)
+  --data-dir DIR     Directory for chain data (default ./data)
+  -h, --help         Show this help and exit
+  -V, --version      Print version information and exit
+
+  rounds             Attractor rounds shown on the engine banner
+                     (default 1000)
+
+Without options the node runs the engine banner and benchmark loop.
+
+Examples:
+  vx_node --serve 8088 --port 8088 --data-dir ./data
+  vx_node --serve --p2p 19089 --peer 127.0.0.1:19088
+
+RPC endpoints (once serving): /api/status, /api/crypto/lab,
+/api/crypto/pq_sign, /api/crypto/pq_verify, /api/security/audit,
+/api/crypto/canonical.
+)" << "\n";
+}
+
+void print_version() {
+    std::cout << "VX node v0.0.1-alpha (Vortex Sovereign OS / VX L1)\n"
+              << "C++26, 3-Trunk Vortex Attractor, WOTS+/XMSS post-quantum layer\n";
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     bool serve_mode = false;
@@ -26,7 +67,13 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--serve") {
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        } else if (arg == "-V" || arg == "--version") {
+            print_version();
+            return 0;
+        } else if (arg == "--serve") {
             serve_mode = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 port = static_cast<uint16_t>(std::stoul(argv[++i]));
@@ -39,8 +86,18 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc) peer_endpoints.emplace_back(argv[++i]);
         } else if (arg == "--data-dir") {
             if (i + 1 < argc) data_dir = argv[++i];
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "vx_node: unknown option '" << arg << "'\n"
+                      << "Run 'vx_node --help' for usage.\n";
+            return 1;
         } else {
-            iterations = static_cast<uint32_t>(std::stoul(arg));
+            try {
+                iterations = static_cast<uint32_t>(std::stoul(arg));
+            } catch (const std::exception&) {
+                std::cerr << "vx_node: invalid argument '" << arg << "'\n"
+                          << "Run 'vx_node --help' for usage.\n";
+                return 1;
+            }
         }
     }
 
