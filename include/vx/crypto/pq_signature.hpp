@@ -103,8 +103,19 @@ PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
 // Pure WOTS+ + XMSS verification (no anchor): recomputes B from `msg`, walks
 // each chain forward 15 - B[i] steps, rebuilds the root through the auth path
 // and compares it with witness.pq_pubkey_root.
+//
+// Note on what this layer does NOT consume: subtree_index (signing-side
+// metadata) and witness_digest (the commitment). Both are bound at the
+// SegPQ anchor layer — pq_verify_transaction() recomputes the commitment
+// from the witness content and refuses a witness whose transported digest
+// field disagrees.
 bool pq_verify_wots_xmss(const std::array<uint8_t, 32>& msg,
                          const PqSignatureWitness& w) noexcept;
+
+// Recomputes the 256-bit witness commitment from the witness content. The
+// same sponge the signer runs; exposed so tests and tooling can check that
+// a transported witness_digest field matches the witness it travels with.
+std::array<uint8_t, 32> witness_commitment(const PqSignatureWitness& w) noexcept;
 
 // Full SegPQ verification: WOTS+/XMSS + the 256-bit anchor check against
 // tx.cocoon_proof (trunc12 of the VX_SEGPQ_ANCHOR_V1 binding).

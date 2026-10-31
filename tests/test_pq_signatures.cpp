@@ -12,6 +12,7 @@
 // real tripwire, not a no-op.
 #undef NDEBUG
 #include <cassert>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <unordered_set>
@@ -260,6 +261,108 @@ void test_sponge_kat_sac_collisions() {
     std::cout << "  ✓ 50 000 low-entropy inputs, zero collisions\n\n";
 }
 
+// ── TEST 7: negative-vector matrix (wycheproof-style) ────────────────────────
+// Two layers, because the two verify functions consume different fields:
+//   Layer A (pq_verify_wots_xmss): every byte of the signature-bearing
+//   region (pub_seed, root, 67 chains, auth path) must be tamper-evident;
+//   the 4-bit leaf domain is swept explicitly. The index header fields that
+//   this layer does not or only partially consume (subtree_index, the high
+//   bits of leaf_index) are asserted to PASS here and REJECT at layer B —
+//   the layering is documented, not hidden.
+//   Layer B (pq_verify_transaction): every byte of the WHOLE witness
+//   (including the index header and the transported witness_digest field)
+//   must be rejected — the verifier recomputes the commitment from the
+//   witness content, so no transported field is trusted.
+
+void test_negative_vector_matrix() {
+    std::cout << "[TEST 7] Negative-vector matrix: exhaustive witness mutations...\n";
+    const auto sk = test_msg("VX_PQ_TEST_MASTER_SK");
+    const auto seed = test_msg("VX_PQ_TEST_PUB_SEED");
+
+    // ── Layer A: pure WOTS+/XMSS ──
+    const auto msg = test_msg("VX_PQ_TEST_MESSAGE_07");
+    PqSignatureWitness w = pq_sign_message(5, 0, sk, seed, msg);
+    assert(pq_verify_wots_xmss(msg, w));
+
+    // The witness is a standard-layout POD with no padding (static_asserted
+    // by the header); byte offsets inside it are stable.
+    constexpr size_t kHeaderOff = offsetof(PqSignatureWitness, pub_seed);
+    constexpr size_t kDigestOff = offsetof(PqSignatureWitness, witness_digest);
+    const auto* base = reinterpret_cast<const uint8_t*>(&w);
+
+    // Layer A sweeps the signature-bearing region: pub_seed, root, 67 chains,
+    // auth path. The 8-byte index header (leaf_index, subtree_index) is
+    // handled explicitly below, not by byte-flips: the verifier normalizes
+    // leaf_index to its 4-bit domain and ignores subtree_index entirely —
+    // both header fields are bound at layer B via the recomputed commitment.
+    size_t mutations = 0, rejected = 0;
+    auto reject_wots = [&](const PqSignatureWitness& bad) {
+        ++mutations;
+        if (!pq_verify_wots_xmss(msg, bad)) ++rejected;
+    };
+    for (size_t byte = kHeaderOff; byte < kDigestOff; ++byte) {
+        for (const uint8_t mask : {uint8_t{0xFF}, uint8_t{0x01}}) {
+            PqSignatureWitness bad = w;
+            reinterpret_cast<uint8_t*>(&bad)[byte] = static_cast<uint8_t>(base[byte] ^ mask);
+            reject_wots(bad);
+        }
+    }
+    assert(mutations == rejected); // 100% of signature-region mutations rejected
+
+    // Leaf domain is exactly 4 bits: every wrong leaf label must be rejected,
+    // the honest one must verify.
+    for (uint32_t leaf = 0; leaf < XMSS_LEAVES; ++leaf) {
+        PqSignatureWitness bad = w;
+        bad.leaf_index = leaf;
+        if (leaf == 5) assert(pq_verify_wots_xmss(msg, bad));
+        else assert(!pq_verify_wots_xmss(msg, bad));
+    }
+
+    // Documented layering: header fields outside the 4-bit leaf domain are
+    // not consumed by pure WOTS+/XMSS — they pass here and must die at
+    // layer B, where the recomputed commitment binds the whole content.
+    // Byte 0 of leaf_index is the exception: its low nibble IS the leaf, so
+    // it is already covered by the 16-leaf domain sweep above.
+    for (size_t byte = 1; byte < kHeaderOff; ++byte) {
+        PqSignatureWitness bad = w;
+        reinterpret_cast<uint8_t*>(&bad)[byte] = static_cast<uint8_t>(base[byte] ^ 0xFF);
+        assert(pq_verify_wots_xmss(msg, bad)); // passes layer A by design...
+        // ...and must die at layer B below.
+    }
+
+    // ── Layer B: full SegPQ anchor over the whole 2376-byte witness ──
+    bc::Transaction tx = make_test_tx(5);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "PQNEGVEC_TEST_ACCOUNT_PQNEGVEC_TEST_ACC");
+    pq_sign_transaction(tx, sk);
+
+    bc::Transaction reg_tx{};
+    PqSignatureWitness rw{};
+    const auto msg_digest = tx_msg_digest(tx);
+    assert(PqWitnessRegistry::instance().lookup(msg_digest, rw));
+    assert(rw.witness_digest == witness_commitment(rw)); // signer/verifier agree
+
+    size_t b_mutations = 0, b_rejected = 0;
+    auto reject_tx = [&](const PqSignatureWitness& bad) {
+        ++b_mutations;
+        if (!pq_verify_transaction(tx, bad)) ++b_rejected;
+    };
+    for (size_t byte = 0; byte < sizeof(PqSignatureWitness); ++byte) {
+        for (const uint8_t mask : {uint8_t{0xFF}, uint8_t{0x01}}) {
+            PqSignatureWitness bad = rw;
+            reinterpret_cast<uint8_t*>(&bad)[byte] = static_cast<uint8_t>(
+                reinterpret_cast<const uint8_t*>(&rw)[byte] ^ mask);
+            reject_tx(bad);
+        }
+    }
+    assert(b_mutations == b_rejected); // 100% of whole-witness mutations rejected
+
+    std::cout << "  ✓ layer A: " << mutations << "/" << mutations
+              << " signature-region mutations rejected\n";
+    std::cout << "  ✓ layer A: subtree_index passes (by design), layer B rejects\n";
+    std::cout << "  ✓ layer B: " << b_mutations << "/" << b_mutations
+              << " whole-witness mutations rejected\n\n";
+}
+
 int main() {
     std::cout << "================================================================\n";
     std::cout << "  VX PHASE 46: PQ HASH-BASED SIGNATURES (WOTS+/XMSS) TEST SUITE\n";
@@ -271,6 +374,7 @@ int main() {
     test_tamper_chains_and_merkle_path();
     test_vault_burn();
     test_sponge_kat_sac_collisions();
+    test_negative_vector_matrix();
 
     std::cout << "================================================================\n";
     std::cout << "  ALL PQ SIGNATURE TESTS PASSED — SHOR-VULNERABLE OPS: 0        \n";

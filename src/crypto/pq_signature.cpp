@@ -180,6 +180,32 @@ std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
 
 // ── Sign / verify ────────────────────────────────────────────────────────────
 
+namespace {
+
+// 256-bit witness commitment over the witness CONTENT (streamed — 2362 bytes
+// of preimage). Shared by the signer and the verifier: a digest that only
+// the signer computes would be a transported, attacker-writable field; a
+// recomputed one binds the anchor to what is actually being verified.
+std::array<uint8_t, 32> compute_witness_digest(const PqSignatureWitness& w) noexcept {
+    Sponge ws;
+    ws.absorb(reinterpret_cast<const uint8_t*>("VX_SEGPQ_WITNESS_V1"), 18);
+    ws.absorb_obj(w.leaf_index);
+    ws.absorb_obj(w.subtree_index);
+    ws.absorb(w.pub_seed.data(), 32);
+    ws.absorb(w.pq_pubkey_root.data(), 32);
+    for (size_t i = 0; i < WOTS_CHAINS; ++i) ws.absorb(w.wots_sig[i].data(), 32);
+    for (size_t i = 0; i < XMSS_H; ++i) ws.absorb(w.auth_path[i].data(), 32);
+    std::array<uint8_t, 32> out{};
+    ws.finalize(out.data());
+    return out;
+}
+
+} // namespace
+
+std::array<uint8_t, 32> witness_commitment(const PqSignatureWitness& w) noexcept {
+    return compute_witness_digest(w);
+}
+
 PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
                                    const std::array<uint8_t, 32>& master_sk,
                                    const std::array<uint8_t, 32>& pub_seed,
@@ -234,15 +260,7 @@ PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
     }
 
     // 256-bit witness commitment (streamed — 2362 bytes of preimage).
-    Sponge ws;
-    ws.absorb(reinterpret_cast<const uint8_t*>("VX_SEGPQ_WITNESS_V1"), 18);
-    ws.absorb_obj(w.leaf_index);
-    ws.absorb_obj(w.subtree_index);
-    ws.absorb(w.pub_seed.data(), 32);
-    ws.absorb(w.pq_pubkey_root.data(), 32);
-    for (size_t i = 0; i < WOTS_CHAINS; ++i) ws.absorb(w.wots_sig[i].data(), 32);
-    for (size_t i = 0; i < XMSS_H; ++i) ws.absorb(w.auth_path[i].data(), 32);
-    ws.finalize(w.witness_digest.data());
+    w.witness_digest = compute_witness_digest(w);
     return w;
 }
 
@@ -268,7 +286,11 @@ bool pq_verify_wots_xmss(const std::array<uint8_t, 32>& msg,
     std::array<uint8_t, 32> cur{};
     ls.finalize(cur.data());
 
-    size_t idx = w.leaf_index;
+    // The leaf domain is exactly 4 bits (global_leaf = subtree << H | leaf).
+    // Normalize here so verification is spec-exact: the auth-path walk
+    // itself only consumes the low 4 bits, and unnormalized high bits made
+    // leaf_index mutations in those bytes invisible to this layer.
+    size_t idx = w.leaf_index & (XMSS_LEAVES - 1);
     for (size_t lvl = 0; lvl < XMSS_H; ++lvl) {
         const size_t sib_idx = (idx & 1) ? idx - 1 : idx + 1;
         const std::array<uint8_t, 32>& left = (idx & 1) ? w.auth_path[lvl] : cur;
@@ -284,12 +306,20 @@ bool pq_verify_transaction(const Transaction& tx, const PqSignatureWitness& w) n
     const auto msg = tx_msg_digest(tx);
     if (!pq_verify_wots_xmss(msg, w)) return false;
 
+    // Recompute the witness commitment from the witness CONTENT and refuse
+    // any witness whose transported digest field disagrees with it — that
+    // field crosses the wire, so it is attacker-writable; the recomputed
+    // one is not. This also closes subtree_index, which pure WOTS+/XMSS
+    // verification does not consume: lying metadata now breaks the anchor.
+    const std::array<uint8_t, 32> digest = compute_witness_digest(w);
+    if (digest != w.witness_digest) return false;
+
     // Anchor: cocoon_proof must be trunc12(Sponge("VX_SEGPQ_ANCHOR_V1" || msg || root || witness_digest)).
     PreimageBuf a; // 18 + 32*3 = 114 bytes, fits
     a.put_str("VX_SEGPQ_ANCHOR_V1", 18);
     a.put(msg.data(), 32);
     a.put(w.pq_pubkey_root.data(), 32);
-    a.put(w.witness_digest.data(), 32);
+    a.put(digest.data(), 32);
     std::array<uint8_t, 32> full_tag{};
     sponge(a.b.data(), a.n, full_tag.data());
     return std::memcmp(full_tag.data(), tx.cocoon_proof, 12) == 0;

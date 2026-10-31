@@ -1,6 +1,6 @@
 # VX L1 — Vortex Sovereign OS: Technical Whitepaper
 
-**Version:** 6.1 (aligned with public release `v0.0.1-alpha`)
+**Version:** 6.2 (negative-vector matrix, verification-trust model)
 **Date:** 2026-11-01
 **License:** AGPLv3 + Cypherpunk Clause (see [LICENSE](LICENSE))
 **Implementation:** C++26, GCC 15/16, GMP; this document describes the code
@@ -709,6 +709,55 @@ keyed ARX+Galois tag binding the frame to its witness. Verification:
 A PQ-backed sender without a matching witness is rejected outright — the
 chain never falls back to "checksum-only" acceptance.
 
+### 9.5 What verification trusts — and what it recomputes
+
+Verification is layered, and the layers consume different fields. Stating
+this explicitly is cheaper than pretending a single check covers everything:
+
+**Layer A — pure WOTS+/XMSS (`pq_verify_wots_xmss`).** Recomputes the base
+vector B from M, walks every chain forward, recompresses the leaf, walks
+the authentication path and compares against the witness's `pq_pubkey_root`.
+This layer consumes: the 67 chains, the auth path, `pub_seed`, and the
+**4-bit leaf domain** of `leaf_index` (the walk itself cannot see more than
+4 bits, so the verifier normalizes `leaf_index & 15` — an unnormalized
+implementation would silently ignore mutations in the high bytes). It does
+*not* consume `subtree_index` or the transported `witness_digest` — by
+design: they are not needed to decide "is this a valid signature".
+
+**Layer B — the SegPQ anchor (`pq_verify_transaction`).** Recomputes the
+256-bit witness commitment **from the witness content** — the same sponge
+the signer ran — and refuses any witness whose transported `witness_digest`
+field disagrees. Only then is the anchor checked. This is what makes the
+whole 2376-byte structure tamper-evident: a digest that merely travelled
+next to the witness would be attacker-writable; a recomputed one is not.
+
+**Every transported field is recomputed or checked against a recomputed
+value. Nothing is trusted because it arrived.**
+
+**Negative vectors.** The property is tested exhaustively, not sampled:
+every single byte of the witness is flipped (two bit-masks per byte) and
+every mutation must be rejected — 4672 mutations at layer A, 4752 at
+layer B, 16 leaf-domain relabelings, 100% rejection. The numbers and the
+two real defects this matrix exposed (and fixed) are in Section 16.
+
+**Where this sits among standardized schemes.** For scale, not as a claim
+of superiority:
+
+| Scheme | Basis | Signature | Public key | Status |
+|---|---|---|---|---|
+| SLH-DSA-SHA2-128s (FIPS-205) | hash-based | 7 856 B | 32 B | NIST standard, analyzed |
+| SLH-DSA-SHA2-128f (FIPS-205) | hash-based | 17 088 B | 32 B | NIST standard, analyzed |
+| ML-DSA-44 (FIPS-204) | lattice | 2 420 B | 1 312 B | NIST standard, analyzed |
+| Falcon-512 (Round 3) | lattice | 666 B | 897 B | submitted, analyzed |
+| **VX WOTS+/XMSS (w=16, H=4)** | hash-based | **2 376 B** | 32 B root | custom, **unaudited** |
+
+The compact witness is a consequence of deliberately minimal parameters —
+one subtree of 16 leaves, 4-bit chains — traded against a smaller security
+margin and the one-time discipline of Section 9.4. It is **not** a better
+construction than FIPS-205; it is a smaller one that fits the SegPQ frame
+economics. Independent review of this exact wiring is the single most
+important open item (Section 15, and ROADMAP item 4).
+
 ---
 
 ## 10. Consensus
@@ -990,6 +1039,31 @@ little-endian builds; serialization conventions of Section 3.1 pin it.
 
 **SAC probe.** `/api/crypto/canonical` exposes the single-bit-flip
 avalanche trace (Section 6) for the canonical seed.
+
+**Negative vectors (wycheproof-style).** Positive vectors only prove an
+implementation agrees with itself. The witness verification is therefore
+tested against exhaustive *negative* vectors: every byte of a signed
+witness is flipped in turn (bit-masks `0xFF` and `0x01`), plus a full sweep
+of the 4-bit leaf domain, and **every** mutation must be rejected:
+
+| Matrix | Mutations | Rejected |
+|---|---|---|
+| Layer A — signature region (pub_seed, root, 67 chains, auth path) | 4 672 | 4 672 (100%) |
+| Layer A — leaf domain (all 16 leaf labels, honest one excluded) | 15 | 15 (100%) |
+| Layer B — whole 2376-byte witness incl. index header and digest field | 4 752 | 4 752 (100%) |
+
+Reproduce with `ctest -R VortexPqSignatureTest` — the matrix is TEST 7 of
+the suite and prints its own counts.
+
+These vectors are not decorative: building them exposed two real defects,
+both fixed. First, the verifier consumed `leaf_index` unnormalized while
+the auth-path walk only sees 4 bits, so mutations in the high bytes were
+invisible at layer A — the verifier now normalizes `leaf_index & 15`.
+Second, the SegPQ anchor trusted the *transported* `witness_digest` field
+instead of recomputing it from the witness content, so lying metadata
+passed the anchor; the verifier now recomputes the commitment and refuses
+a disagreeing witness. Both are exactly the class of bug that positive
+vectors cannot catch.
 
 ---
 
