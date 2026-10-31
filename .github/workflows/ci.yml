@@ -81,6 +81,8 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang++ -DVX_BUILD_FUZZERS=ON
       - name: Build
         run: cmake --build build -j"$(nproc)"
+      - name: Prepare corpus directory
+        run: mkdir -p /tmp/vx_corpus
       - name: Fuzz block frame parsing
         run: >
           ./build/fuzz_block_frame -runs=100000 -max_len=70000 -seed=1
