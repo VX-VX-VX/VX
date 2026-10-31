@@ -1,5 +1,9 @@
 # VX — Vortex Sovereign OS (VX L1)
 
+> **New to VX?** Start with [The Vortex Challenge](docs/CHALLENGE.md) —
+> four levels from "it compiles" to "I rebuilt the consensus core from the
+> whitepaper alone".
+
 ![language](https://img.shields.io/badge/C%2B%2B-26-blue)
 [![CI](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml/badge.svg)](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-AGPLv3%20%2B%20clause-lightgrey)
