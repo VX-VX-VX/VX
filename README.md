@@ -90,7 +90,12 @@ Merkle tree**, hash-keyed by VortexSponge256:
 
 The defense is layered, not single-point: a MITM that recomputes the keyless
 checksum still has to forge the full Winternitz checksum chain **and** the
-XMSS Merkle path.
+XMSS Merkle path. And verification trusts nothing that merely *arrived* —
+every consumed field is recomputed, and the witness is tested against an
+exhaustive negative-vector matrix (every byte flipped: 9 439 mutations,
+100 % rejected). The trust model and the size trade-off against
+SLH-DSA / ML-DSA / Falcon are laid out in
+[whitepaper §9.5](WHITEPAPER_V6.md#95-what-verification-trusts--and-what-it-recomputes).
 
 Signing flow — the witness is *detached* from the transaction frame:
 
