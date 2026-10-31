@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability (private)
+    url: https://github.com/VX-VX-VX/VX/security/advisories/new
+    about: Please report security issues privately — never in a public issue. See SECURITY.md for scope and expectations.
+  - name: Questions & discussion
+    url: https://github.com/VX-VX-VX/VX/discussions
+    about: For "how does X work" questions, use Discussions instead of opening an issue.

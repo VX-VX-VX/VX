@@ -1,0 +1,64 @@
+name: Bug report
+description: Something builds wrong, crashes, or behaves against the spec
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing VX. Before filing: build a fresh clone, run
+        `ctest --output-on-failure`, and check whether the failure survives
+        that. Two locked-arena suites legitimately SKIP in containers
+        without `RLIMIT_MEMLOCK` — a SKIP is not a bug.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, what did you see instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Exact commands, input files, or RPC transcript starting from a fresh clone.
+      placeholder: |
+        git clone … && cd VX
+        cmake -S . -B build -G Ninja && cmake --build build -j
+        ./build/vx_node --data-dir /tmp/vxtest …
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Compiler and version, OS, CPU arch, and any non-default flags.
+      placeholder: GCC 16.1.1, Arch Linux x86-64, default flags
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Commit hash
+      description: git rev-parse HEAD of the build you tested
+    validations:
+      required: true
+
+  - type: textarea
+    id: ctest
+    attributes:
+      label: ctest output
+      description: Paste the relevant tail of `ctest --output-on-failure` if tests are involved.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: This reproduces from a fresh clone (no local modifications)
+          required: true
+        - label: This is not a security vulnerability (those go to private reporting)
+          required: true

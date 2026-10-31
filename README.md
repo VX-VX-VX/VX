@@ -1,7 +1,7 @@
 # VX — Vortex Sovereign OS (VX L1)
 
 ![language](https://img.shields.io/badge/C%2B%2B-26-blue)
-![build](https://img.shields.io/badge/build-CMake%20%2B%20Ninja-green)
+[![CI](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml/badge.svg)](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-AGPLv3%20%2B%20clause-lightgrey)
 ![tests](https://img.shields.io/badge/ctest-16%2F16-brightgreen)
 

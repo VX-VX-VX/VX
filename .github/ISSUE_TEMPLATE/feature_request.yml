@@ -1,0 +1,30 @@
+name: Feature request / research direction
+description: A capability, protocol change, or research question you want VX to address
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What can you not do today? Link the relevant whitepaper section if the proposal touches consensus, crypto or frame formats.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed direction
+      description: What should happen, concretely?
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Consensus impact
+      description: Proposals that change deterministic output (genesis, hashes, frame layouts) need a documented reason and will be discussed slowly.
+      options:
+        - label: This would change consensus-visible behavior (hashes, formats, rules)
