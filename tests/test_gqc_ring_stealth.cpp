@@ -43,8 +43,8 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
         std::array<uint8_t, 384> coords{};
         builder.set_attractor_coords(coords.data());
         vx::blockchain::Transaction mint{};
-        std::memcpy(mint.sender_nfa, "MINER_GQC_TEST_000000000000000000000000000", 42);
-        std::memcpy(mint.receiver_nfa, "GQC_TEST_RECV_0000000000000000000000000000", 42);
+        vx::blockchain::set_nfa_field(mint.sender_nfa, "MINER_GQC_TEST_000000000000000000000000000");
+        vx::blockchain::set_nfa_field(mint.receiver_nfa, "GQC_TEST_RECV_0000000000000000000000000000");
         vx::blockchain::tx_set_amount(mint, 1'000'000);
         vx::blockchain::tx_set_fee(mint, 100);
         vx::blockchain::sign_transaction(mint);
@@ -143,8 +143,8 @@ namespace {
 Transaction ring_tx(uint32_t fee, uint64_t amount, uint32_t nonce) {
     Transaction tx{};
     std::memset(&tx, 0, sizeof(tx));
-    std::memcpy(tx.sender_nfa, "RING_PIPELINE_TEST_SENDER_000000000000000000", 42);
-    std::memcpy(tx.receiver_nfa, "RING_PIPELINE_TEST_RECV_00000000000000000000", 42);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "RING_PIPELINE_TEST_SENDER_0000000000000000");
+    vx::blockchain::set_nfa_field(tx.receiver_nfa, "RING_PIPELINE_TEST_RECV_000000000000000000");
     vx::blockchain::tx_set_amount(tx, amount);
     vx::blockchain::tx_set_fee(tx, fee);
     vx::blockchain::tx_set_nonce(tx, nonce);
@@ -235,7 +235,7 @@ TEST(VortexGqcRingStealthTest, StealthEnvelopeOneOfSixteen) {
     std::vector<std::array<uint8_t, 42>> decoys;
     for (int i = 0; i < 15; ++i) {
         std::array<uint8_t, 42> d{};
-        std::memcpy(d.data(), "LEDGER_DECOY_ADDR_0000000000000000000000000000", 42);
+        vx::blockchain::set_nfa_field(d, "LEDGER_DECOY_ADDR_000000000000000000000000");
         d[18] = static_cast<uint8_t>(i);
         decoys.push_back(d);
     }
@@ -249,7 +249,7 @@ TEST(VortexGqcRingStealthTest, StealthEnvelopeOneOfSixteen) {
 
     // Stamp the envelope into a transaction and hide it among 579 noise txs.
     Transaction stealth{};
-    std::memcpy(stealth.sender_nfa, "STEALTH_TEST_SENDER_00000000000000000000000", 42);
+    vx::blockchain::set_nfa_field(stealth.sender_nfa, "STEALTH_TEST_SENDER_0000000000000000000000");
     vx::blockchain::tx_set_amount(stealth, 999'999);
     vx::blockchain::tx_set_fee(stealth, 750);
     stamp_stealth_envelope(env, stealth);
@@ -258,8 +258,8 @@ TEST(VortexGqcRingStealthTest, StealthEnvelopeOneOfSixteen) {
     std::mt19937 rng(0xFEED);
     for (auto& tx : block) {
         std::memset(&tx, 0, sizeof(tx));
-        std::memcpy(tx.sender_nfa, "NOISE_SENDER_0000000000000000000000000000000", 42);
-        std::memcpy(tx.receiver_nfa, "NOISE_RECV_00000000000000000000000000000000", 42);
+        vx::blockchain::set_nfa_field(tx.sender_nfa, "NOISE_SENDER_00000000000000000000000000000");
+        vx::blockchain::set_nfa_field(tx.receiver_nfa, "NOISE_RECV_0000000000000000000000000000000");
         tx.receiver_nfa[9] = static_cast<uint8_t>(rng() & 0xFF);
         vx::blockchain::tx_set_amount(tx, rng());
         vx::blockchain::tx_set_fee(tx, 300);

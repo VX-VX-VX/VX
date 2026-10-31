@@ -11,7 +11,7 @@
 namespace vx::state {
 
 UndoEngine::UndoEngine(const std::string& data_dir, storage::BlockStore& store, LedgerState& ledger)
-    : data_dir_(data_dir), store_(store), ledger_(ledger) {
+    : data_dir_(data_dir), store_(&store), ledger_(ledger) {
     // Ensure undo directory exists
     std::filesystem::path undo_path = std::filesystem::path(data_dir_) / "undo";
     std::filesystem::create_directories(undo_path);
@@ -30,14 +30,15 @@ void UndoEngine::apply_block(const blockchain::BlockView& block) {
     record.height = block.header().block_height;
     record.timestamp = std::chrono::system_clock::now();
     uint8_t tip_hash[32];
-    store_.tip_hash(tip_hash);
+    store_->tip_hash(tip_hash);
     record.prev_tip_hash = std::string(reinterpret_cast<const char*>(tip_hash), 32);
     record.prev_supply = ledger_.total_supply();
     record.prev_accounts_count = ledger_.accounts().size();
 
     // Record transaction effects
+    if (block.header().tx_count > blockchain::MAX_TX_PER_BLOCK) return; // malformed frame: nothing to record
     for (uint32_t i = 0; i < block.header().tx_count; ++i) {
-        auto* raw = store_.get_block(record.height);
+        auto* raw = store_->get_block(record.height);
         if (!raw) break;
         blockchain::BlockView v{std::span<const uint8_t, 65536>(reinterpret_cast<const uint8_t*>(raw), 65536)};
         const auto& tx = v.tx(i);

@@ -104,7 +104,7 @@ void test_mitm_keyless_recalculation_rejected() {
     std::cout << "[TEST 3] MITM keyless rehash rejected by SegPQ registry...\n";
     const auto sk = test_msg("VX_PQ_TEST_MASTER_SK");
     bc::Transaction tx = make_test_tx(5);
-    std::memcpy(tx.sender_nfa, "PQSENDER_TEST_ACCOUNT_PQSENDER_TEST_ACCOUNT_P", 42);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "PQSENDER_TEST_ACCOUNT_PQSENDER_TEST_ACCOUN");
 
     pq_sign_transaction(tx, sk);
     assert(verify_transaction_proof(tx)); // honest PQ-signed tx passes
@@ -163,7 +163,7 @@ void test_vault_burn() {
     std::cout << "[TEST 5] Vault ephemeral PQ sign burns secret material...\n";
     const auto sk = test_msg("VX_PQ_TEST_MASTER_SK");
     bc::Transaction tx = make_test_tx(9);
-    std::memcpy(tx.sender_nfa, "PQBURN_TEST_ACCOUNT_PQBURN_TEST_ACCOUNT_PQBU", 42);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "PQBURN_TEST_ACCOUNT_PQBURN_TEST_ACCOUNT_PQ");
 
     PqSignTimings t;
     pq_sign_transaction(tx, sk, &t);

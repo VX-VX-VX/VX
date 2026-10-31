@@ -5,6 +5,7 @@ namespace vx::math {
 
 static inline uint64_t rotl64(uint64_t val, int shift) {
     shift &= 63;
+    if (shift == 0) return val; // shift by 64 would be UB
     return (val << shift) | (val >> (64 - shift));
 }
 

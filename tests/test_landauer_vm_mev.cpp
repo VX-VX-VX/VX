@@ -160,8 +160,8 @@ vx::blockchain::Transaction make_test_tx(uint64_t amount, uint32_t fee, uint32_t
     vx::blockchain::Transaction tx{};
     std::memset(tx.sender_nfa, 0, 42);
     std::memset(tx.receiver_nfa, 0, 42);
-    std::memcpy(tx.sender_nfa, "TEST_SENDER_DANDELION_ROUTE_0000000000000", 42);
-    std::memcpy(tx.receiver_nfa, "TEST_RECEIVER_DANDELION_ROUTE_000000000000", 42);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "TEST_SENDER_DANDELION_ROUTE_0000000000000");
+    vx::blockchain::set_nfa_field(tx.receiver_nfa, "TEST_RECEIVER_DANDELION_ROUTE_000000000000");
     vx::blockchain::tx_set_amount(tx, amount);
     vx::blockchain::tx_set_fee(tx, fee);
     vx::blockchain::tx_set_nonce(tx, nonce);

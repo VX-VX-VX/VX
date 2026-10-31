@@ -8,7 +8,7 @@ on:
 
 jobs:
   core:
-    name: C++ core (${{ matrix.edition }})
+    name: C++ core (${{ matrix.edition }}, ${{ matrix.compiler }})
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
@@ -16,12 +16,23 @@ jobs:
       fail-fast: false
       matrix:
         edition: [public, vault]
+        compiler: [gcc, clang]
+        exclude:
+          # the Vault edition ships one compiler lane; keep CI cost sane
+          - edition: vault
+            compiler: clang
     steps:
       - name: Install toolchain
         run: |
           pacman -Syu --noconfirm --needed \
-            git cmake ninja gcc gmp openssl python gtest nodejs npm
+            git cmake ninja gcc clang gmp openssl python gtest nodejs npm
       - uses: actions/checkout@v4
+      - name: Select compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang" >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          fi
       - name: Configure (Public Core)
         if: matrix.edition == 'public'
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -32,6 +43,56 @@ jobs:
         run: cmake --build build -j"$(nproc)"
       - name: Run test suite
         run: cd build && ctest --output-on-failure
+
+  sanitizers:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja gcc gmp openssl python gtest
+      - uses: actions/checkout@v4
+      - name: Configure with ASan + UBSan
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -g -O1"
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Run test suite under sanitizers
+        run: cd build && ctest --output-on-failure
+
+  fuzz:
+    name: Fuzzing (libFuzzer, Clang)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja clang gmp openssl python gtest
+      - uses: actions/checkout@v4
+      - name: Configure fuzzers
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=clang++ -DVX_BUILD_FUZZERS=ON
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Fuzz block frame parsing
+        run: >
+          ./build/fuzz_block_frame -runs=100000 -max_len=70000 -seed=1
+          -rss_limit_mb=2560 -timeout=25 /tmp/vx_corpus
+      - name: Fuzz PQ witness verification
+        run: >
+          ./build/fuzz_pq_witness -runs=20000 -max_len=2500 -seed=1
+          -rss_limit_mb=2560 -timeout=25 /tmp/vx_corpus
+      - name: Fuzz VX60 wire ingest
+        run: >
+          ./build/fuzz_wire -runs=200000 -max_len=70000 -seed=1
+          -rss_limit_mb=2560 -timeout=25 /tmp/vx_corpus
 
   web:
     name: Web console

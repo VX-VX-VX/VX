@@ -30,6 +30,12 @@ public:
     UndoEngine(const std::string& data_dir, storage::BlockStore& store, LedgerState& ledger);
     ~UndoEngine();
 
+    // Re-point the journal at a reopened block store. The chain can close
+    // and reopen its store file (e.g. ledger truncation during a reorg)
+    // while the journal object — and its in-memory state — must survive;
+    // a reference member would silently dangle across that reopen.
+    void attach_store(storage::BlockStore& store) noexcept { store_ = &store; }
+
     // Delete copy/move
     UndoEngine(const UndoEngine&) = delete;
     UndoEngine& operator=(const UndoEngine&) = delete;
@@ -63,7 +69,7 @@ public:
 
 private:
     std::string data_dir_;
-    storage::BlockStore& store_;
+    storage::BlockStore* store_;
     LedgerState& ledger_;
     std::filesystem::path undo_file_;
     std::vector<UndoRecord> undo_journal_;

@@ -7,6 +7,29 @@
 
 namespace vx::blockchain {
 
+// ── fixed-field tag copy ─────────────────────────────────────────────────────
+// Copy a string-literal tag into a fixed 42-byte NFA field: the tag is
+// copied whole (NUL excluded), the tail is zero-padded, and tags longer
+// than the field are rejected at compile time. This replaces the raw
+// memcpy(field, "tag", 42) pattern whose literal lengths silently
+// under-ran the field (reading past the literal — the global-buffer-
+// overflow Clang/ASan flagged in CI) or over-ran it.
+template <size_t N, size_t M>
+inline void set_nfa_field(uint8_t (&dst)[N], const char (&src)[M]) {
+    static_assert(M - 1 <= N, "tag does not fit the fixed NFA field");
+    constexpr size_t len = M - 1; // exclude the terminating NUL
+    std::memcpy(dst, src, len);
+    std::memset(dst + len, 0, N - len);
+}
+
+template <size_t N, size_t M>
+inline void set_nfa_field(std::array<uint8_t, N>& dst, const char (&src)[M]) {
+    static_assert(M - 1 <= N, "tag does not fit the fixed NFA field");
+    constexpr size_t len = M - 1;
+    std::memcpy(dst.data(), src, len);
+    std::memset(dst.data() + len, 0, N - len);
+}
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 inline constexpr uint32_t BLOCK_MAGIC        = 0x58564336; // "VXC6" little-endian

@@ -131,8 +131,8 @@ std::vector<RdtscSample> RdtscProfiler::run_full_profile() const {
         vault.initialize(0xC17ADE1ULL);
         out.push_back(profile("vault_ephemeral_sign_and_burn", iters_.vault, [&] {
             blockchain::Transaction tx{};
-            std::memcpy(tx.sender_nfa, "PROFILER_VAULT_SENDER_000000000000000000", 42);
-            std::memcpy(tx.receiver_nfa, "PROFILER_VAULT_RECV_0000000000000000000", 42);
+            vx::blockchain::set_nfa_field(tx.sender_nfa, "PROFILER_VAULT_SENDER_000000000000000000");
+            vx::blockchain::set_nfa_field(tx.receiver_nfa, "PROFILER_VAULT_RECV_0000000000000000000");
             blockchain::sign_transaction(tx);
             const auto rep = vault.sign_ephemeral_in_vault(tx);
             sink(rep.key_lifetime_rdtsc_cycles);

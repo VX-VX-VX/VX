@@ -545,9 +545,9 @@ struct SimNode {
             store->tip_hash(tip);
 
             Transaction cb{};
-            std::memcpy(cb.sender_nfa, "MINER_", 6);
+            vx::blockchain::set_nfa_field(cb.sender_nfa, "MINER_");
             for (size_t k = 6; k < 42; ++k) cb.sender_nfa[k] = '0';
-            std::memcpy(cb.receiver_nfa, "MINER_REWARD_ADDR_SPLIT_BRAIN_SIM", 35);
+            vx::blockchain::set_nfa_field(cb.receiver_nfa, "MINER_REWARD_ADDR_SPLIT_BRAIN_SIM");
             for (size_t k = 35; k < 42; ++k) cb.receiver_nfa[k] = '0';
             blockchain::tx_set_amount(cb, 1'000'000ULL * (h + 1)); // distinct per height
             blockchain::sign_transaction(cb);
@@ -785,6 +785,9 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             node_a.store.reset(); // close mmap/fd
             std::filesystem::resize_file(base + "/node_a/ledger.vxb", SB_BLOCK_BYTES);
             node_a.store = std::make_unique<BlockStore>(base + "/node_a/ledger.vxb", genesis_path);
+            // The journal survived the rollback; re-point it at the reopened
+            // store (its old reference died with store.reset() above).
+            node_a.undo->attach_store(*node_a.store);
 
             // 3c. Node A applies B's 4 blocks (received over VX60).
             for (uint64_t h = 1; h <= report.node_b_height; ++h) {

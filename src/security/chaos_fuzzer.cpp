@@ -101,8 +101,8 @@ void fuzz_frames(Rng& rng, uint64_t mutations, ChaosReport& rep) {
             }
             case 1: { // UINT64_MAX amount / fee must not trap or wrap fatally
                 Transaction tx{};
-                std::memcpy(tx.sender_nfa, "CHAOS_MAX_SENDER_000000000000000000000000", 42);
-                std::memcpy(tx.receiver_nfa, "CHAOS_MAX_RECV_0000000000000000000000000", 42);
+                vx::blockchain::set_nfa_field(tx.sender_nfa, "CHAOS_MAX_SENDER_000000000000000000000000");
+                vx::blockchain::set_nfa_field(tx.receiver_nfa, "CHAOS_MAX_RECV_0000000000000000000000000");
                 tx_set_amount(tx, UINT64_MAX);
                 tx_set_fee(tx, UINT32_MAX); // fee is uint32_t: overflow boundary
                 volatile uint64_t sink = tx_fee(tx) + 1;
@@ -137,7 +137,7 @@ void fuzz_frames(Rng& rng, uint64_t mutations, ChaosReport& rep) {
 // ── Surface 3: VortexVM random bytecodes ────────────────────────────────────
 void fuzz_vm(Rng& rng, uint64_t mutations, ChaosReport& rep) {
     using namespace vx::vm;
-    constexpr size_t kCodeLen = 128; // well inside BYTECODE_MAX_SIZE
+    constexpr size_t kCodeLen = VortexVM::BYTECODE_MAX_SIZE; // full 56-byte space
 
     for (uint64_t m = 0; m < mutations; ++m) {
         std::array<uint8_t, VortexVM::BYTECODE_MAX_SIZE> code{};

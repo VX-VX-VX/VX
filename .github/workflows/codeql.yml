@@ -1,0 +1,39 @@
+# CodeQL static analysis for the C++ core and the web console.
+# Findings policy: every alert is either fixed or explicitly documented as
+# a false positive — never silenced without a written reason (ROADMAP item 4).
+name: CodeQL
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: '0 6 * * 1' # weekly, Monday 06:00 UTC
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [cpp, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+      - name: Build C++ core (autobuild cannot infer the CMake26 toolchain deps)
+        if: matrix.language == 'cpp'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev ninja-build
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"

@@ -24,6 +24,10 @@ static void hash_pair(const uint8_t left[32], const uint8_t right[32], uint8_t o
 
 void BlockBuilder::compute_merkle_root() noexcept {
     uint32_t count = block_.header.tx_count;
+    // Structural cap: the fixed frame cannot hold more than MAX_TX_PER_BLOCK
+    // transactions. add_transaction() enforces this on the way in; the clamp
+    // keeps the hash loop in-bounds even if the invariant were ever broken.
+    if (count > MAX_TX_PER_BLOCK) count = MAX_TX_PER_BLOCK;
     if (count == 0) {
         std::memset(block_.header.merkle_root, 0, 32);
         return;

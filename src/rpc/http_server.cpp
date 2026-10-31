@@ -351,7 +351,12 @@ HttpResponse HttpServer::handle_blocks(const HttpRequest&) {
         // Raw header hex (472 bytes)
         oss << "\"raw_header_hex\":\"" << hex_bytes(reinterpret_cast<const uint8_t*>(&hdr), 472) << "\",";
         oss << "\"transactions\":[";
-        for (uint32_t i = 0; i < hdr.tx_count; ++i) {
+        // Structural cap: never walk past the frame's fixed transaction array
+        // (a malformed/hand-crafted frame may carry an inflated header count).
+        const uint32_t tx_scan =
+            hdr.tx_count > vx::blockchain::MAX_TX_PER_BLOCK
+                ? vx::blockchain::MAX_TX_PER_BLOCK : hdr.tx_count;
+        for (uint32_t i = 0; i < tx_scan; ++i) {
             const auto& tx = v.tx(i);
             if (i > 0) oss << ",";
             bool proof_valid = vx::blockchain::verify_transaction_proof(tx);
@@ -1664,8 +1669,8 @@ HttpResponse HttpServer::handle_mempool_pipeline_benchmark(const HttpRequest& re
     for (size_t i = 0; i < kBenchmarkTxs; ++i) {
         blockchain::Transaction& tx = bundle[i];
         std::memset(&tx, 0, sizeof(tx));
-        std::memcpy(tx.sender_nfa, "PIPELINE_BENCH_SENDER_00000000000000000000", 42);
-        std::memcpy(tx.receiver_nfa, "PIPELINE_BENCH_RECV_000000000000000000000", 42);
+        vx::blockchain::set_nfa_field(tx.sender_nfa, "PIPELINE_BENCH_SENDER_00000000000000000000");
+        vx::blockchain::set_nfa_field(tx.receiver_nfa, "PIPELINE_BENCH_RECV_000000000000000000000");
         blockchain::tx_set_amount(tx, 100 + i);
         blockchain::tx_set_fee(tx, (i % 10 == 0) ? 1u : static_cast<uint32_t>(200 + (i % 64) * 10));
         blockchain::tx_set_nonce(tx, static_cast<uint32_t>(i));
@@ -1725,14 +1730,14 @@ HttpResponse HttpServer::handle_zk_stealth_envelope([[maybe_unused]] const HttpR
     std::vector<std::array<uint8_t, 42>> decoys;
     for (int i = 0; i < 15; ++i) {
         std::array<uint8_t, 42> d{};
-        std::memcpy(d.data(), "NFA_LEDGER_DECOY_000000000000000000000000000", 42);
+        vx::blockchain::set_nfa_field(d, "NFA_LEDGER_DECOY_0000000000000000000000000");
         d[20] = static_cast<uint8_t>(i);
         decoys.push_back(d);
     }
 
     const auto env = crypto::create_stealth_envelope(sender_seed, recipient_ivk, decoys);
     blockchain::Transaction tx{};
-    std::memcpy(tx.sender_nfa, "STEALTH_SENDER_ANCHOR_000000000000000000000", 42);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "STEALTH_SENDER_ANCHOR_00000000000000000000");
     blockchain::tx_set_amount(tx, 1'000'000);
     blockchain::tx_set_fee(tx, 500);
     blockchain::tx_set_nonce(tx, 7);
@@ -1770,8 +1775,8 @@ HttpResponse HttpServer::handle_zk_ivk_scan(const HttpRequest& req) {
     for (size_t i = 0; i < txs.size(); ++i) {
         blockchain::Transaction& tx = txs[i];
         std::memset(&tx, 0, sizeof(tx));
-        std::memcpy(tx.sender_nfa, "IVK_SCAN_NOISE_SENDER_000000000000000000000", 42);
-        std::memcpy(tx.receiver_nfa, "IVK_SCAN_NOISE_RECV_00000000000000000000000", 42);
+        vx::blockchain::set_nfa_field(tx.sender_nfa, "IVK_SCAN_NOISE_SENDER_00000000000000000000");
+        vx::blockchain::set_nfa_field(tx.receiver_nfa, "IVK_SCAN_NOISE_RECV_0000000000000000000000");
         tx.receiver_nfa[10] = static_cast<uint8_t>(i);
         blockchain::tx_set_amount(tx, 10 + i);
         blockchain::tx_set_fee(tx, 300);
@@ -1790,7 +1795,7 @@ HttpResponse HttpServer::handle_zk_ivk_scan(const HttpRequest& req) {
     const size_t stealth_pos = env.ephemeral_pub[0] % txs.size();
     blockchain::Transaction& stealth_tx = txs[stealth_pos];
     std::memset(&stealth_tx, 0, sizeof(stealth_tx));
-    std::memcpy(stealth_tx.sender_nfa, "STEALTH_SCAN_ANCHOR_0000000000000000000000", 42);
+    vx::blockchain::set_nfa_field(stealth_tx.sender_nfa, "STEALTH_SCAN_ANCHOR_0000000000000000000000");
     blockchain::tx_set_amount(stealth_tx, 777'000);
     blockchain::tx_set_fee(stealth_tx, 500);
     blockchain::tx_set_nonce(stealth_tx, 7);
@@ -1835,8 +1840,8 @@ HttpResponse HttpServer::handle_vault_ephemeral_sign(const HttpRequest& req) {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     blockchain::Transaction tx{};
-    std::memcpy(tx.sender_nfa, "VAULT_AIRGAP_SENDER_0000000000000000000000", 42);
-    std::memcpy(tx.receiver_nfa, "VAULT_AIRGAP_RECV_00000000000000000000000", 42);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "VAULT_AIRGAP_SENDER_0000000000000000000000");
+    vx::blockchain::set_nfa_field(tx.receiver_nfa, "VAULT_AIRGAP_RECV_00000000000000000000000");
     blockchain::tx_set_amount(tx, 250'000);
     blockchain::tx_set_fee(tx, 900);
     blockchain::tx_set_nonce(tx, 42);
@@ -2073,8 +2078,8 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
     }
 
     bc::Transaction tx{};
-    std::memcpy(tx.sender_nfa, "PQ_RPC_DEMO_SENDER_00000000000000000000000", 42);
-    std::memcpy(tx.receiver_nfa, "PQ_RPC_DEMO_RECV_0000000000000000000000000", 42);
+    vx::blockchain::set_nfa_field(tx.sender_nfa, "PQ_RPC_DEMO_SENDER_00000000000000000000000");
+    vx::blockchain::set_nfa_field(tx.receiver_nfa, "PQ_RPC_DEMO_RECV_0000000000000000000000000");
     bc::tx_set_amount(tx, amount);
     bc::tx_set_fee(tx, fee);
     bc::tx_set_nonce(tx, nonce);

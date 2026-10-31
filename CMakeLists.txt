@@ -188,3 +188,20 @@ add_test(NAME VortexGqcRingStealthTest COMMAND test_gqc_ring_stealth)
 add_test(NAME VortexVaultHtlcTest COMMAND test_vault_htlc)
 add_test(NAME VortexChaosFuzzerTest COMMAND test_chaos_fuzzer)
 add_test(NAME VortexPqSignatureTest COMMAND test_pq_signatures)
+
+# ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────
+# Standalone fuzz harnesses for the three highest-risk parse/verify surfaces:
+# block frames, WOTS+/XMSS witness verification and VX60 wire ingest.
+# libFuzzer requires Clang; with any other compiler the option is ignored so
+# a plain `cmake -B build` stays untouched.
+option(VX_BUILD_FUZZERS "Build libFuzzer harnesses (Clang only)" OFF)
+if(VX_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "VX_BUILD_FUZZERS=ON requires Clang (libFuzzer)")
+    endif()
+    foreach(fuzz_target IN ITEMS fuzz_block_frame fuzz_pq_witness fuzz_wire)
+        add_executable(${fuzz_target} fuzz/${fuzz_target}.cpp)
+        target_compile_options(${fuzz_target} PRIVATE -fsanitize=fuzzer)
+        target_link_libraries(${fuzz_target} PRIVATE vx_core -fsanitize=fuzzer)
+    endforeach()
+endif()

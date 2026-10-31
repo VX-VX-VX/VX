@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 #include <vector>
@@ -64,6 +65,10 @@ MemoryCore::MemoryCore(size_t arena_size) : arena_size_(arena_size) {
     if (!try_huge_pages(arena_size)) {
         fallback_alloc(arena_size);
     }
+    // The usable pool is bounded by the arena actually allocated (both
+    // allocation paths round arena_size_ up to a page multiple), so each
+    // slot owns a distinct PAGE_SIZE region — no modulo aliasing.
+    page_slot_count_ = std::min(POOL_SIZE, arena_size_ / PAGE_SIZE);
 }
 
 MemoryCore::~MemoryCore() {
@@ -113,6 +118,7 @@ void MemoryCore::fallback_alloc(size_t size) {
         free(ptr);
         throw std::runtime_error("MemoryCore: mlock failed");
     }
+    arena_mlock_active_ = true;
 
     madvise(ptr, size, MADV_DONTFORK | MADV_DONTDUMP);
     arena_ = static_cast<uint8_t*>(ptr);
@@ -212,7 +218,7 @@ std::array<uint8_t, 32> MemoryCore::commit_secure_data(const uint8_t* raw_data, 
         throw std::runtime_error("MemoryCore: data exceeds page size");
     }
 
-    size_t page_idx = next_page_.fetch_add(1, std::memory_order_acq_rel) % POOL_SIZE;
+    size_t page_idx = next_page_.fetch_add(1, std::memory_order_acq_rel) % page_slot_count_;
     MemoryPage& page = pages_[page_idx];
 
     if (page.state != static_cast<uint8_t>(PageState::VOID)) {
@@ -220,7 +226,9 @@ std::array<uint8_t, 32> MemoryCore::commit_secure_data(const uint8_t* raw_data, 
         memset(arena_ + page.offset, 0, page.capacity);
     }
 
-    page.offset = (page_idx * PAGE_SIZE) % arena_size_;
+    // page_idx < page_slot_count_ <= arena_size_ / PAGE_SIZE, so the page
+    // owns a private, in-bounds region of the arena.
+    page.offset = page_idx * PAGE_SIZE;
     page.capacity = static_cast<uint32_t>(size);
     page.state = static_cast<uint8_t>(PageState::LOCKED);
 
@@ -266,7 +274,13 @@ bool MemoryCore::consume_data(const std::array<uint8_t, 32>& h32, uint8_t* out_b
 void MemoryCore::emergency_burn_all() {
     for (auto& page : pages_) {
         if (page.state != static_cast<uint8_t>(PageState::VOID)) {
-            memset(arena_ + page.offset, 0, PAGE_SIZE);
+            // Defense in depth: this is the last-ditch zeroization path, so
+            // it must never write outside the arena even if a future change
+            // breaks the slot/offset invariant. The page state is still
+            // retired either way.
+            if (arena_ && page.offset + PAGE_SIZE <= arena_size_) {
+                memset(arena_ + page.offset, 0, PAGE_SIZE);
+            }
             page.state = static_cast<uint8_t>(PageState::BURNED);
             page.capacity = 0;
             page.content_hash = 0;
@@ -411,6 +425,7 @@ bool MemoryCore::burn_page(uint32_t page_id) noexcept {
     asm volatile("" ::: "memory");
 
     page.state = static_cast<uint8_t>(PageState::BURNED);
+    page.capacity = 0; // slot returns to the reusable pool
     page.content_hash = 0;
     return true;
 }
@@ -424,11 +439,11 @@ MemoryCore::EphemeralSignReport MemoryCore::sign_ephemeral_in_vault(
     // ── Step 2: allocate a free page VOID -> LOCKED ─────────────────────────
     int32_t page_id = -1;
     for (size_t attempt = 0; attempt < POOL_SIZE; ++attempt) {
-        const size_t idx = next_page_.fetch_add(1) % POOL_SIZE;
+        const size_t idx = next_page_.fetch_add(1) % page_slot_count_;
         uint8_t expected = static_cast<uint8_t>(PageState::VOID);
         MemoryPage& page = pages_[idx];
         if (page.capacity != 0 && page.state != expected) continue;
-        page.offset = (idx * PAGE_SIZE) % arena_size_;
+        page.offset = idx * PAGE_SIZE;
         page.capacity = PAGE_SIZE;
         page.state = static_cast<uint8_t>(PageState::LOCKED);
         page_id = static_cast<int32_t>(idx);

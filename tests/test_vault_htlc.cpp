@@ -26,8 +26,8 @@ TEST(VortexVaultHtlcTest, EphemeralSignBurnsPage) {
     auto make_tx = [](uint64_t amount) {
         vx::blockchain::Transaction tx{};
         std::memset(&tx, 0, sizeof(tx));
-        std::memcpy(tx.sender_nfa, "VAULT_TEST_SENDER_00000000000000000000000", 42);
-        std::memcpy(tx.receiver_nfa, "VAULT_TEST_RECV_000000000000000000000000", 42);
+        vx::blockchain::set_nfa_field(tx.sender_nfa, "VAULT_TEST_SENDER_00000000000000000000000");
+        vx::blockchain::set_nfa_field(tx.receiver_nfa, "VAULT_TEST_RECV_000000000000000000000000");
         vx::blockchain::tx_set_amount(tx, amount);
         vx::blockchain::tx_set_fee(tx, 800);
         vx::blockchain::tx_set_nonce(tx, 1);

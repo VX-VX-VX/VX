@@ -17,49 +17,52 @@ verified, not before.
 - Vault memory core (mlock arenas, page lifecycle, burn paths)
 - 7-tier key matrix, Shamir 2-of-3 recovery, proof-of-life
 - VSDPV mempool pre-filter, VX60 wire protocol, JSON RPC, web console
-- 16/16 test suites, CI on Arch (GCC, C++26)
+- 16/16 test suites, CI on Arch (GCC + Clang, C++26)
+- Sanitizer CI — ASan + UBSan test pass as a separate job; the pass exposed
+  and fixed four real defects (uninitialized vault page pool, literal-length
+  NFA field overreads, a 64-bit rotation UB, a use-after-free across a
+  ledger reopen in the reorg path)
+- libFuzzer targets for block-frame parsing, WOTS+/XMSS witness
+  verification and VX60 wire ingest, wired into CI (`fuzz/`, deterministic
+  seeds)
+- CodeQL static analysis on the C++ core and the web console
 
 ## Near term — hardening the artifact
 
 These items make the codebase itself more trustworthy before anything is
 asked of the network:
 
-1. **Sanitizer CI** — an ASan + UBSan test pass as a separate CI job.
-2. **Fuzzing** — libFuzzer targets for frame parsing, witness verification
-   and RPC input; "fuzzed since day one" as a standing property, not a
-   one-off.
-3. **Compiler matrix** — Clang alongside GCC in CI; kill any accidental
-   GCC-only assumptions.
-4. **Static analysis** — CodeQL (or clang-tidy baseline) with a clean-or-
-   documented policy.
-5. **RPC cookbook** — task-oriented docs: send a transaction, verify a
+1. **RPC cookbook** — task-oriented docs: send a transaction, verify a
    witness, replay a chain, read an audit report.
-6. **Multi-node local testnet runbook** — scripted two/three-node setup
+2. **Multi-node local testnet runbook** — scripted two/three-node setup
    exercising VX60 sync and split-brain reorg convergence outside unit
    tests.
+3. **RPC input fuzzing** — the JSON surface is still only covered by the
+   chaos fuzzer's fixed vectors; a libFuzzer target needs the RPC parser
+   extracted into a callable unit first.
 
 ## Mid term — earning the right to be called a protocol
 
-7. **Independent cryptographic review** — priority order: VortexSponge256,
+4. **Independent cryptographic review** — priority order: VortexSponge256,
    the WOTS+/XMSS wiring and key-lifecycle state machine, then the
    attractor's collision behavior. See whitepaper §15 — this is the single
    most important item on the list.
-8. **Signature backend as an interface** — pluggable hash-based schemes
+5. **Signature backend as an interface** — pluggable hash-based schemes
    (e.g. SPHINCS+ or LMS/HSS) behind the same witness API, so the custom
    sponge dependency can be reduced or removed without touching the frame
    format.
-9. **Formal collision analysis of the address derivation** — including the
+6. **Formal collision analysis of the address derivation** — including the
    documented 18-bit prefix drop in the NFA payload.
-10. **GQC validator-set formation** — economics and admission logic for
+7. **GQC validator-set formation** — economics and admission logic for
     the quorum set; today the threshold gadget exists, the set-formation
     story is research-grade (whitepaper §15, open item 4).
 
 ## Long term — conditional on everything above
 
-11. **Public testnet** — real PoGW economics, external validators, live
+8. **Public testnet** — real PoGW economics, external validators, live
     ASERT under adversarial load.
-12. **Mainnet criteria** — published, explicit, and gated on the audit
-    outcome: no mainnet before (7) and (8) conclude, whatever the calendar
+9. **Mainnet criteria** — published, explicit, and gated on the audit
+    outcome: no mainnet before (4) and (5) conclude, whatever the calendar
     says.
 
 ## Explicitly not promised

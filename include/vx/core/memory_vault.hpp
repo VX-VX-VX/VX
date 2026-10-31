@@ -19,11 +19,16 @@ enum class PageState : uint8_t {
 };
 
 struct alignas(16) MemoryPage {
-    size_t offset;
-    uint32_t capacity;
-    uint32_t content_hash;
-    uint8_t state : 2;
-    uint8_t reserved : 6;
+    // Default member initializers are load-bearing: the page pool must be
+    // fully VOID the moment the core is constructed. Relying on the caller
+    // to run initialize() first left the pool holding stack garbage, and
+    // emergency_burn_all() then zeroized bogus arena offsets (the crash
+    // Clang/ASan exposed; GCC merely got lucky with zeroed stack memory).
+    size_t offset = 0;
+    uint32_t capacity = 0;
+    uint32_t content_hash = 0;
+    uint8_t state : 2 = 0; // PageState::VOID
+    uint8_t reserved : 6 = 0;
 };
 
 class MemoryCore {
@@ -123,8 +128,12 @@ private:
     // an mlock failure degrades gracefully with zeroization still guaranteed.
     bool arena_mlock_active_ = false;
 
-    // Ring buffer for page allocation
+    // Ring buffer for page allocation. page_slot_count_ is the number of
+    // pool slots the arena can actually back (POOL_SIZE, but capped by
+    // arena_size_ / PAGE_SIZE) — never allocate a page whose backing memory
+    // would have to alias another page's.
     std::array<MemoryPage, POOL_SIZE> pages_;
+    size_t page_slot_count_ = POOL_SIZE;
     std::atomic<size_t> next_page_{0};
     std::atomic<size_t> entropy_nonce_{0};
 

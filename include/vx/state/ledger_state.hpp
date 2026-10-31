@@ -60,6 +60,16 @@ public:
         }
 
         uint32_t n = block.header().tx_count;
+        // Structural bound: a frame cannot carry more transactions than the
+        // fixed 64 KiB layout allows. Unchecked, tx_count from a hostile
+        // frame walks BlockView::tx(i) past the frame's transaction array
+        // and past the frame itself.
+        if (n > blockchain::MAX_TX_PER_BLOCK) {
+            res.error = "tx_count " + std::to_string(n) +
+                        " exceeds block capacity " +
+                        std::to_string(blockchain::MAX_TX_PER_BLOCK);
+            return res;
+        }
         std::vector<U128> debits(n);
         std::vector<U128> fees(n);
         // Intra-block pending credits for intra-block spendability.
