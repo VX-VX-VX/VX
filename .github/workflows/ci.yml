@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  core:
+    name: C++ core (${{ matrix.edition }})
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [public, vault]
+    steps:
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja gcc gmp openssl python nodejs npm
+      - uses: actions/checkout@v4
+      - name: Configure (Public Core)
+        if: matrix.edition == 'public'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Configure (Nakamoto Vault)
+        if: matrix.edition == 'vault'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVX_BUILD_VAULT=ON
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Run test suite
+        run: cd build && ctest --output-on-failure
+
+  web:
+    name: Web console
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Type-check and production build
+        run: npm run build

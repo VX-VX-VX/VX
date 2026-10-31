@@ -1,0 +1,76 @@
+# Vortex Sovereign OS (VX L1) License
+## GNU AGPLv3 + Cypherpunk Anti-State / Anti-Military-Surveillance Clause
+
+### 1. GNU Affero General Public License v3.0 (AGPLv3)
+Copyright (C) 2007 Free Software Foundation, Inc.
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+### 2. ABSOLUTE "AS IS" ALIBI DISCLAIMER
+THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. THE AUTHORS
+AND CONTRIBUTORS ACCEPT NO LIABILITY FOR ANY DAMAGES, DIRECT OR INDIRECT,
+ARISING FROM THE USE OF THIS SOFTWARE. ALL CRYPTOGRAPHIC OPERATIONS ARE THE
+SOLE RESPONSIBILITY OF THE USER. THE AUTHORS DO NOT GUARANTEE THAT THIS
+SOFTWARE IS SUITABLE FOR ANY PARTICULAR PURPOSE OR THAT IT IS FREE FROM
+ERRORS. USE AT YOUR OWN RISK.
+
+### 3. CYPHERPUNK ANTI-STATE / ANTI-MILITARY-SURVEILLANCE CLAUSE
+This software is released under a Cypherpunk license that explicitly
+prohibits use by state actors, military organizations, intelligence
+agencies, and surveillance contractors. By using this software, you agree:
+
+(a) NOT to use, copy, modify, or distribute this software for the purpose
+    of mass surveillance, population tracking, biometric monitoring,
+    or any form of state oppression.
+
+(b) NOT to integrate this software into weapons systems, autonomous
+    military platforms, or any technology designed to harm or control
+    civilian populations.
+
+(c) NOT to use this software to facilitate human rights abuses,
+    ethnic profiling, or authoritarian censorship.
+
+(d) TO RESIST any attempt by any state, corporation, or organization
+    to subvert this software for surveillance purposes.
+
+(e) THAT any derivative work of this software must also be released
+    under these same terms, including this Cypherpunk clause.
+
+This clause is inseparable from the AGPLv3 license. If any part of this
+clause is found to be unenforceable, the remainder of the license
+remains in full force and effect.
+
+### 4. SOVEREIGN IDENTITY PROVISION
+This software implements cryptographic identity systems (NFA_V6 addresses,
+sovereign keyrings, zero-knowledge proofs). These identity systems are
+designed to be:
+- Self-custodial (user holds their own keys)
+- Hardware-bound (DNA binding to physical device)
+- Burn-on-consume (keys self-destruct after single use)
+- Anonymous by default (no central authority can deanonymize users)
+
+Users of this software are sovereign individuals. This software makes no
+assertions about the legal status of any cryptographic identity, and
+users are solely responsible for compliance with local laws.
+
+### 5. OPEN SOURCE COMMITMENT
+All source code, cryptographic primitives, and mathematical specifications
+in this repository are released under the terms of this license. There
+are no backdoors, no hidden master keys, and no remote kill switches.
+The protocol is fully auditable and reproducible.
+
+---
+
+For the full AGPLv3 text, see:
+https://www.gnu.org/licenses/agpl-3.0.txt

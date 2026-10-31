@@ -1,0 +1,50 @@
+# ── Build artifacts ──────────────────────────────────────────────────────────
+build/
+build_*/
+bin/
+*.o
+*.a
+*.so
+*.exe
+/outDebug
+/vx_node
+/test_vortex
+/test_block
+/test_*
+/crypto_deep_tests
+/dump_vectors
+/main
+/core
+/core.*
+
+# ── Deterministic chain artifacts (auto-generated deterministically at runtime)
+genesis.bin
+*.bin
+*.vxb
+*.log
+
+# ── Runtime chain data ───────────────────────────────────────────────────────
+data/
+vault/
+
+# ── ctest runtime logs ───────────────────────────────────────────────────────
+Testing/
+web/Testing/
+
+# ── Internal working notes (local-only, never published) ─────────────────────
+docs/internal/
+
+# ── Secrets & frontend build output ──────────────────────────────────────────
+.env
+.env.*
+web/node_modules/
+web/dist/
+
+# ── IDEs ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Local-only copies of removed tracked files (stay on disk, never in git) ──
+/main.cpp
