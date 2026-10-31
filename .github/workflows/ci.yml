@@ -20,7 +20,7 @@ jobs:
       - name: Install toolchain
         run: |
           pacman -Syu --noconfirm --needed \
-            git cmake ninja gcc gmp openssl python nodejs npm
+            git cmake ninja gcc gmp openssl python gtest nodejs npm
       - uses: actions/checkout@v4
       - name: Configure (Public Core)
         if: matrix.edition == 'public'
