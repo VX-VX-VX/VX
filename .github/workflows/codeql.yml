@@ -12,28 +12,44 @@ on:
     - cron: '0 6 * * 1' # weekly, Monday 06:00 UTC
 
 jobs:
-  analyze:
-    name: Analyze
+  analyze-cpp:
+    name: Analyze (cpp)
     runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
     permissions:
       security-events: write
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [cpp, javascript-typescript]
     steps:
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed git cmake ninja gcc openmp gmp gtest
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
         with:
-          languages: ${{ matrix.language }}
-      - name: Build C++ core (autobuild cannot infer the CMake26 toolchain deps)
-        if: matrix.language == 'cpp'
+          languages: cpp
+      - name: Build C++ core
+        # The arch toolchain is the same one the CI lane builds with; the
+        # ubuntu runner's default GCC cannot compile C++26, which breaks
+        # CMake's OpenMP try-compile before CodeQL sees any code.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libgmp-dev ninja-build
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
       - uses: github/codeql-action/analyze@v3
         with:
-          category: "/language:${{ matrix.language }}"
+          category: "/language:cpp"
+
+  analyze-web:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"

@@ -25,7 +25,7 @@ jobs:
       - name: Install toolchain
         run: |
           pacman -Syu --noconfirm --needed \
-            git cmake ninja gcc clang gmp openssl python gtest nodejs npm
+            git cmake ninja gcc clang openmp gmp openssl python gtest nodejs npm
       - uses: actions/checkout@v4
       - name: Select compiler
         run: |
@@ -73,7 +73,7 @@ jobs:
       - name: Install toolchain
         run: |
           pacman -Syu --noconfirm --needed \
-            git cmake ninja clang gmp openssl python gtest
+            git cmake ninja clang openmp gmp openssl python gtest
       - uses: actions/checkout@v4
       - name: Configure fuzzers
         run: |
