@@ -8,6 +8,8 @@
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
 #include "vx/rpc/http_server.hpp"
+#include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <iomanip>
 #include <chrono>
@@ -32,17 +34,24 @@ Options:
   --p2p PORT         VX60 P2P wire protocol port (default 19088)
   --peer HOST:PORT   Connect to a peer at startup (repeatable)
   --data-dir DIR     Directory for chain data (default ./data)
+  --demo             Run the scripted demo: mine the secondary genesis
+                     mint (100 000 VX) and a 25 000 VX transfer between
+                     the two demo attractor addresses, then print the
+                     ledger audit. Off by default — a node never mines
+                     demo blocks on its own.
   -h, --help         Show this help and exit
   -V, --version      Print version information and exit
 
   rounds             Attractor rounds shown on the engine banner
                      (default 1000)
 
-Without options the node runs the engine banner and benchmark loop.
+Without options the node opens (or derives) the chain, replays the
+ledger and prints the audit — it does not mine or transfer anything.
 
 Examples:
   vx_node --serve 8088 --port 8088 --data-dir ./data
   vx_node --serve --p2p 19089 --peer 127.0.0.1:19088
+  vx_node --demo
 
 RPC endpoints (once serving): /api/status, /api/crypto/lab,
 /api/crypto/pq_sign, /api/crypto/pq_verify, /api/security/audit,
@@ -55,99 +64,14 @@ void print_version() {
               << "C++26, 3-Trunk Vortex Attractor, WOTS+/XMSS post-quantum layer\n";
 }
 
-} // namespace
-
-int main(int argc, char* argv[]) {
-    bool serve_mode = false;
-    uint16_t port = 8088;       // HTTP/RPC port (never 8080)
-    uint16_t p2p_port = 19088;  // VX60 P2P wire port
-    std::vector<std::string> peer_endpoints; // --peer host:port
-    std::string data_dir = "data";
-    uint32_t iterations = 1000;
-
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "-h" || arg == "--help") {
-            print_usage();
-            return 0;
-        } else if (arg == "-V" || arg == "--version") {
-            print_version();
-            return 0;
-        } else if (arg == "--serve") {
-            serve_mode = true;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                port = static_cast<uint16_t>(std::stoul(argv[++i]));
-            }
-        } else if (arg == "--port") {
-            if (i + 1 < argc) port = static_cast<uint16_t>(std::stoul(argv[++i]));
-        } else if (arg == "--p2p") {
-            if (i + 1 < argc) p2p_port = static_cast<uint16_t>(std::stoul(argv[++i]));
-        } else if (arg == "--peer") {
-            if (i + 1 < argc) peer_endpoints.emplace_back(argv[++i]);
-        } else if (arg == "--data-dir") {
-            if (i + 1 < argc) data_dir = argv[++i];
-        } else if (!arg.empty() && arg[0] == '-') {
-            std::cerr << "vx_node: unknown option '" << arg << "'\n"
-                      << "Run 'vx_node --help' for usage.\n";
-            return 1;
-        } else {
-            try {
-                iterations = static_cast<uint32_t>(std::stoul(arg));
-            } catch (const std::exception&) {
-                std::cerr << "vx_node: invalid argument '" << arg << "'\n"
-                          << "Run 'vx_node --help' for usage.\n";
-                return 1;
-            }
-        }
-    }
-
-    std::cout << R"(
-    ██╗   ██╗██████╗ ██████╗ ████████╗███████╗██╗  ██╗
-    ██║   ██║██╔══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝
-    ██║   ██║██║  ██║██████╔╝   ██║   █████╗   ╚███╔╝
-    ╚██╗ ██╔╝██║  ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗
-     ╚████╔╝ ██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗
-      ╚═══╝  ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
-         VORTEX CRYPTOGRAPHIC CORE ENGINE (C++26)
-    )" << "\n";
-
-    std::cout << "Compiler:  GCC " << __GNUC__ << "." << __GNUC_MINOR__ << "." << __GNUC_PATCHLEVEL__
-              << " | Standard: C++26 (__cplusplus = " << __cplusplus << ")\n";
-    std::cout << "Precision: 1024-bit Galois Fields (3-Trunk Attractor with GMP)\n";
-    std::cout << "Iterations to compute: " << iterations << " rounds\n";
-    std::cout << "--------------------------------------------------------\n\n";
-
-    // ── 1. BlockStore (auto-seeds genesis.bin → ledger.vxb on first run) ─────
-    std::cout << "[NODE] Opening ledger.vxb (auto-init from genesis.bin if empty)...\n";
-    vx::storage::BlockStore store("ledger.vxb", "genesis.bin");
-    uint64_t current_height = store.chain_height();
-    std::cout << "      ✓ Chain height: " << current_height << " blocks (tip = #" << (current_height - 1) << ")\n\n";
-
-    // ── 2. Replay all existing blocks into LedgerState ────────────────────────
-    std::cout << "[NODE] Replaying " << current_height << " block(s) into LedgerState...\n";
-    vx::state::LedgerState state;
-    for (uint64_t h = 0; h < current_height; ++h) {
-        auto* raw = store.get_block(h);
-        if (!raw) throw std::runtime_error("BlockStore: missing block #" + std::to_string(h));
-        vx::blockchain::BlockView v{std::span<const uint8_t, 65536>(
-            reinterpret_cast<const uint8_t*>(raw), 65536)};
-        auto r = state.apply_block(v);
-        if (!r.ok) throw std::runtime_error("LedgerState apply failed on block #" +
-                                             std::to_string(h) + ": " + r.error);
-    }
-
-    // Genesis #1 address & balance
-    auto* genesis_raw = store.get_block(0);
-    vx::blockchain::BlockView gv{std::span<const uint8_t, 65536>(
-        reinterpret_cast<const uint8_t*>(genesis_raw), 65536)};
-    vx::blockchain::Address gen1_addr = vx::blockchain::tx_address(gv.tx(0).receiver_nfa);
-
-    std::cout << "      ✓ Genesis #1 address: " << vx::state::LedgerState::address_label(gen1_addr) << "\n";
-    std::cout << "      ✓ Genesis #1 balance: " << state.balance_of(gen1_addr).to_string() << " atomics (2.54M VX)\n";
-    std::cout << "      ✓ Total supply:       " << state.total_supply().to_string() << " atomics\n\n";
-
-    // ── 3. Derive Coordinates & Addresses for Seed #2 and Seed #3 ─────────────
-    std::cout << "[NODE] Computing 1000-round Attractor for Seed #2 and Seed #3...\n";
+// Scripted demo: secondary genesis mint (100 000 VX) plus a 25 000 VX
+// transfer between the two demo attractor addresses. Runs only when the
+// operator passes --demo; a node never mines demo blocks on its own.
+void run_demo_script(vx::storage::BlockStore& store,
+                     vx::state::LedgerState& state,
+                     const vx::blockchain::Address& gen1_addr) {
+    // ── 1. Derive Coordinates & Addresses for Seed #2 and Seed #3 ────────────
+    std::cout << "[DEMO] Computing 1000-round Attractor for Seed #2 and Seed #3...\n";
 
     std::string seed2 =
         "e76a1d401b5c3b803d9e909a1c7d7b5893f89e991160bfea87d56b9292a9eca5"
@@ -180,9 +104,9 @@ int main(int argc, char* argv[]) {
     std::memcpy(addr2_payload.data(), res2.addressNFA.data() + 7, 42);
     std::memcpy(addr3_payload.data(), res3.addressNFA.data() + 7, 42);
 
-    // ── 4. Mine New Block: Tx1 (Mint to Addr #2) + Tx2 (Transfer #2 → #3) ───────
+    // ── 2. Mine New Block: Tx1 (Mint to Addr #2) + Tx2 (Transfer #2 → #3) ────
     uint64_t next_h = store.chain_height();
-    std::cout << "[NODE] Assembling and Mining Block #" << next_h << "...\n";
+    std::cout << "[DEMO] Assembling and Mining Block #" << next_h << "...\n";
 
     vx::blockchain::BlockBuilder builder;
     builder.set_height(next_h);
@@ -250,8 +174,8 @@ int main(int argc, char* argv[]) {
     std::cout << "      append_block(#" << next_h << ") → " << (appended ? "OK ✓" : "FAILED ✗") << "\n";
     if (!appended) throw std::runtime_error("BlockStore rejected Block #" + std::to_string(next_h));
 
-    // ── 5. Apply the new block to LedgerState ──────────────────────────────────
-    std::cout << "\n[NODE] Applying Block #" << next_h << " to LedgerState...\n";
+    // ── 3. Apply the new block to LedgerState ─────────────────────────────────
+    std::cout << "\n[DEMO] Applying Block #" << next_h << " to LedgerState...\n";
     auto* new_raw = store.get_block(next_h);
     vx::blockchain::BlockView newv{std::span<const uint8_t, 65536>(
         reinterpret_cast<const uint8_t*>(new_raw), 65536)};
@@ -261,15 +185,15 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "      ✓ Block #" << next_h << " applied successfully: " << apply_res.transfers << " transfer(s)\n\n";
 
-    // ── 6. Ledger State Audit Summary ──────────────────────────────────────────
+    // ── 4. Ledger State Audit Summary ──────────────────────────────────────────
     std::cout << "=================== LEDGER STATE AUDIT ===================\n";
-    std::cout << "  Genesis #1 Balance (2.54M VX Target): "
+    std::cout << "  Genesis #1 Balance:                   "
               << state.balance_of(gen1_addr).to_string() << " atomics\n";
 
-    std::cout << "  Genesis #2 Balance (75k VX Target):   "
+    std::cout << "  Genesis #2 Balance:                   "
               << state.balance_of(addr2_payload).to_string() << " atomics\n";
 
-    std::cout << "  Address #3 Balance (25k VX Target):   "
+    std::cout << "  Address #3 Balance:                   "
               << state.balance_of(addr3_payload).to_string() << " atomics\n";
 
     std::cout << "  -----------------------------------------------------\n";
@@ -278,6 +202,113 @@ int main(int argc, char* argv[]) {
     std::cout << "  Live Chain Height:                    "
               << store.chain_height() << " blocks (tip = #" << (store.chain_height() - 1) << ")\n";
     std::cout << "===========================================================\n\n";
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    bool serve_mode = false;
+    bool demo_mode = false;
+    uint16_t port = 8088;       // HTTP/RPC port (never 8080)
+    uint16_t p2p_port = 19088;  // VX60 P2P wire port
+    std::vector<std::string> peer_endpoints; // --peer host:port
+    std::string data_dir = "data";
+    uint32_t iterations = 1000;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        } else if (arg == "-V" || arg == "--version") {
+            print_version();
+            return 0;
+        } else if (arg == "--serve") {
+            serve_mode = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                port = static_cast<uint16_t>(std::stoul(argv[++i]));
+            }
+        } else if (arg == "--port") {
+            if (i + 1 < argc) port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        } else if (arg == "--p2p") {
+            if (i + 1 < argc) p2p_port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        } else if (arg == "--peer") {
+            if (i + 1 < argc) peer_endpoints.emplace_back(argv[++i]);
+        } else if (arg == "--data-dir") {
+            if (i + 1 < argc) data_dir = argv[++i];
+        } else if (arg == "--demo") {
+            demo_mode = true;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "vx_node: unknown option '" << arg << "'\n"
+                      << "Run 'vx_node --help' for usage.\n";
+            return 1;
+        } else {
+            try {
+                iterations = static_cast<uint32_t>(std::stoul(arg));
+            } catch (const std::exception&) {
+                std::cerr << "vx_node: invalid argument '" << arg << "'\n"
+                          << "Run 'vx_node --help' for usage.\n";
+                return 1;
+            }
+        }
+    }
+
+    std::cout << R"(
+    ██╗   ██╗██████╗ ██████╗ ████████╗███████╗██╗  ██╗
+    ██║   ██║██╔══██╗██╔══██╗╚══██╔══╝██╔════╝╚██╗██╔╝
+    ██║   ██║██║  ██║██████╔╝   ██║   █████╗   ╚███╔╝
+    ╚██╗ ██╔╝██║  ██║██╔══██╗   ██║   ██╔══╝   ██╔██╗
+     ╚████╔╝ ██████╔╝██║  ██║   ██║   ███████╗██╔╝ ██╗
+      ╚═══╝  ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+         VORTEX CRYPTOGRAPHIC CORE ENGINE (C++26)
+    )" << "\n";
+
+    std::cout << "Compiler:  GCC " << __GNUC__ << "." << __GNUC_MINOR__ << "." << __GNUC_PATCHLEVEL__
+              << " | Standard: C++26 (__cplusplus = " << __cplusplus << ")\n";
+    std::cout << "Precision: 1024-bit Galois Fields (3-Trunk Attractor with GMP)\n";
+    std::cout << "Iterations to compute: " << iterations << " rounds\n";
+    std::cout << "--------------------------------------------------------\n\n";
+
+    // ── 1. BlockStore (auto-derives genesis.bin → ledger.vxb on first run) ────
+    std::error_code fs_ec;
+    std::filesystem::create_directories(data_dir, fs_ec);
+    std::string ledger_path  = (std::filesystem::path(data_dir) / "ledger.vxb").string();
+    std::string genesis_path = (std::filesystem::path(data_dir) / "genesis.bin").string();
+
+    std::cout << "[NODE] Opening " << ledger_path << " (auto-init from genesis.bin if empty)...\n";
+    vx::storage::BlockStore store(ledger_path, genesis_path);
+    uint64_t current_height = store.chain_height();
+    std::cout << "      ✓ Chain height: " << current_height << " blocks (tip = #" << (current_height - 1) << ")\n\n";
+
+    // ── 2. Replay all existing blocks into LedgerState ────────────────────────
+    std::cout << "[NODE] Replaying " << current_height << " block(s) into LedgerState...\n";
+    vx::state::LedgerState state;
+    for (uint64_t h = 0; h < current_height; ++h) {
+        auto* raw = store.get_block(h);
+        if (!raw) throw std::runtime_error("BlockStore: missing block #" + std::to_string(h));
+        vx::blockchain::BlockView v{std::span<const uint8_t, 65536>(
+            reinterpret_cast<const uint8_t*>(raw), 65536)};
+        auto r = state.apply_block(v);
+        if (!r.ok) throw std::runtime_error("LedgerState apply failed on block #" +
+                                             std::to_string(h) + ": " + r.error);
+    }
+
+    // Genesis #1 address & balance
+    auto* genesis_raw = store.get_block(0);
+    vx::blockchain::BlockView gv{std::span<const uint8_t, 65536>(
+        reinterpret_cast<const uint8_t*>(genesis_raw), 65536)};
+    vx::blockchain::Address gen1_addr = vx::blockchain::tx_address(gv.tx(0).receiver_nfa);
+
+    std::cout << "      ✓ Genesis #1 address: " << vx::state::LedgerState::address_label(gen1_addr) << "\n";
+    std::cout << "      ✓ Genesis #1 balance: " << state.balance_of(gen1_addr).to_string() << " atomics (2.54M VX)\n";
+    std::cout << "      ✓ Total supply:       " << state.total_supply().to_string() << " atomics\n\n";
+
+    // ── 3. Demo script (optional) — mint + transfer between demo addresses ────
+    if (demo_mode) {
+        run_demo_script(store, state, gen1_addr);
+    } else {
+        std::cout << "[NODE] Demo script skipped (pass --demo to run it).\n\n";
+    }
 
     std::cout << "Core execution completed successfully.\n";
 

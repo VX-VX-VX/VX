@@ -351,6 +351,11 @@ Options:
   --p2p PORT         VX60 P2P wire protocol port (default 19088)
   --peer HOST:PORT   Connect to a peer at startup (repeatable)
   --data-dir DIR     Directory for chain data (default ./data)
+  --demo             Run the scripted demo: mine the secondary genesis
+                     mint (100 000 VX) and a 25 000 VX transfer between
+                     the two demo attractor addresses, then print the
+                     ledger audit. Off by default — a node never mines
+                     demo blocks on its own.
   -h, --help         Show this help and exit
   -V, --version      Print version information and exit
 
@@ -363,7 +368,8 @@ Options:
 | `--port PORT` | HTTP/RPC listen port (8088 by default — 8080 is deliberately avoided) |
 | `--p2p PORT` | VX60 wire listener port |
 | `--peer HOST:PORT` | Outbound peer to dial at startup; repeatable |
-| `--data-dir DIR` | Ledger and chain data directory |
+| `--data-dir DIR` | Ledger and chain data directory (`ledger.vxb` and the derived `genesis.bin` live here, not in the working directory) |
+| `--demo` | Run the scripted demo block (100 000 VX secondary-genesis mint + 25 000 VX transfer between the two demo attractor addresses). Off by default — a node never mines demo blocks on its own |
 | `rounds` | Bare positional integer — attractor rounds for the banner benchmark |
 | `-h`, `--help` | Usage screen, exit 0 |
 | `-V`, `--version` | Version line, exit 0 |
