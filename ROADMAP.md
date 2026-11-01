@@ -29,16 +29,17 @@ verified, not before.
 - RPC cookbook (`docs/RPC_COOKBOOK.md`) — task-oriented recipes for the
   JSON RPC with live-captured responses: transfers, PQ signing, guard
   replays, VM traces
+- Multi-node runbook (`docs/MULTI_NODE_RUNBOOK.md`) — live VX60 testnet:
+  3-node block propagation with tip convergence, garbage-packet
+  resistance, in-process split-brain reorg; plus the P2P wiring that made
+  it real (`--p2p`/`--peer` now bind, handshake, relay and gossip)
 
 ## Near term — hardening the artifact
 
 These items make the codebase itself more trustworthy before anything is
 asked of the network:
 
-2. **Multi-node local testnet runbook** — scripted two/three-node setup
-   exercising VX60 sync and split-brain reorg convergence outside unit
-   tests.
-3. **RPC input fuzzing** — the JSON surface is still only covered by the
+2. **RPC input fuzzing** — the JSON surface is still only covered by the
    chaos fuzzer's fixed vectors; a libFuzzer target needs the RPC parser
    extracted into a callable unit first.
 

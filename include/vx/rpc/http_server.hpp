@@ -112,6 +112,17 @@ public:
     void start();
     void stop();
 
+    // Bind the VX60 P2P listener, register the block-relay hook and connect
+    // to the given static peers (HOST:PORT each). Safe to call with no peers;
+    // a failed bind only logs and leaves the node RPC-only.
+    void attach_p2p(uint16_t p2p_port, const std::vector<std::string>& peer_endpoints);
+
+    // Apply a block frame that arrived over VX60. Accepts a frame only when
+    // it extends the current tip (height == chain_height and prev_block_hash
+    // == tip hash); anything else is dropped. On success the frame is
+    // re-broadcast to this node's peers so it gossips past its origin.
+    bool apply_remote_frame(const void* frame);
+
 private:
     void accept_loop();
     void handle_client(int client_fd);

@@ -111,6 +111,66 @@ void HttpServer::stop() {
     }
 }
 
+// ── P2P wiring ────────────────────────────────────────────────────────────────
+// The SwarmNode inside the RPC server gets real duties here: bind the VX60
+// listener, relay verified inbound block frames into the ledger (tip-extending
+// frames only), and broadcast locally mined blocks to peers.
+
+void HttpServer::attach_p2p(uint16_t p2p_port,
+                            const std::vector<std::string>& peer_endpoints) {
+    swarm_node_->set_frame_hook([this](const uint8_t* frame, size_t len) {
+        if (len == 65536) apply_remote_frame(frame);
+    });
+    if (p2p_port != 0 && !swarm_node_->bind_p2p_listener(p2p_port)) {
+        std::cerr << "[NODE] VX60 P2P bind failed on port " << p2p_port
+                  << " — continuing RPC-only\n";
+    }
+    swarm_node_->start();
+    for (const auto& ep : peer_endpoints) {
+        const size_t colon = ep.rfind(':');
+        if (colon == std::string::npos) {
+            std::cerr << "[NODE] bad --peer endpoint '" << ep << "'\n";
+            continue;
+        }
+        const std::string host = ep.substr(0, colon);
+        const uint16_t p = static_cast<uint16_t>(std::stoul(ep.substr(colon + 1)));
+        if (!swarm_node_->connect_peer_tcp(host, p)) {
+            std::cerr << "[NODE] peer connect " << ep << " failed\n";
+        } else {
+            std::cout << "[NODE] peer connected: " << ep << "\n";
+        }
+    }
+}
+
+bool HttpServer::apply_remote_frame(const void* frame) {
+    const auto* bytes = static_cast<const uint8_t*>(frame);
+    vx::blockchain::BlockView view{std::span<const uint8_t, 65536>(bytes, 65536)};
+    const uint64_t h = view.header().block_height;
+
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    // Only a frame that extends our current tip is applied. Fork choice and
+    // reorg handling for live peers is ROADMAP item 2 follow-up; until then
+    // a competing-height frame is dropped rather than guessed at.
+    if (h != store_.chain_height()) return false;
+    uint8_t tip[32] = {};
+    store_.tip_hash(tip);
+    if (std::memcmp(tip, view.header().prev_block_hash, 32) != 0) return false;
+
+    vx::blockchain::BlockFrame f;
+    std::memcpy(f.data(), bytes, 65536);
+    if (!store_.append_block(f)) return false;
+    auto* raw = store_.get_block(h);
+    vx::blockchain::BlockView applied{std::span<const uint8_t, 65536>(
+        reinterpret_cast<const uint8_t*>(raw), 65536)};
+    auto res = ledger_.apply_block(applied);
+    if (!res.ok) return false;
+
+    // Gossip one hop past the origin; peers that already have it will drop
+    // the duplicate at the height check above.
+    swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(bytes, 65536));
+    return true;
+}
+
 HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
     HttpRequest req;
     ok = false;
@@ -526,6 +586,9 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     if (!res.ok) {
         return HttpResponse::error(500, res.error);
     }
+
+    // Gossip the freshly mined block to every connected VX60 peer.
+    swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(frame.data(), 65536));
 
     uint8_t bh[32];
     vx::blockchain::hash_header(newv.header(), bh);
@@ -1217,7 +1280,7 @@ HttpResponse HttpServer::handle_swarm_peers(const HttpRequest&) {
     std::ostringstream oss;
     oss << "{\"wire_magic\":\"0x56583630\","
         << "\"wire_protocol\":\"VX60\","
-        << "\"p2p_port\":19088,"
+        << "\"p2p_port\":" << swarm_node_->listen_port() << ","
         << "\"corrupted_packets_dropped\":" << swarm_node_->corrupted_packets_dropped() << ","
         << "\"zero_copy_bytes_sent\":" << swarm_node_->zero_copy_bytes_sent() << ","
         << "\"zero_copy_blocks_streamed\":" << swarm_node_->zero_copy_blocks_streamed() << ","

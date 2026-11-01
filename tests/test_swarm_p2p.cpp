@@ -15,6 +15,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <thread>
 
@@ -182,4 +184,55 @@ TEST(VortexSwarmP2PTest, SplitBrainReorgConverges) {
     EXPECT_TRUE(report.reorg_success);
     EXPECT_GT(report.vx60_bytes_transferred, 0u);
     EXPECT_GT(report.duration_us, 0u);
+}
+
+// ── 5. P2P listener relays a verified frame into the node-layer hook ───────
+
+TEST(VortexSwarmP2PTest, ListenerRelaysVerifiedFrameToHook) {
+    // Pick a free loopback port by binding an ephemeral listener first.
+    int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(probe, 0);
+    int opt = 1;
+    ::setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ASSERT_EQ(::bind(probe, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    socklen_t alen = sizeof(addr);
+    ::getsockname(probe, reinterpret_cast<sockaddr*>(&addr), &alen);
+    const uint16_t port = ntohs(addr.sin_port);
+    ::close(probe);
+
+    // Receiver node: binds the VX60 listener and captures relayed frames.
+    vx::net::SwarmNode receiver;
+    std::atomic<int> frames_seen{0};
+    std::vector<uint8_t> captured;
+    std::mutex cap_mu;
+    receiver.set_frame_hook([&](const uint8_t* frame, size_t len) {
+        if (len != 65536) return;
+        std::lock_guard<std::mutex> lock(cap_mu);
+        captured.assign(frame, frame + len);
+        frames_seen.fetch_add(1);
+    });
+    ASSERT_TRUE(receiver.bind_p2p_listener(port));
+    receiver.start();
+
+    // Sender node: connects and broadcasts a deterministic 64 KiB frame.
+    vx::net::SwarmNode sender;
+    std::vector<uint8_t> frame(65536, 0);
+    const uint32_t magic = 0x58564336; // VXC6 block magic
+    std::memcpy(frame.data(), &magic, 4);
+    for (size_t i = 4; i < frame.size(); ++i) frame[i] = static_cast<uint8_t>(i * 31 + 7);
+    ASSERT_TRUE(sender.connect_peer_tcp("127.0.0.1", port));
+    sender.broadcast_frame(std::span<const uint8_t, 65536>(frame.data(), frame.size()));
+
+    // The hook must fire within a bounded window (listener thread path).
+    for (int i = 0; i < 100 && frames_seen.load() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    receiver.emergency_stop();
+    EXPECT_EQ(frames_seen.load(), 1);
+    ASSERT_EQ(captured.size(), 65536u);
+    EXPECT_EQ(std::memcmp(captured.data(), frame.data(), 65536), 0);
 }

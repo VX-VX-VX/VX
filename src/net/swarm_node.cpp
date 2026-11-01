@@ -95,16 +95,42 @@ void SwarmNode::start() {
 }
 
 void SwarmNode::emergency_stop() {
-    if (!running_.exchange(false)) return;
+    // Reader threads may exist even when start() was never called
+    // (connect_peer_tcp spawns them directly), so teardown of dialed
+    // sockets and readers must run on every call, not only when running.
+    const bool was_running = running_.exchange(false);
     emergency_stop_requested_.store(true);
 
+    // Closing the dialed sockets unblocks the per-peer reader threads.
     close_all_peers();
+    std::vector<std::thread> readers_done;
+    {
+        std::lock_guard<std::mutex> lock(readers_mu_);
+        readers_done.swap(peer_readers_);
+    }
+    for (auto& t : readers_done)
+        if (t.joinable()) t.join();
+
+    if (!was_running) return;
 
     if (listen_fd_ >= 0) {
         ::shutdown(listen_fd_, SHUT_RDWR);
         ::close(listen_fd_);
         listen_fd_ = -1;
     }
+
+    // Unblock the listener thread if it is blocked in a recv on an accepted
+    // connection; the fd itself stays open and is closed by the listener.
+    shutdown_accepted();
+
+    // Connection handlers exit once their sockets are shut down.
+    std::vector<std::thread> handlers_done;
+    {
+        std::lock_guard<std::mutex> lock(handlers_mu_);
+        handlers_done.swap(conn_handlers_);
+    }
+    for (auto& t : handlers_done)
+        if (t.joinable()) t.join();
 
     if (listener_thread_.joinable()) listener_thread_.join();
     if (gossip_thread_.joinable()) gossip_thread_.join();
@@ -141,9 +167,47 @@ bool SwarmNode::connect_peer_tcp(const std::string& host, uint16_t port) {
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    // Handshake: announce ourselves so the remote listener promotes this
+    // connection into its peer table (and can broadcast back over it).
+    WireHeader ping = make_header(WireMsgType::PING, 0,
+                                  session_nonce_.fetch_add(1));
+    ping.crc32c = compute_wire_crc32c(nullptr, 0);
+    ssize_t n = ::send(fd, &ping, sizeof(ping), MSG_NOSIGNAL);
+    if (n != static_cast<ssize_t>(sizeof(ping))) {
+        ::close(fd);
+        std::cerr << "[Swarm] handshake send " << host << ":" << port << " failed\n";
+        return false;
+    }
+
     std::lock_guard<std::mutex> lock(peers_mutex_);
     peer_fds_[host + ":" + std::to_string(port)] = fd;
+    // Reader thread: our outgoing socket must also ingest — otherwise blocks
+    // broadcast back to us by the dialed peer are never received.
+    const std::string label = host + ":" + std::to_string(port);
+    std::lock_guard<std::mutex> readers_lock(readers_mu_);
+    peer_readers_.emplace_back(&SwarmNode::peer_reader_loop, this, fd, label);
     return true;
+}
+
+void SwarmNode::peer_reader_loop(int fd, std::string label) {
+    for (;;) {
+        WireHeader hdr{};
+        std::vector<uint8_t> payload;
+        if (!recv_packet(fd, hdr, payload)) break;
+        const auto type = static_cast<WireMsgType>(hdr.msg_type);
+        if (type == WireMsgType::PONG) continue; // keepalive reply
+        if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
+            handle_incoming_frame(label,
+                std::span<const uint8_t, 65536>(payload.data(), payload.size()));
+            continue;
+        }
+        break; // unexpected message type: drop the connection
+    }
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        peer_fds_.erase(label);
+    }
+    ::close(fd);
 }
 
 // ── Loopback peer ───────────────────────────────────────────────────────────
@@ -332,12 +396,17 @@ void SwarmNode::broadcast_frame(const std::span<const uint8_t, 65536>& frame) {
     }
 }
 
+void SwarmNode::set_frame_hook(FrameHook hook) {
+    frame_hook_ = std::move(hook);
+}
+
 void SwarmNode::handle_incoming_frame(const std::string& from_peer, const std::span<const uint8_t, 65536>& frame) {
     if (!verify_frame(frame)) {
         ban_peer(from_peer, 100);
         return;
     }
- // Block relay processing is driven by the RPC/node layer via hooks.
+    if (frame_hook_) frame_hook_(frame.data(), frame.size());
+    // Further block-relay policy (apply / re-broadcast) lives in the hook.
 }
 
 bool SwarmNode::verify_frame(const std::span<const uint8_t, 65536>& frame) {
@@ -413,6 +482,11 @@ bool SwarmNode::bind_p2p_listener(uint16_t port) {
 
 // ── Background loops ────────────────────────────────────────────────────────
 
+void SwarmNode::shutdown_accepted() {
+    std::lock_guard<std::mutex> lock(accepted_mu_);
+    for (int fd : accepted_fds_) ::shutdown(fd, SHUT_RDWR);
+}
+
 void SwarmNode::listener_loop() {
     while (!emergency_stop_requested_.load()) {
         if (listen_fd_ < 0) {
@@ -426,22 +500,86 @@ void SwarmNode::listener_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
-        int one = 1;
-        ::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        {
+            std::lock_guard<std::mutex> lock(accepted_mu_);
+            accepted_fds_.insert(c);
+        }
+        // Each connection is served on its own thread: peers stay connected
+        // indefinitely, so serving inline would block accept() for the rest
+        // of the mesh.
+        std::lock_guard<std::mutex> handlers_lock(handlers_mu_);
+        conn_handlers_.emplace_back(&SwarmNode::serve_connection, this, c);
+    }
+}
 
-        // Handshake exchange over VX60: respond PONG to PING, validate CRC32C.
+void SwarmNode::serve_connection(int c) {
+    int one = 1;
+    ::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    // Serve one connection until EOF: PING -> PONG, RAW_BLOCK_64K ->
+    // handle_incoming_frame (CRC32C already verified inside recv_packet).
+    // Anything else is an unexpected message type; the connection is
+    // closed rather than guessed at.
+    //
+    // The first verified packet promotes the connection to a tracked
+    // peer: inbound connections become broadcast targets too, so a node
+    // that was connected TO can relay back over the accepted socket.
+    std::string peer_label = "loopback";
+    bool registered = false;
+    auto promote = [&]() {
+        if (registered) return;
+        sockaddr_in sa{};
+        socklen_t sl = sizeof(sa);
+        uint16_t rport = 0;
+        if (::getpeername(c, reinterpret_cast<sockaddr*>(&sa), &sl) == 0) {
+            char ip[INET_ADDRSTRLEN] = {0};
+            ::inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
+            rport = ntohs(sa.sin_port);
+            peer_label = std::string(ip) + ":" + std::to_string(rport);
+        }
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        peer_fds_[peer_label] = c;
+        PeerInfo peer{}; // zero-init: height/work/scores start at 0
+        peer.address = peer_label;
+        peer.node_id = 0; // unknown until a richer handshake exists
+        peer.is_loopback = true;
+        peer.last_seen = std::chrono::system_clock::now();
+        peer_table_.insert(peer);
+        registered = true;
+    };
+    for (;;) {
         WireHeader hdr{};
         std::vector<uint8_t> payload;
-        if (recv_packet(c, hdr, payload)) {
-            if (hdr.msg_type == static_cast<uint8_t>(WireMsgType::PING)) {
-                WireHeader pong = make_header(WireMsgType::PONG, 0,
-                                              session_nonce_.fetch_add(1));
-                pong.crc32c = compute_wire_crc32c(nullptr, 0);
-                ::send(c, &pong, sizeof(pong), MSG_NOSIGNAL);
-            }
+        if (!recv_packet(c, hdr, payload)) break;
+        const auto type = static_cast<WireMsgType>(hdr.msg_type);
+        if (type == WireMsgType::PING) {
+            promote();
+            WireHeader pong = make_header(WireMsgType::PONG, 0,
+                                          session_nonce_.fetch_add(1));
+            pong.crc32c = compute_wire_crc32c(nullptr, 0);
+            ::send(c, &pong, sizeof(pong), MSG_NOSIGNAL);
+            continue;
         }
-        ::close(c);
+        if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
+            promote();
+            handle_incoming_frame(peer_label,
+                std::span<const uint8_t, 65536>(payload.data(), payload.size()));
+            continue;
+        }
+        break;
     }
+    if (registered) {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        peer_fds_.erase(peer_label);
+        for (auto it = peer_table_.begin(); it != peer_table_.end(); ++it) {
+            if (it->address == peer_label) { peer_table_.erase(it); break; }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(accepted_mu_);
+        accepted_fds_.erase(c);
+    }
+    ::close(c);
 }
 
 void SwarmNode::gossip_loop() {

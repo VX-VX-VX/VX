@@ -204,6 +204,13 @@ public:
     // Handle incoming frame from peer
     void handle_incoming_frame(const std::string& from_peer, const std::span<const uint8_t, 65536>& frame);
 
+    // Register a callback invoked for every verified 64 KiB block frame that
+    // arrives over the P2P listener. The node layer (RPC server / main) owns
+    // the decision to apply, relay or drop the frame; the wire layer only
+    // guarantees CRC32C integrity and the BLOCK_MAGIC prefix.
+    using FrameHook = std::function<void(const uint8_t* frame, size_t len)>;
+    void set_frame_hook(FrameHook hook);
+
   // ── VX60 wire protocol ────────────────────────────────────────
 
     // Build a 24-byte WireHeader for a payload (computes hardware CRC32C).
@@ -292,6 +299,27 @@ private:
     // Listener socket
     int listen_fd_ = -1;
     std::atomic<uint16_t> listen_port_{0};
+
+    // Accepted connection sockets, tracked so emergency_stop() can shut them
+    // down and unblock the listener thread's blocking recv.
+    std::mutex accepted_mu_;
+    std::set<int> accepted_fds_;
+    void shutdown_accepted();
+
+    // One handler thread per accepted connection (serving it until EOF), so
+    // a persistent peer connection never blocks accept() for the next peer.
+    std::mutex handlers_mu_;
+    std::vector<std::thread> conn_handlers_;
+    void serve_connection(int fd);
+
+    // One reader thread per outgoing peer connection: ingests VX60 packets
+    // (PONG keepalives, RAW_BLOCK_64K frames) from sockets we dialed.
+    std::mutex readers_mu_;
+    std::vector<std::thread> peer_readers_;
+    void peer_reader_loop(int fd, std::string label);
+
+    // Callback for verified inbound block frames (set by the node layer)
+    FrameHook frame_hook_;
 
     // VX60 wire statistics (atomic: updated from multiple threads)
     std::atomic<uint64_t> corrupted_packets_dropped_{0};

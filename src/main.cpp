@@ -318,6 +318,7 @@ int main(int argc, char* argv[]) {
                   << " | data-dir: " << data_dir
                   << " | peers: " << peer_endpoints.size() << "\n";
         vx::rpc::HttpServer server(store, state, port, data_dir);
+        server.attach_p2p(p2p_port, peer_endpoints);
         std::signal(SIGINT, [](int) { std::exit(0); });
         server.start();
         return 0;
