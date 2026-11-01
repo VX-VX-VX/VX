@@ -26,14 +26,15 @@ verified, not before.
   verification and VX60 wire ingest, wired into CI (`fuzz/`, deterministic
   seeds)
 - CodeQL static analysis on the C++ core and the web console
+- RPC cookbook (`docs/RPC_COOKBOOK.md`) — task-oriented recipes for the
+  JSON RPC with live-captured responses: transfers, PQ signing, guard
+  replays, VM traces
 
 ## Near term — hardening the artifact
 
 These items make the codebase itself more trustworthy before anything is
 asked of the network:
 
-1. **RPC cookbook** — task-oriented docs: send a transaction, verify a
-   witness, replay a chain, read an audit report.
 2. **Multi-node local testnet runbook** — scripted two/three-node setup
    exercising VX60 sync and split-brain reorg convergence outside unit
    tests.
@@ -43,25 +44,25 @@ asked of the network:
 
 ## Mid term — earning the right to be called a protocol
 
-4. **Independent cryptographic review** — priority order: VortexSponge256,
+3. **Independent cryptographic review** — priority order: VortexSponge256,
    the WOTS+/XMSS wiring and key-lifecycle state machine, then the
    attractor's collision behavior. See whitepaper §15 — this is the single
    most important item on the list.
-5. **Signature backend as an interface** — pluggable hash-based schemes
+4. **Signature backend as an interface** — pluggable hash-based schemes
    (e.g. SPHINCS+ or LMS/HSS) behind the same witness API, so the custom
    sponge dependency can be reduced or removed without touching the frame
    format.
-6. **Formal collision analysis of the address derivation** — including the
+5. **Formal collision analysis of the address derivation** — including the
    documented 18-bit prefix drop in the NFA payload.
-7. **GQC validator-set formation** — economics and admission logic for
+6. **GQC validator-set formation** — economics and admission logic for
     the quorum set; today the threshold gadget exists, the set-formation
     story is research-grade (whitepaper §15, open item 4).
 
 ## Long term — conditional on everything above
 
-8. **Public testnet** — real PoGW economics, external validators, live
+7. **Public testnet** — real PoGW economics, external validators, live
     ASERT under adversarial load.
-9. **Mainnet criteria** — published, explicit, and gated on the audit
+8. **Mainnet criteria** — published, explicit, and gated on the audit
     outcome: no mainnet before (4) and (5) conclude, whatever the calendar
     says.
 

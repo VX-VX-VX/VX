@@ -2,7 +2,9 @@
 
 > **New to VX?** Start with [The Vortex Challenge](docs/CHALLENGE.md) —
 > four levels from "it compiles" to "I rebuilt the consensus core from the
-> whitepaper alone".
+> whitepaper alone". Driving a node over RPC? The
+> [RPC cookbook](docs/RPC_COOKBOOK.md) has live-captured recipes for every
+> endpoint.
 
 ![language](https://img.shields.io/badge/C%2B%2B-26-blue)
 [![CI](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml/badge.svg)](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml)
