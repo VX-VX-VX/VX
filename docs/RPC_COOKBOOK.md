@@ -6,6 +6,7 @@ Every response shown here was captured from a live node — nothing here is
 only to avoid colliding with a node you may already run.
 
 Other docs: [README](../README.md) · [whitepaper](../WHITEPAPER_V6.md) ·
+[nodes guide](NODES.md) · [multi-node runbook](MULTI_NODE_RUNBOOK.md) ·
 [glossary](GLOSSARY.md) · [The Vortex Challenge](CHALLENGE.md)
 
 ---

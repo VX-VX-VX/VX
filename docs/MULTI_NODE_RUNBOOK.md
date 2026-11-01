@@ -189,6 +189,23 @@ below for what it does not yet cover.
 `frame.prev_block_hash == tip_hash`. Anything else is dropped silently.
 There is no fork choice over the wire yet — see limits.
 
+## Field-tested scenarios
+
+All of the following were run live against real node processes; results
+are recorded, not promised:
+
+| Scenario | Result |
+|---|---|
+| 5 sequential transfers, star topology | all 3 nodes h=7, identical tip, identical balances after every step |
+| Multi-hop gossip (node D dials B, not the hub A) | D converged on the next block via B's relay, balances correct |
+| Replay of a real historical block with valid CRC32C | dropped by the tip-extension rule, `corrupted_packets_dropped` stays 0 |
+| Replay of the current tip frame | dropped (height is not `chain_height`) |
+| 10 garbage packets (bad magic) | counter rose to 10, node kept serving |
+| 3 concurrent transfers | serialized by the ledger lock: heights n, n+1, n+2, all applied |
+| Spoke restart mid-chain | rejoined on connect and received the next block |
+| Late joiner from a stale snapshot | honestly stalls at its snapshot height (see limits) |
+| Snapshot restart after an abrupt kill | ledger intact on disk; fresh snapshot rejoins at the tip, next block converges |
+
 ## Honest limits (read before building on this)
 
 - **No backfill sync.** A node that joins late, or misses a block, has no
