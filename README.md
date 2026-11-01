@@ -4,9 +4,10 @@
 > four levels from "it compiles" to "I rebuilt the consensus core from the
 > whitepaper alone". Driving a node? [How nodes work](docs/NODES.md) is the
 > map; the [RPC cookbook](docs/RPC_COOKBOOK.md) has live-captured recipes
-> for every endpoint, and the
+> for every endpoint, the
 > [multi-node runbook](docs/MULTI_NODE_RUNBOOK.md) boots a 3-node VX60
-> testnet in one command.
+> testnet in one command, and the
+> [engineering backlog](docs/BACKLOG.md) tracks everything being built.
 
 ![language](https://img.shields.io/badge/C%2B%2B-26-blue)
 [![CI](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml/badge.svg)](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml)
