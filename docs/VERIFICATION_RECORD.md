@@ -55,7 +55,7 @@ Everything cited below was produced by commands a reader can re-run:
 | 2 | VortexSponge256 | Tested | No published cryptanalysis battery yet |
 | 3 | Key generation & storage | Tested (demo grade) | Entropy-source argument; full per-format WIF roundtrip inventory |
 | 4 | PoGW | Implemented | Wire frames are not re-verified (no PoGW check on the relay path) |
-| 5 | GQC finality | Implemented | No adversarial network model or simulation yet |
+| 5 | GQC finality | Implemented | Shares unauthenticated; checkpoint not persisted across restart |
 | 6 | State & transactions | Tested | Cross-node state-root equality not yet asserted in the testnet script |
 | 7 | Vortex VM / Landauer gas | Implemented | Cross-CPU determinism argument not written |
 | 8 | SGMT state trie | Tested | Two-node identical-state test pending |
@@ -209,6 +209,16 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   the test `GqcQuorumForgeableFromPublicDataOnly` (expect: the forge
   SUCCEEDS today) — flip the test when signature-bearing shares ship
   (BACKLOG 0.4/2.4). Until then VX claims **no** cryptographic finality.
+- **Fixed in external-review round 4.** The share pool was keyed by
+  height alone, so votes for DIFFERENT blocks at the same height mixed
+  into one quorum; pools are now keyed by (height, block hash) and
+  finalization requires shares collected for the exact block being
+  certified. The GQC tail stamp now reports failure (`stamp_gqc_into_tail`
+  returns `bool`) and a failed stamp blocks certification instead of
+  leaving the certificate in RAM with an unstamped tail.
+- **Still open (round 4).** The finalized checkpoint height lives only
+  in RAM: after a restart the rollback guard forgets what was cemented
+  (BACKLOG 0.13, fail-closed restore on open).
 - **Implementation.** `src/consensus/gqc_finality.cpp`;
   `/api/consensus/finality_status` reports checkpoint height, pending
   finality and the rollback guard; `/api/swarm/simulate_split_reorg`
@@ -224,7 +234,7 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   under the model's assumptions") needs a written model first — BACKLOG
   2.4 (validator-set design) and the security-model write-up.
 
-### 6. Blockchain state & transactions — **Tested** (two external-review P0s fixed this pass; authorization still NOT claimed)
+### 6. Blockchain state & transactions — **Tested** (external-review P0s fixed across rounds 3-4; authorization and emission still NOT claimed)
 
 - **Implementation.** `src/state/ledger_state.cpp` (deterministic
   `apply_block`), undo journal for O(1) rollback, `src/state/mempool.cpp`
@@ -243,6 +253,27 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     reservation were two separate critical sections; now one.
   - *Durability*: `append_block` now rolls back the frame and reports
     failure if `fsync` fails, instead of acknowledging a phantom write.
+- **Fixed in external-review round 4 (pinned by `test_documented_gaps`).**
+  - *Genesis-v1 nonce bypass*: any transaction with fee=0/nonce=0 skipped
+    nonce accounting at EVERY height, so the shape could be replayed
+    forever. The exemption is now scoped to the genesis replay window
+    (`next_height <= 1`). Regression: `NonceZeroReplayRejected` (a
+    fee=0/nonce=0 replay at height 3 fails with `nonce mismatch`).
+  - *tx_count poisoning + unverified merkle*: `append_block` accepted a
+    frame whose header `tx_count` was patched past the structural
+    capacity (readers then walk past the frame) and never re-verified the
+    merkle root (the commitment field was decorative). Now: tx_count
+    bound + merkle recomputation gate at the store. Regressions:
+    `OversizedTxCountRejected`, `TamperedMerkleRejected`.
+  - *Miner ignoring commit results*: the mining loop called
+    append/apply and unconditionally drained the mempool; a rejected
+    block destroyed its transactions while the chain stayed behind. The
+    miner now checks both results and keeps sealed transactions on
+    failure.
+  - *RPC transfer auto-fields*: `handle_transfer` left fee/nonce to the
+    (attacker-controlled) request body; the node now stamps fee and the
+    ledger's next nonce itself.
+- **Still open, pinned honestly (expect-success tests).**
 - **Still open, pinned honestly (expect-success tests).**
   - *Keyless authorization*: `verify_transaction_proof` accepts a plain
     sponge digest for any sender not registered as a PQ sender — a
@@ -250,6 +281,24 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     from the genesis receiver (`KeylessTheftReproducible` — the theft
     SUCCEEDS today). TX AUTH IS NOT CLAIMED until BACKLOG 0.7/0.8 ship
     (addresses bound to PQ keys in state; witness on the wire).
+  - *MINER_ emission*: a coinbase needs only the `MINER_` sender prefix,
+    index 0 and an amount at or below the 1000 VX limit — no identity, no
+    PoGW binding — so anyone mints the maximum reward per block
+    (`MinerEmissionForgeable` — the mint SUCCEEDS today). EMISSION
+    INTEGRITY IS NOT CLAIMED until PoGW verification gates coinbase
+    intake (BACKLOG 0.6 + 0.9).
+  - *Undo journal serialization*: `UndoRecord` holds `std::string` /
+    `std::vector` / `time_point` and is written with a raw
+    `write(fd, &record, sizeof(record))` — heap pointers serialized as
+    payload (BACKLOG 0.11).
+  - *Reorg undo defects*: `rollback_to_height` journals the displaced
+    block read from the wrong side of the truncation, and
+    `UndoTransaction` restores balances but not sender nonces (BACKLOG
+    0.12).
+  - *Mempool ordering/race*: the global fee sort can order a sender's
+    nonce-1 tx before its nonce-0 tx (guaranteed apply-failure block),
+    and `count_` is published before the entry is written, so a
+    concurrent reader can observe an unwritten slot (BACKLOG 0.14).
 - **Test suite.** Double-spend rejection, overspend rejection (live:
   `{"error":"insufficient funds"}` leaves the tip unchanged), coinbase
   checks (`excess_reward`, `unauthorized_genesis` guard replays at

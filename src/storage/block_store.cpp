@@ -151,6 +151,14 @@ bool BlockStore::append_block(const BlockFrame& frame) {
 
     if (!v.valid_magic() || v.header().block_height != expected_height) return false;
 
+    // Structural + commitment gate (external review): an oversized tx_count
+    // would poison the ledger file permanently (recovery then fails on
+    // reopen), and an unchecked merkle field is not a commitment at all.
+    if (v.header().tx_count > blockchain::MAX_TX_PER_BLOCK) return false;
+    if (!blockchain::verify_block_merkle(
+            *reinterpret_cast<const blockchain::RawBlock*>(frame.data())))
+        return false;
+
     // Chain binding: prev_block_hash must equal the commitment of the current tip,
     // and the genesis prev-hash must be all zeros.
     uint8_t want_prev[32];
@@ -198,13 +206,15 @@ void BlockStore::tip_hash(uint8_t out[32]) const noexcept {
     blockchain::hash_header(tip->header, out);
 }
 
-void BlockStore::stamp_gqc_into_tail(uint64_t height, const uint8_t agg[32]) {
-    if (height >= count_ || !mapped_ || fd_ < 0) return;
+bool BlockStore::stamp_gqc_into_tail(uint64_t height, const uint8_t agg[32]) {
+    if (height >= count_ || !mapped_ || fd_ < 0) return false;
     // The read-only mapping stays read-only — stamp through the fd instead.
     const off_t at = static_cast<off_t>(height * blockchain::BLOCK_SIZE_BYTES +
                                         blockchain::GQC_TAIL_OFFSET);
-    if (::pwrite(fd_, agg, 32, at) != 32) return;
-    ::fsync(fd_); // MS_SYNC equivalent: certified finality must survive reboot
+    if (::pwrite(fd_, agg, 32, at) != 32) return false;
+    // MS_SYNC equivalent: certified finality must survive reboot — a failed
+    // fsync is a failed stamp (the caller must not certify).
+    return ::fsync(fd_) == 0;
 }
 
 } // namespace vx::storage

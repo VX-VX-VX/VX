@@ -177,6 +177,74 @@ External review (confirmed): `INADDR_ANY` listener, thread-per-connection
 - Acceptance: a slow/garbage client cannot stall or exhaust the server;
   state-changing calls fail closed without credentials.
 
+### 0.11 Undo journal serialization (no raw pointers on disk)
+
+External review (round 4): `UndoRecord` contains `std::string`,
+`std::vector` and `time_point` members, and the journal writes it with a
+raw `write(fd, &record, sizeof(record))` — that serializes heap POINTERS,
+not payloads. On replay the reconstructed record points at freed/garbage
+memory; the journal is corrupt-by-design the moment it holds a
+non-trivial member.
+
+- [ ] Versioned, fixed-width record format: length-prefixed payload
+  fields written byte-wise (no `sizeof(struct)` writes), a format version
+  in the header, and a reader that refuses unknown versions.
+- [ ] Reject-or-migrate on open: a journal whose version/magic does not
+  match is rebuilt from the ledger, never replayed.
+- [ ] Fuzz target: journal bytes -> replay; invariant: no crash, no
+  pointer-looking field is ever dereferenced.
+- Acceptance: the replay path touches only plain bytes; ASan lane runs a
+  rollback-over-poisoned-journal case clean.
+
+### 0.12 Reorg undo correctness (journal the displaced block, restore nonces)
+
+External review (round 4): `rollback_to_height` reads the block at the
+rollback height from the store BEFORE the truncation append, so the
+displaced block's own frame is what gets re-journaled (or lost) depending
+on ordering; and `UndoTransaction` restores balances but not sender
+nonces, so a reorg can desynchronize nonce accounting (replayed or
+permanently gapped senders).
+
+- [ ] Journal the DISPLACED block frames (read before truncate, write
+  before rollback), so a rollback is replayable in both directions.
+- [ ] Snapshot/restore `next_nonce` per sender inside `UndoTransaction`
+  alongside balances.
+- [ ] Test: reorg across a block whose txs advanced nonces, then
+  re-apply the same txs; nonces and balances must both converge.
+- Acceptance: rollback + re-apply is byte-identical to a fresh apply.
+
+### 0.13 GQC checkpoint persistence (RAM-only finalized_height_)
+
+External review (round 4): `finalized_height_` lives only in RAM. After a
+restart the node forgets what was cemented and `rollback_to_height` may
+cross a previously finalized checkpoint — the "absolute defence" against
+deep reorgs evaporates on reboot.
+
+- [ ] Persist the finalized checkpoint (block tail stamp already exists;
+  add a small side-file or scan-back on open: highest height whose tail
+  aggregate verifies against the share-derived recomputation).
+- [ ] `lock_finalized_height` on open must never report a height lower
+  than the persisted one (fail-closed, monotonic).
+- Acceptance: restart test — finalize block N, restart, rollback to N-1
+  is refused.
+
+### 0.14 Mempool per-sender nonce ordering + publication race
+
+External review (round 4): (a) the global fee sort in `pull_for_sealing`
+can order a sender's nonce-1 tx before its nonce-0 tx — the block then
+fails apply and (post-fix) the miner drops it with txs retained;
+repeatable livelock under load. (b) `count_` is bumped by CAS before the
+entry is written into the map; a concurrent reader can observe count
+including a not-yet-written entry (reads a default Transaction).
+
+- [ ] Order pulled txs per sender by nonce (topological by sender), not
+  only by global fee.
+- [ ] Publish entries before bumping `count_` (or use a generation/
+  seqlock so readers skip incomplete slots).
+- Acceptance: stress test — N senders x M out-of-order submissions, all
+  sealed blocks apply on first attempt; concurrent reader never observes
+  an unwritten entry.
+
 ---
 
 ## P1 — harden what ships

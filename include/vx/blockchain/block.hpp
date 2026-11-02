@@ -123,11 +123,16 @@ inline void tx_set_nonce(Transaction& tx, uint32_t v) noexcept {
     for (int i = 0; i < 4; ++i) { tx.nonce[i] = static_cast<uint8_t>(v & 0xFF); v >>= 8; }
 }
 
-// Check if this is a Genesis v1 transaction (fee == 0 and nonce == 0)
+// Check if this is a Genesis v1 transaction (fee == 0 and nonce == 0).
+// NOTE: this shape alone proves nothing about origin — consumers must
+// scope the legacy exemption (see LedgerState::apply_block); a regular
+// user transaction with fee=0/nonce=0 is NOT a genesis transaction.
 inline bool is_genesis_v1_tx(const Transaction& tx) noexcept {
     for (int i = 0; i < 4; ++i) if (tx.fee[i] != 0 || tx.nonce[i] != 0) return false;
     return true;
 }
+
+// Merkle commitment: see the declarations after RawBlock below.
 
 // ── VortexFrameTail (104 bytes, replaces padding) ───────────────────────────
 
@@ -149,6 +154,12 @@ struct alignas(1) RawBlock {
 };
 
 static_assert(sizeof(RawBlock) == BLOCK_SIZE_BYTES, "RawBlock must be exactly 65536 bytes");
+
+// Merkle commitment: recompute from the block body alone and compare
+// against the header field. External review P1: the field existed but
+// was verified nowhere on intake.
+void compute_block_merkle(const RawBlock& raw, uint8_t out[32]) noexcept;
+bool verify_block_merkle(const RawBlock& raw) noexcept;
 
 // ── Common aliases ───────────────────────────────────────────────────────────
 

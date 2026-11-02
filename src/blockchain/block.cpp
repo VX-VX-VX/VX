@@ -23,19 +23,23 @@ static void hash_pair(const uint8_t left[32], const uint8_t right[32], uint8_t o
 }
 
 void BlockBuilder::compute_merkle_root() noexcept {
-    uint32_t count = block_.header.tx_count;
+    compute_block_merkle(block_, block_.header.merkle_root);
+}
+
+void compute_block_merkle(const RawBlock& raw, uint8_t out[32]) noexcept {
+    uint32_t count = raw.header.tx_count;
     // Structural cap: the fixed frame cannot hold more than MAX_TX_PER_BLOCK
     // transactions. add_transaction() enforces this on the way in; the clamp
     // keeps the hash loop in-bounds even if the invariant were ever broken.
     if (count > MAX_TX_PER_BLOCK) count = MAX_TX_PER_BLOCK;
     if (count == 0) {
-        std::memset(block_.header.merkle_root, 0, 32);
+        std::memset(out, 0, 32);
         return;
     }
 
     uint8_t hashes[MAX_TX_PER_BLOCK][32];
     for (uint32_t i = 0; i < count; ++i) {
-        hash_tx(block_.transactions[i], hashes[i]);
+        hash_tx(raw.transactions[i], hashes[i]);
     }
 
     uint32_t level_size = count;
@@ -48,7 +52,16 @@ void BlockBuilder::compute_merkle_root() noexcept {
         }
         level_size = next_size;
     }
-    std::memcpy(block_.header.merkle_root, hashes[0], 32);
+    std::memcpy(out, hashes[0], 32);
+}
+
+bool verify_block_merkle(const RawBlock& raw) noexcept {
+    // Independent recomputation: the header merkle field is a commitment
+    // only if a verifier can rebuild it from the block body alone
+    // (external review P1: the field existed but was checked nowhere).
+    uint8_t expect[32];
+    compute_block_merkle(raw, expect);
+    return std::memcmp(expect, raw.header.merkle_root, 32) == 0;
 }
 
 // Chain ID for replay protection across networks

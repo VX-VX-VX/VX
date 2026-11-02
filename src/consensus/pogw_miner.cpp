@@ -96,8 +96,19 @@ void PoGWMiner::mine_one() {
             if (hash[i] != 0) { match = false; break; }
         }
         if (match && (diff % 8 == 0 || (hash[diff/8] & (0xFF << (8 - diff % 8))) == 0)) {
-            store_.append_block(frame);
-            ledger_.apply_block(blockchain::BlockView(std::span<const uint8_t, 65536>(frame.data(), 65536)));
+            // Commit results are no longer ignored (external review): a
+            // rejected block must not drain the mempool or report success.
+            const bool appended = store_.append_block(frame);
+            const auto applied = ledger_.apply_block(
+                blockchain::BlockView(std::span<const uint8_t, 65536>(frame.data(), 65536)));
+            if (!appended || !applied.ok) {
+                std::cerr << "[MINER] Block #" << height << " REJECTED"
+                          << " (appended=" << appended
+                          << ", applied=" << applied.ok
+                          << (applied.error.empty() ? "" : (std::string(": ") + applied.error))
+                          << "); sealed transactions kept in mempool\n";
+                break;
+            }
 
             // Remove sealed transactions from mempool
             mempool_.remove_sealed(txs);

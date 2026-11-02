@@ -84,6 +84,12 @@ public:
         // Track expected nonce per sender within this block (for intra-block sequential nonce)
         std::unordered_map<Address, uint32_t, AddressHash> expected_nonces_;
 
+        // Legacy Genesis v1 exemption (fee=0/nonce=0 skips nonce accounting)
+        // is scoped to the actual genesis replay window. Unscoped, ANY user
+        // transaction with fee=0/nonce=0 would bypass nonce checks forever
+        // (external review P0: unbounded nonce-0 replay).
+        const bool legacy_window = (next_height_ <= 1);
+
         for (uint32_t i = 0; i < n; ++i) {
             const Transaction& tx = block.tx(i);
 
@@ -146,7 +152,7 @@ public:
                     expected_nonce = nit->second;
                 }
 
-                if (!is_genesis_v1 && nonce != expected_nonce) {
+                if (!(legacy_window && is_genesis_v1) && nonce != expected_nonce) {
                     res.error = "tx " + std::to_string(i) + ": nonce mismatch (expected " +
                                 std::to_string(expected_nonce) + ", got " + std::to_string(nonce) + ")";
                     return res;
@@ -225,7 +231,7 @@ public:
                 }
                 balances_[sender] = balances_[sender] - outflow;
                 // Update nonce for non-genesis-v1 transactions
-                if (!blockchain::is_genesis_v1_tx(tx)) {
+                if (!(legacy_window && blockchain::is_genesis_v1_tx(tx))) {
                     set_next_nonce(sender, blockchain::tx_nonce(tx) + 1);
                 }
             }

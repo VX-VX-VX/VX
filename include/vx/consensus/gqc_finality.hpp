@@ -86,7 +86,12 @@ private:
     storage::BlockStore& store_;
     uint64_t finalized_height_ = 0;
     // (height, hash) -> validator_id -> share
-    std::map<uint64_t, std::map<uint16_t, std::array<uint8_t, 32>>> share_pools_;
+    // Shares are pooled per (height, block hash) — keying by height alone
+    // let votes for DIFFERENT blocks at the same height mix into one
+    // quorum (external review P1).
+    std::map<uint64_t, std::map<std::array<uint8_t, 32>,
+                               std::map<uint16_t, std::array<uint8_t, 32>>>>
+        share_pools_;
 };
 
 } // namespace vx::consensus

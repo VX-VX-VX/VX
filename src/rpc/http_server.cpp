@@ -590,6 +590,12 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     std::memcpy(tx.sender_nfa, sender_addr.data(), 42);
     std::memcpy(tx.receiver_nfa, recv_addr.data(), 42);
     std::memcpy(tx.amount, &amount_atomics, 8);
+    // A zero fee AND zero nonce would shape the tx as "Genesis v1" (legacy
+    // exemption shape) — external review P0: that bypassed nonce accounting
+    // entirely. The demo transfer path now pays a real fee and takes the
+    // sender's next expected nonce from the ledger.
+    vx::blockchain::tx_set_fee(tx, 100);
+    vx::blockchain::tx_set_nonce(tx, ledger_.get_next_nonce(sender_addr));
     vx::blockchain::sign_transaction(tx);
     builder.add_transaction(tx);
     builder.finalize();

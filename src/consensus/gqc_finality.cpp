@@ -71,8 +71,9 @@ void GqcFinality::collect_share(uint64_t block_height,
                                 const std::array<uint8_t, 32>& block_hash,
                                 uint16_t validator_id,
                                 const std::array<uint8_t, 32>& share) {
-    share_pools_[block_height][validator_id] = share;
-    (void)block_hash;
+    // Bound to the exact block: votes for different blocks at the same
+    // height never mix into one quorum.
+    share_pools_[block_height][block_hash][validator_id] = share;
 }
 
 GaloisQuorumCert GqcFinality::finalize_block(uint64_t block_height,
@@ -89,11 +90,18 @@ GaloisQuorumCert GqcFinality::finalize_block(uint64_t block_height,
         return cert;
     }
 
+    // Only shares collected for THIS exact block hash count.
+    const auto hash_it = pool_it->second.find(block_hash);
+    if (hash_it == pool_it->second.end()) {
+        cert.error = "no shares collected for this block hash";
+        return cert;
+    }
+
     // Quorum: >= ceil(2/3 * validator_count) distinct validator shares.
     const size_t needed = (QUORUM_NUM * validator_count + QUORUM_DEN - 1) / QUORUM_DEN;
     std::vector<GqcShare> shares;
-    shares.reserve(pool_it->second.size());
-    for (const auto& [id, share] : pool_it->second) shares.push_back({id, share});
+    shares.reserve(hash_it->second.size());
+    for (const auto& [id, share] : hash_it->second) shares.push_back({id, share});
     cert.share_count = static_cast<uint32_t>(shares.size());
 
     if (shares.size() < needed) {
@@ -105,7 +113,12 @@ GaloisQuorumCert GqcFinality::finalize_block(uint64_t block_height,
     cert.gqc_signature_agg = aggregate_shares(shares, block_hash, block_height);
 
     // Stamp the aggregate into the stored 64 KB frame tail (offset 65464).
-    store_.stamp_gqc_into_tail(block_height, cert.gqc_signature_agg.data());
+    // A failed stamp must NOT certify: the certificate would exist only in
+    // RAM while the block tail never records it (external review P1).
+    if (!store_.stamp_gqc_into_tail(block_height, cert.gqc_signature_agg.data())) {
+        cert.error = "gqc tail stamp failed";
+        return cert;
+    }
 
     // Cement: no rollback may ever cross below this checkpoint again.
     undo_.lock_finalized_height(block_height);

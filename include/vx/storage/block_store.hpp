@@ -43,7 +43,9 @@ public:
  /// write the 32-byte GQC aggregate into the block tail at frame
     /// offset 65464..65495 and flush the mapping (the tail is the padding area,
     /// so this does not alter the header commitment).
-    void stamp_gqc_into_tail(uint64_t height, const uint8_t agg[32]);
+    // Returns false if the stamp could not be persisted — the caller must
+    // not certify on a failed stamp.
+    bool stamp_gqc_into_tail(uint64_t height, const uint8_t agg[32]);
     const std::string& path() const noexcept { return path_; }
 
 private:
