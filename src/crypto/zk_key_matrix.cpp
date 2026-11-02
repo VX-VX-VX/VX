@@ -326,7 +326,10 @@ StealthEnvelope create_stealth_envelope(
                            d.data());
             std::array<uint8_t, 42> decoy{};
             std::memcpy(decoy.data(), "NFA_ST_", 7);
-            std::memcpy(decoy.data() + 7, d.data(), 35);
+            // 32 sponge bytes + 3 checksum bytes, same layout as
+            // derive_stealth_addr above (no out-of-bounds read).
+            std::memcpy(decoy.data() + 7, d.data(), 32);
+            for (int j = 0; j < 3; ++j) decoy[39 + j] = static_cast<uint8_t>(d[j] ^ d[7 + j]);
             env.ring_members.push_back(decoy);
         }
     }
