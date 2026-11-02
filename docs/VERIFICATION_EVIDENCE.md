@@ -1086,6 +1086,7 @@ Notes on fidelity:
 | `424b743` | ROADMAP near-term emptied; BACKLOG 1.1 closed |
 | `d72f6fc` | VERIFICATION_RECORD.md (18-component status) |
 | `c1d6230` | PqLeafLedger: durable one-time-leaf lifecycle, per-call leaf reporting, TEST 8 |
+| `f55fbd1` | External-review finding, fixed at HEAD: synthetic ring decoys read 35 bytes from a 32-byte buffer (3 trailing decoy bytes were adjacent stack garbage). Whole-repo `-Warray-bounds` scan after the fix: zero hits |
 
 Every commit above is GPG-signed locally and **not pushed** at the time
 of signing this document; the push decision stays with the repository
