@@ -55,11 +55,15 @@ curl -s http://localhost:18099/api/status | python3 -m json.tool
 }
 ```
 
-What to look at: `tip_hash_hex` is the Sponge256 digest of the 472-byte
-header of the tip block. On a **fresh** data directory (no `--demo`) it must
+What to look at: `tip_hash_hex` is the Sponge256 digest of the tip block's
+full frame commitment - the 472-byte header AND the 104-byte tail (VM state
+root, gas, PoGW nonce, bytecode), so tail metadata cannot change without
+changing the block id (external review round 5; earlier captures show the
+header-only digest of the same genesis). On a **fresh** data directory
+(no `--demo`) it must
 equal the value published in the whitepaper §16 and in
 [The Vortex Challenge](CHALLENGE.md):
-`ff327c330756241cd7c66a2f207c19202a2d7d38bbe9ffebb23510a72fd75be1`.
+`485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d`.
 After the demo block it differs (the chain grew) — that is expected.
 
 `total_supply_atomics` is a string, not a number: u64 atomics are wider

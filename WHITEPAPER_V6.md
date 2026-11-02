@@ -1027,7 +1027,7 @@ b2fd1f7332a634663fdac32f387c63bc0d6a4fc3e47f62b3baf0c1e0194b7868
 |---|---|
 | Genesis #1 address | `NFA_V6_O4HmXEAExE6zKrurarTRDZVapms3cqqoJkNRNhmgAA` |
 | Genesis #1 balance | 254 000 000 000 000 atomics (2.54M VX) |
-| Genesis tip hash (Sponge256 of the 472-byte header) | `ff327c330756241cd7c66a2f207c19202a2d7d38bbe9ffebb23510a72fd75be1` |
+| Genesis tip hash (Sponge256 over the 472-byte header AND the 104-byte tail - full frame commitment, round 5) | `485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d` |
 | Demo address #2 (Genesis Sender) | `NFA_V6_CLIqoXuU6o9M9cAcFUGEWe7dsxsM8WqV0RwVQnukAA` |
 | Demo address #3 (Transfer Target) | `NFA_V6_iIgiAC7Bohg_wrdof8Vu1y7z0T3zHB3BMxERENEMAA` |
 | Moduli primality | P, Q, R prime (BPSW + 40 MR); P ≡ Q ≡ R ≡ 2 (mod 3) |

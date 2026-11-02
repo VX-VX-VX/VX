@@ -23,6 +23,18 @@
 //   7. TamperedMerkleRejected   — the merkle root was never verified on
 //      intake; now append_block recomputes and rejects mismatches.
 //
+// Round 5 regressions (external review PoCs converted to tests):
+//
+//   8. HtlcVmFailureForcesLocked — the HTLC outcome used to ignore the VM
+//      verdict (CLAIMED even when the bytecode failed at runtime).
+//   9. VaultTokenDigestFullyChecked — only the first 4 token bytes were
+//      stored/compared; a token with a mutated tail still consumed.
+//  10. VaultPoolFullNotClobber — the ring page cursor used to silently
+//      zero a still-LOCKED page when the pool wrapped.
+//  11. TailMetadataCommitted — the block hash used to cover only the
+//      472-byte header, leaving vm/PoGW tail metadata outside the
+//      commitment.
+//
 // All originate from / are confirmed by external review.
 
 #include <gtest/gtest.h>
@@ -30,6 +42,8 @@
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
+#include "vx/core/memory_vault.hpp"
+#include "vx/vm/vortex_vm.hpp"
 
 #include <cstring>
 #include <filesystem>
@@ -422,6 +436,160 @@ TEST(VortexDocumentedGapsTest, TamperedMerkleRejected) {
     EXPECT_FALSE(store.append_block(f))
         << "forged merkle root accepted - commitment regression!";
     EXPECT_EQ(store.chain_height(), 1u) << "forged frame must not land";
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── Regression (round 5, fixed): the HTLC outcome used to be decided by a
+// pre-classification BEFORE the VM ran; a bytecode that failed at runtime
+// (e.g. an opcode swapped in after the shape check) still reported
+// CLAIMED. The VM verdict now gates the outcome.
+TEST(VortexDocumentedGapsTest, HtlcVmFailureForcesLocked) {
+    const auto recipient = [] {
+        std::array<uint8_t, 42> a{};
+        std::memcpy(a.data(), "HTLC_GAP_RECIPIENT_0000000000000000000000000", 42);
+        return a;
+    }();
+    const auto refund = [] {
+        std::array<uint8_t, 42> a{};
+        std::memcpy(a.data(), "HTLC_GAP_REFUND_000000000000000000000000000", 42);
+        return a;
+    }();
+
+    const auto contract = vx::vm::VortexVM::create_htlc_contract(
+        0x5EED5EEDULL, recipient.data(), refund.data(), /*timelock_height=*/100);
+
+    const uint64_t secret = 0x5EED5EEDULL;
+    uint8_t preimage[16];
+    const uint64_t pre_hi = ~secret;
+    std::memcpy(preimage, &secret, 8);
+    std::memcpy(preimage + 8, &pre_hi, 8);
+
+    // Sanity: the canonical contract claims with the canonical preimage.
+    const auto good = vx::vm::VortexVM::settle_htlc_swap(
+        contract.bytecode, std::span<const uint8_t>(preimage, 16), 99);
+    ASSERT_EQ(good.outcome, vx::vm::VortexVM::HtlcOutcome::CLAIMED);
+
+    // The reviewer's PoC: mutate an opcode AFTER the shape check passes.
+    // Byte 33 opens the CLAIM branch (LOAD_IMM R6 1); corrupting it must
+    // NOT leave the outcome at CLAIMED.
+    std::vector<uint8_t> tampered(contract.bytecode);
+    ASSERT_GT(tampered.size(), 34u);
+    tampered[33] = 0xFE; // unknown opcode, executed only on the CLAIM path
+    const auto bad = vx::vm::VortexVM::settle_htlc_swap(
+        tampered, std::span<const uint8_t>(preimage, 16), 99);
+    EXPECT_FALSE(bad.vm_trace.success) << "corrupted bytecode executed cleanly?";
+    EXPECT_EQ(bad.outcome, vx::vm::VortexVM::HtlcOutcome::LOCKED)
+        << "a failed VM run must never settle as CLAIMED (round 5)";
+
+    std::cout << "  [fixed] HTLC with a runtime-corrupted opcode settles"
+              << " LOCKED; the VM verdict gates the contract outcome.\n";
+}
+
+// ── Regression (round 5, fixed): the vault capability token stored and
+// compared only its first 4 bytes - a token with 28 mutated tail bytes
+// still consumed the page. The full 32-byte sponge digest is now stored
+// and compared constant-time.
+TEST(VortexDocumentedGapsTest, VaultTokenDigestFullyChecked) {
+    if (!vx::core::MemoryCore::mlock_supported(4 * 1024 * 1024)) {
+        GTEST_SKIP() << "mlock unavailable in this environment";
+    }
+    vx::core::MemoryCore core(4 * 1024 * 1024);
+    core.initialize(0xA11CE1234567890ULL);
+
+    const std::string payload = "VAULT_REGRESSION_PAYLOAD_ROUND5";
+    const auto token = core.commit_secure_data(
+        reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+
+    // Forge: keep the first 4 bytes, corrupt the remaining 28.
+    std::array<uint8_t, 32> forged = token;
+    for (size_t i = 4; i < 32; ++i) forged[i] = static_cast<uint8_t>(forged[i] ^ 0x5A);
+    EXPECT_NE(forged, token) << "precondition: the tail WAS mutated";
+    uint8_t out[vx::core::MemoryCore::PAGE_SIZE];
+    EXPECT_FALSE(core.consume_data(forged, out))
+        << "a 4-byte-prefix token consumed the page - digest regression!";
+    EXPECT_TRUE(core.consume_data(token, out))
+        << "the genuine token must still consume";
+    EXPECT_EQ(std::memcmp(out, payload.data(), payload.size()), 0);
+
+    std::cout << "  [fixed] vault token with 28 mutated tail bytes is"
+              << " rejected; the full 32-byte digest is checked.\n";
+}
+
+// ── Regression (round 5, fixed): the ring page cursor used to claim a
+// slot unconditionally and silently ZERO a still-LOCKED page on pool wrap
+// (the 4097th commit destroyed the 1st live token in a 16 MiB arena). A
+// full pool must now raise, never clobber.
+TEST(VortexDocumentedGapsTest, VaultPoolFullNotClobber) {
+    vx::core::MemoryCore core(2 * vx::core::MemoryCore::PAGE_SIZE); // 2 slots
+    core.initialize(0xB0B5AFE123456789ULL);
+
+    const std::string a = "PAGE_ALIVE_TOKEN_A";
+    const std::string b = "PAGE_ALIVE_TOKEN_B";
+    const auto tok_a = core.commit_secure_data(
+        reinterpret_cast<const uint8_t*>(a.data()), a.size());
+    const auto tok_b = core.commit_secure_data(
+        reinterpret_cast<const uint8_t*>(b.data()), b.size());
+
+    bool threw = false;
+    try {
+        core.commit_secure_data(reinterpret_cast<const uint8_t*>(a.data()), a.size());
+    } catch (const std::exception& e) {
+        threw = std::string(e.what()).find("pool full") != std::string::npos;
+    }
+    EXPECT_TRUE(threw) << "the third commit must refuse a full pool";
+
+    // Both earlier tokens are still live and readable - nothing was
+    // silently zeroized.
+    uint8_t out[vx::core::MemoryCore::PAGE_SIZE];
+    ASSERT_TRUE(core.consume_data(tok_a, out));
+    EXPECT_EQ(std::memcmp(out, a.data(), a.size()), 0)
+        << "token A payload survived untouched";
+    ASSERT_TRUE(core.consume_data(tok_b, out));
+    EXPECT_EQ(std::memcmp(out, b.data(), b.size()), 0)
+        << "token B payload survived untouched";
+
+    std::cout << "  [fixed] full vault pool refuses instead of zeroing a"
+              << " live LOCKED page; both tokens survive.\n";
+}
+
+// ── Regression (round 5, fixed): the block id committed only the
+// 472-byte header; the tail (vm_state_root, vm_gas_used, pogw_nonce,
+// vm_bytecode) sat OUTSIDE the commitment, so two frames differing only
+// in their PoGW nonce shared one tip hash. hash_block now commits both.
+TEST(VortexDocumentedGapsTest, TailMetadataCommitted) {
+    const std::string dir = temp_dir("vx_gap_tailcommit");
+    vx::storage::BlockStore store(dir + "/tail.vxb", "genesis.bin");
+
+    BlockBuilder b = next_block(store, 44);
+    Transaction t = make_tx(addr_of("GENESIS_2"),
+                            addr_of("NFA_TAIL_TARGET_00000000000000000000000"),
+                            100000000u, 0);
+    sign_transaction(t);
+    ASSERT_TRUE(b.add_transaction(t));
+    b.finalize();
+    BlockFrame f;
+    std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    auto* raw = reinterpret_cast<const RawBlock*>(f.data());
+
+    uint8_t h1[32];
+    hash_block(*raw, h1);
+
+    // Mutate ONE byte of the PoGW nonce inside the tail (offset 65472):
+    // the old header-only digest did not move; the full commitment must.
+    BlockFrame g = f;
+    g.data()[65472] = static_cast<uint8_t>(g.data()[65472] ^ 0x01);
+    auto* raw2 = reinterpret_cast<const RawBlock*>(g.data());
+    uint8_t h2[32];
+    hash_block(*raw2, h2);
+
+    uint8_t header_only_1[32], header_only_2[32];
+    hash_header(raw->header, header_only_1);
+    hash_header(raw2->header, header_only_2);
+    EXPECT_EQ(std::memcmp(header_only_1, header_only_2, 32), 0)
+        << "precondition: header-only digest ignores the tail";
+    EXPECT_NE(std::memcmp(h1, h2, 32), 0)
+        << "a mutated PoGW nonce must change the block commitment";
 
     std::filesystem::remove_all(dir);
 }

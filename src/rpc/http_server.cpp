@@ -24,6 +24,7 @@
 
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -224,12 +225,32 @@ void HttpServer::handle_sse_client(int client_fd) {
     // Send initial comment to keep connection alive
     send_sse_data(client_fd, "connected");
 
-    // Keep connection alive until client disconnects
+    // External review round 5 (thread leak): the accept loop only PEEKed the
+    // request; the old loop PEEKED again and never consumed it, so recv()
+    // kept returning the buffered GET after the client was gone and the
+    // detached thread never observed EOF. Consume the handshake bytes and
+    // then wait on poll() so a closed connection surfaces immediately.
+    const int fl = ::fcntl(client_fd, F_GETFL, 0);
+    if (fl >= 0) ::fcntl(client_fd, F_SETFL, fl | O_NONBLOCK);
+    {
+        char drain[4096];
+        while (::recv(client_fd, drain, sizeof(drain), 0) > 0) {
+        } // EAGAIN (buffer empty) or 0 (client already gone) ends the drain
+    }
+
     char buf[1024];
     while (sse_running_.load()) {
-        ssize_t n = ::recv(client_fd, buf, sizeof(buf) - 1, MSG_PEEK);
-        if (n <= 0) break;
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        struct pollfd pfd{};
+        pfd.fd = client_fd;
+        pfd.events = POLLIN;
+        const int pr = ::poll(&pfd, 1, 1000);
+        if (pr < 0) break;
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
+        if ((pfd.revents & POLLIN) != 0) {
+            const ssize_t n = ::recv(client_fd, buf, sizeof(buf) - 1, 0);
+            if (n == 0) break; // EOF: client disconnected
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) break;
+        }
     }
 
     // Remove client
@@ -409,7 +430,7 @@ HttpResponse HttpServer::handle_blocks(const HttpRequest&) {
         const auto& hdr = v.header();
 
         uint8_t bh[32];
-        vx::blockchain::hash_header(hdr, bh);
+        vx::blockchain::hash_block(*raw, bh); // full-frame commitment (round 5)
 
         oss << "{";
         oss << "\"height\":" << hdr.block_height << ","
@@ -618,7 +639,9 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(frame.data(), 65536));
 
     uint8_t bh[32];
-    vx::blockchain::hash_header(newv.header(), bh);
+    // Full-frame commitment (round 5): the reported block hash must commit
+    // the tail (VM/PoGW metadata) too, not just the 472-byte header.
+    vx::blockchain::hash_block(*reinterpret_cast<const vx::blockchain::RawBlock*>(frame.data()), bh);
     std::ostringstream oss;
     oss << "{";
     oss << "\"status\":\"ok\",\"block_height\":" << next_h << ","
@@ -1056,9 +1079,43 @@ HttpResponse HttpServer::handle_vault_action(const HttpRequest& req) {
         } catch (...) {
             return HttpResponse::json(500, "{\"error\":\"commit failed\"}");
         }
-    } else if (action == "consume" || action == "emergency_burn") {
-        vault_core_.emergency_burn_all();
-        hash_hex = action == "consume" ? "0xCONSUMED" : "0xEMERGENCY_BURN";
+    } else if (action == "consume") {
+        // consume ONE capability token, identified by the full 32-byte hash
+        // that commit returned (external review P0, round 5: the old path
+        // called emergency_burn_all() for BOTH actions — any RPC client
+        // could wipe the whole vault).
+        std::string tok = req.body.find("\"token_hex\":\"") != std::string::npos
+            ? [&] {
+                const std::string pat = "\"token_hex\":\"";
+                const size_t p = req.body.find(pat) + pat.size();
+                return req.body.substr(p, req.body.find('"', p) - p);
+            }()
+            : "";
+        if (tok.size() >= 2 && tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) tok = tok.substr(2);
+        if (tok.size() != 64) {
+            return HttpResponse::json(400,
+                "{\"error\":\"token_hex required: the 32-byte capability hash returned by commit\"}");
+        }
+        std::array<uint8_t, 32> token{};
+        for (size_t i = 0; i < 32; ++i) {
+            try {
+                token[i] = static_cast<uint8_t>(std::stoul(tok.substr(i * 2, 2), nullptr, 16));
+            } catch (...) {
+                return HttpResponse::json(400, "{\"error\":\"token_hex is not valid hex\"}");
+            }
+        }
+        uint8_t out[vx::core::MemoryCore::PAGE_SIZE];
+        if (!vault_core_.consume_data(token, out)) {
+            return HttpResponse::json(404, "{\"error\":\"no live page for this token\"}");
+        }
+        // plaintext is NOT returned over RPC; the caller only learns the burn happened
+        hash_hex = "0x" + hex_bytes(token.data(), 32);
+    } else if (action == "emergency_burn") {
+        // Admin-only destructive operation: deliberately NOT exposed over the
+        // unauthenticated RPC surface (external review P0, round 5). It stays
+        // available to in-process callers (pq signing, shutdown paths).
+        return HttpResponse::json(403,
+            "{\"error\":\"emergency_burn is not available over RPC\"}");
     } else {
         return HttpResponse::json(400, "{\"error\":\"invalid action\"}");
     }

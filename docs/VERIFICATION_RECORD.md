@@ -209,13 +209,22 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   the test `GqcQuorumForgeableFromPublicDataOnly` (expect: the forge
   SUCCEEDS today) — flip the test when signature-bearing shares ship
   (BACKLOG 0.4/2.4). Until then VX claims **no** cryptographic finality.
-- **Fixed in external-review round 4.** The share pool was keyed by
+- **Fixed in external-review rounds 4-5.** The share pool was keyed by
   height alone, so votes for DIFFERENT blocks at the same height mixed
   into one quorum; pools are now keyed by (height, block hash) and
   finalization requires shares collected for the exact block being
-  certified. The GQC tail stamp now reports failure (`stamp_gqc_into_tail`
-  returns `bool`) and a failed stamp blocks certification instead of
-  leaving the certificate in RAM with an unstamped tail.
+  certified. The stamp now reports failure (`stamp_gqc` returns `bool`)
+  and a failed stamp blocks certification instead of leaving the
+  certificate in RAM with nothing durable recorded. Round 5 also moved
+  the stamp OUT of the frame: the 104-byte tail has no free bytes
+  (vm_state_root, vm_gas_used, pogw_nonce, vm_bytecode), so the old
+  tail stamp physically overwrote consensus metadata of the certified
+  block; the aggregate now lives as a versioned record in a sidecar
+  file (`<ledger>.gqc`), the frame stays byte-identical after
+  certification, and the whole tail is inside the block's cryptographic
+  commitment (`hash_block` over header AND tail — a mutated PoGW nonce
+  now changes the block id; the published genesis constant was
+  recomputed accordingly).
 - **Still open (round 4).** The finalized checkpoint height lives only
   in RAM: after a restart the rollback guard forgets what was cemented
   (BACKLOG 0.13, fail-closed restore on open).
@@ -428,6 +437,25 @@ scheduled beyond the 4-node backfill test.
   unchanged, and the real protection level stays visible in
   `stats.mlock_active` (`/api/vault/*`). Sovereign Vault editions keep
   mlock as a hard invariant.
+- **Fixed in external-review round 5.** The capability token was not
+  what its API claimed: `generate_unique_sha32` computed a 4-stream
+  CRC32C checksum (not a cryptographic digest), and only the FIRST 4
+  BYTES were stored and compared on consume — 224 of the 256 token bits
+  were never checked, so a token with a mutated tail still consumed the
+  page. Now the full 32-byte VortexSponge256 digest (domain-separated,
+  bound to the hardware key and an entropy nonce) is stored and compared
+  constant-time. Second round-5 fix: the ring page cursor silently
+  ZEROED a still-LOCKED page on pool wrap (commit #4097 destroyed the
+  1st live token in a 16 MiB arena); a page is now reusable only after
+  consume/burn, and a full pool raises instead of clobbering.
+- **Honest limitation (external review round 5, stated).** `MemoryCore`
+  (src/core) protects against swap-out (mlock) — NOT against a
+  privileged in-process reader: payloads sit in the arena as plaintext,
+  and `check_debugger()` exists but is not wired into the hot path.
+  mlock is swap/core-dump hygiene, not an anti-analysis boundary; any
+  stronger claim would be false. (BACKLOG 1.6 tracks wiring the
+  debugger check and/or masking; the separate SDK implementation's
+  test results do not transfer to this class.)
 
 - **Implementation.** `src/core/memory_vault.cpp`: mlock'd pages,
   VOID -> LOCKED -> BURNED lifecycle, huge pages, guard values;
@@ -499,12 +527,26 @@ replay, mempool tests).
   - Live hostile-input smoke: `amount_vx: 1e999` (string and numeric
     forms) answered clean TDI rejections; the node kept serving; valid
     transfers unaffected.
+- **Fixed in external-review round 5.** The vault route was a
+  remote kill-switch: `POST /api/vault/action` with `consume` OR
+  `emergency_burn` both called `emergency_burn_all()` — any RPC client
+  could wipe the whole vault (P0). Now `consume` requires the specific
+  32-byte capability token and burns exactly one page;
+  `emergency_burn` is refused over RPC (403, admin-only in-process
+  path). The SSE thread leak is fixed: the SSE handler used to PEEK the
+  request forever without consuming it, so a detached thread never
+  observed a disconnect — the handshake is now drained and the wait is
+  poll()-based.
 - **Standing limitations (by design, stated).** No authentication, no
   rate limiting, no request replay protection — the RPC is an observation
   and demo surface with no consensus weight, documented in the cookbook.
-  The seed-leakage requirement holds: no public endpoint returns the
-  node's own key material; callers may *submit* seeds to derivation
-  endpoints (demo), which is different and documented.
+  The seed-leakage requirement holds for the NODE's own key material: no
+  public endpoint returns it. But external-review round 5 correctly
+  flagged demo fixtures over RPC: `/api/crypto/canonical` returns the
+  TEST VECTOR private keys of its built-in profiles, and
+  `/api/crypto/pq_sign` derives from a public demo seed. These are
+  published fixtures, not live keys — but the endpoint must never exist
+  in a production build (BACKLOG 0.10).
 - **Reproducibility.** `ctest`, the fuzz target, and the cookbook's
   commands.
 

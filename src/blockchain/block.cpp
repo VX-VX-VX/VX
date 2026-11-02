@@ -9,6 +9,18 @@ void hash_header(const BlockHeader& header, uint8_t out[32]) noexcept {
     VortexSponge256::compute(reinterpret_cast<const uint8_t*>(&header), HEADER_SIZE_BYTES, out);
 }
 
+void hash_block(const RawBlock& raw, uint8_t out[32]) noexcept {
+    // Full consensus commitment: header (472 B) AND tail (104 B). The tail
+    // carries vm_state_root, vm_gas_used, pogw_nonce and vm_bytecode — all
+    // consensus-critical, none of them covered by the header alone
+    // (external review round 5: a mutated pogw_nonce used to leave the
+    // block hash unchanged).
+    VortexSponge256 sponge;
+    sponge.absorb(reinterpret_cast<const uint8_t*>(&raw.header), HEADER_SIZE_BYTES);
+    sponge.absorb(reinterpret_cast<const uint8_t*>(&raw.tail), PADDING_SIZE_BYTES);
+    sponge.finalize(out);
+}
+
 // ── Merkle root logic using Sponge ──────────────────────────────────────────
 
 void hash_tx(const Transaction& tx, uint8_t out[32]) noexcept {

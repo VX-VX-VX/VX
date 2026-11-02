@@ -12,6 +12,9 @@
 
 namespace vx::core {
 
+/// Capability digest width (32 bytes, full VortexSponge256 output).
+inline constexpr size_t VAULT_HASH_SIZE = 32;
+
 enum class PageState : uint8_t {
     VOID = 0,
     LOCKED = 1,
@@ -26,7 +29,10 @@ struct alignas(16) MemoryPage {
     // Clang/ASan exposed; GCC merely got lucky with zeroed stack memory).
     size_t offset = 0;
     uint32_t capacity = 0;
-    uint32_t content_hash = 0;
+    // Full 32-byte capability digest (external review round 5: the old
+    // uint32_t field made the "256-bit" token effectively 32 bits — the
+    // remaining 224 token bytes were never checked on consume).
+    std::array<uint8_t, VAULT_HASH_SIZE> content_hash{};
     uint8_t state : 2 = 0; // PageState::VOID
     uint8_t reserved : 6 = 0;
 };

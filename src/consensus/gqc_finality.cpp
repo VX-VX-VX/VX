@@ -112,10 +112,11 @@ GaloisQuorumCert GqcFinality::finalize_block(uint64_t block_height,
 
     cert.gqc_signature_agg = aggregate_shares(shares, block_hash, block_height);
 
-    // Stamp the aggregate into the stored 64 KB frame tail (offset 65464).
-    // A failed stamp must NOT certify: the certificate would exist only in
-    // RAM while the block tail never records it (external review P1).
-    if (!store_.stamp_gqc_into_tail(block_height, cert.gqc_signature_agg.data())) {
+    // Persist the aggregate as a sidecar record (<ledger>.gqc). A failed
+    // stamp must NOT certify: the certificate would exist only in RAM
+    // while nothing durable records it (external review P1; round 5 moved
+    // the stamp out of the frame tail, which has no free bytes).
+    if (!store_.stamp_gqc(block_height, cert.gqc_signature_agg.data())) {
         cert.error = "gqc tail stamp failed";
         return cert;
     }

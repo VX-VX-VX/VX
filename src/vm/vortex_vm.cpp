@@ -1112,6 +1112,24 @@ VortexVM::HtlcSettleResult VortexVM::settle_htlc_swap(
         // R6 holds the executed branch marker (1 = CLAIM, 2 = REFUND path).
         res.vm_branch_marker = static_cast<uint8_t>(res.vm_trace.final_registers[6]);
     }
+
+    // External review round 5: the VM's verdict must GATE the outcome. The
+    // pre-classification above is only a prediction; if the canonical
+    // bytecode did not run to success (truncated/tampered code, unknown
+    // opcode, cycle exhaustion) — or ran a branch that contradicts the
+    // prediction — the contract is NOT settled: fall back to LOCKED.
+    if (!res.vm_trace.success || res.vm_trace.cycles_used == 0) {
+        res.outcome = HtlcOutcome::LOCKED;
+        res.vm_branch_marker = 0;
+        return res;
+    }
+    const bool marker_matches =
+        (res.outcome == HtlcOutcome::CLAIMED && res.vm_branch_marker == 1) ||
+        (res.outcome == HtlcOutcome::REFUNDED && res.vm_branch_marker == 2);
+    if (!marker_matches) {
+        res.outcome = HtlcOutcome::LOCKED;
+        res.vm_trace.error = "branch marker contradicts hash-lock/timelock classification";
+    }
     return res;
 }
 

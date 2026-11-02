@@ -142,7 +142,7 @@ void MemoryCore::initialize(uint64_t user_master_key) {
     for (auto& page : pages_) {
         page.offset = 0;
         page.capacity = 0;
-        page.content_hash = 0;
+        page.content_hash.fill(0);
         page.state = static_cast<uint8_t>(PageState::VOID);
     }
     next_page_ = 0;
@@ -150,94 +150,64 @@ void MemoryCore::initialize(uint64_t user_master_key) {
 }
 
 std::array<uint8_t, 32> MemoryCore::generate_unique_sha32(const uint8_t* data, size_t size) {
-    // Hardware-accelerated SSE4.2 CRC32C with 4 independent 64-bit streams
+    // External review round 5: this used to be 4 CRC32C streams — a
+    // non-cryptographic checksum handed out as a capability token. The
+    // digest is now a domain-separated VortexSponge256 output bound to the
+    // vault's hardware key and an entropy nonce. (The historical name is
+    // kept for API stability; the "32" refers to the 32-BYTE digest.)
     std::array<uint8_t, 32> hash{};
 
-    // Initialize 4 independent CRC32C streams
-    uint64_t crc0 = 0xFFFFFFFFFFFFFFFFULL;
-    uint64_t crc1 = 0x9E3779B97F4A7C15ULL;
-    uint64_t crc2 = 0xC6A4A7935BD1E995ULL;
-    uint64_t crc3 = 0x7F4A7C159E3779B9ULL;
-
-    // Process data in 8-byte chunks via the portable CRC32C word primitive
-    size_t i = 0;
-    for (; i + 7 < size; i += 8) {
-        uint64_t chunk;
-        std::memcpy(&chunk, data + i, 8);
-
-        // 4-way parallel CRC32C with cubic mixing
-        crc0 = hw::crc32c_word_update(static_cast<uint32_t>(crc0),
-                                      chunk ^ 0x9E3779B97F4A7C15ULL);
-        crc1 = hw::crc32c_word_update(static_cast<uint32_t>(crc1),
-                                      chunk ^ 0xC6A4A7935BD1E995ULL);
-        crc2 = hw::crc32c_word_update(static_cast<uint32_t>(crc2),
-                                      chunk ^ 0x7F4A7C159E3779B9ULL);
-        crc3 = hw::crc32c_word_update(static_cast<uint32_t>(crc3),
-                                      chunk ^ 0x5BD1E995C6A4A793ULL);
-    }
-
-    // Process remaining bytes with the portable byte primitive
-    for (; i < size; ++i) {
-        crc0 = hw::crc32c_byte_update(static_cast<uint32_t>(crc0), data[i]);
-        crc1 = hw::crc32c_byte_update(static_cast<uint32_t>(crc1), data[i]);
-        crc2 = hw::crc32c_byte_update(static_cast<uint32_t>(crc2), data[i]);
-        crc3 = hw::crc32c_byte_update(static_cast<uint32_t>(crc3), data[i]);
-    }
-
-    // Mix the 4 streams into 32-byte hash
-    crc0 ^= crc0 >> 32;
-    crc1 ^= crc1 >> 32;
-    crc2 ^= crc2 >> 32;
-    crc3 ^= crc3 >> 32;
-
-    // Stream 0 -> bytes 0-7
-    for (int j = 0; j < 8; ++j) {
-        hash[j] = (crc0 >> (j * 8)) & 0xFF;
-    }
-    // Stream 1 -> bytes 8-15
-    for (int j = 0; j < 8; ++j) {
-        hash[8 + j] = (crc1 >> (j * 8)) & 0xFF;
-    }
-    // Stream 2 -> bytes 16-23
-    for (int j = 0; j < 8; ++j) {
-        hash[16 + j] = (crc2 >> (j * 8)) & 0xFF;
-    }
-    // Stream 3 -> bytes 24-31
-    for (int j = 0; j < 8; ++j) {
-        hash[24 + j] = (crc3 >> (j * 8)) & 0xFF;
-    }
-
-    // Add entropy nonce and hw_master_key mixing
     entropy_nonce_.fetch_add(1, std::memory_order_relaxed);
-    uint64_t nonce = entropy_nonce_.load(std::memory_order_relaxed);
-    for (int i = 0; i < 8; ++i) {
-        hash[i] ^= (nonce >> (i * 8)) & 0xFF;
-    }
+    const uint64_t nonce = entropy_nonce_.load(std::memory_order_relaxed);
 
-    uint64_t key_mix = hw_master_key_;
-    for (int i = 0; i < 8; ++i) {
-        hash[16 + i] ^= (key_mix >> (i * 8)) & 0xFF;
-    }
-
+    blockchain::VortexSponge256 sponge;
+    const uint8_t tag[] = "VXVAULTCAPV1";
+    sponge.absorb(tag, sizeof(tag) - 1);
+    const uint8_t km[8] = {
+        static_cast<uint8_t>(hw_master_key_), static_cast<uint8_t>(hw_master_key_ >> 8),
+        static_cast<uint8_t>(hw_master_key_ >> 16), static_cast<uint8_t>(hw_master_key_ >> 24),
+        static_cast<uint8_t>(hw_master_key_ >> 32), static_cast<uint8_t>(hw_master_key_ >> 40),
+        static_cast<uint8_t>(hw_master_key_ >> 48), static_cast<uint8_t>(hw_master_key_ >> 56)};
+    sponge.absorb(km, 8);
+    const uint8_t nm[8] = {
+        static_cast<uint8_t>(nonce), static_cast<uint8_t>(nonce >> 8),
+        static_cast<uint8_t>(nonce >> 16), static_cast<uint8_t>(nonce >> 24),
+        static_cast<uint8_t>(nonce >> 32), static_cast<uint8_t>(nonce >> 40),
+        static_cast<uint8_t>(nonce >> 48), static_cast<uint8_t>(nonce >> 56)};
+    sponge.absorb(nm, 8);
+    if (size && data) sponge.absorb(data, size);
+    sponge.finalize(hash.data());
     return hash;
 }
+
 
 std::array<uint8_t, 32> MemoryCore::commit_secure_data(const uint8_t* raw_data, size_t size) {
     if (size > PAGE_SIZE) {
         throw std::runtime_error("MemoryCore: data exceeds page size");
     }
 
-    size_t page_idx = next_page_.fetch_add(1, std::memory_order_acq_rel) % page_slot_count_;
-    MemoryPage& page = pages_[page_idx];
-
-    if (page.state != static_cast<uint8_t>(PageState::VOID)) {
-        page.state = static_cast<uint8_t>(PageState::VOID);
-        memset(arena_ + page.offset, 0, page.capacity);
+    // External review round 5: the ring cursor used to claim a slot
+    // unconditionally, silently ZEROING a still-LOCKED page when the pool
+    // wrapped (the 4097th commit destroyed the 1st token's payload while
+    // that token was still live). A page is now reusable only after its
+    // token was consumed or burned; a full pool is an error, never a
+    // clobber.
+    const size_t start = next_page_.fetch_add(1, std::memory_order_acq_rel);
+    MemoryPage* target = nullptr;
+    for (size_t k = 0; k < page_slot_count_; ++k) {
+        MemoryPage& cand = pages_[(start + k) % page_slot_count_];
+        if (cand.state == static_cast<uint8_t>(PageState::VOID)) {
+            target = &cand;
+            break;
+        }
     }
+    if (!target) {
+        throw std::runtime_error("MemoryCore: vault pool full (no consumed/burned slot free)");
+    }
+    MemoryPage& page = *target;
 
-    // page_idx < page_slot_count_ <= arena_size_ / PAGE_SIZE, so the page
-    // owns a private, in-bounds region of the arena.
-    page.offset = page_idx * PAGE_SIZE;
+    // page owns a private, in-bounds region of the arena.
+    page.offset = static_cast<size_t>(&page - pages_.data()) * PAGE_SIZE;
     page.capacity = static_cast<uint32_t>(size);
     page.state = static_cast<uint8_t>(PageState::LOCKED);
 
@@ -246,36 +216,40 @@ std::array<uint8_t, 32> MemoryCore::commit_secure_data(const uint8_t* raw_data, 
         memset(arena_ + page.offset + size, 0, PAGE_SIZE - size);
     }
 
-    auto hash = generate_unique_sha32(raw_data, size);
-    page.content_hash = *reinterpret_cast<uint32_t*>(hash.data());
+    // Full 32-byte capability digest (round 5: only the first 4 bytes used
+    // to be stored AND compared, so 224 token bits were never checked).
+    page.content_hash = generate_unique_sha32(raw_data, size);
 
-    return hash;
+    return page.content_hash;
 }
 
 bool MemoryCore::consume_data(const std::array<uint8_t, 32>& h32, uint8_t* out_buffer) {
-    uint32_t target_hash = *reinterpret_cast<const uint32_t*>(h32.data());
-
     for (auto& page : pages_) {
-        if (page.state == static_cast<uint8_t>(PageState::LOCKED) &&
-            page.content_hash == target_hash) {
-
-            if (out_buffer) {
-                std::memcpy(out_buffer, arena_ + page.offset, page.capacity);
-            }
-
-            // Physically zero the arena memory with volatile pointer
-            volatile uint8_t* vp = reinterpret_cast<volatile uint8_t*>(arena_ + page.offset);
-            for (size_t i = 0; i < PAGE_SIZE; ++i) {
-                vp[i] = 0;
-            }
-            // Flush cache lines via the portable hardware primitive
-            hw::flush_cache_range(arena_ + page.offset, PAGE_SIZE);
-
-            page.state = static_cast<uint8_t>(PageState::BURNED);
-            page.capacity = 0;
-            page.content_hash = 0;
-            return true;
+        if (page.state != static_cast<uint8_t>(PageState::LOCKED)) continue;
+        // Constant-time full-digest compare: early-exit memcmp would leak
+        // how many leading bytes of the capability matched.
+        volatile uint8_t diff = 0;
+        for (size_t i = 0; i < 32; ++i) {
+            diff |= page.content_hash[i] ^ h32[i];
         }
+        if (diff != 0) continue;
+
+        if (out_buffer) {
+            std::memcpy(out_buffer, arena_ + page.offset, page.capacity);
+        }
+
+        // Physically zero the arena memory with volatile pointer
+        volatile uint8_t* vp = reinterpret_cast<volatile uint8_t*>(arena_ + page.offset);
+        for (size_t i = 0; i < PAGE_SIZE; ++i) {
+            vp[i] = 0;
+        }
+        // Flush cache lines via the portable hardware primitive
+        hw::flush_cache_range(arena_ + page.offset, PAGE_SIZE);
+
+        page.state = static_cast<uint8_t>(PageState::BURNED);
+        page.capacity = 0;
+        page.content_hash.fill(0);
+        return true;
     }
     return false;
 }
@@ -292,7 +266,7 @@ void MemoryCore::emergency_burn_all() {
             }
             page.state = static_cast<uint8_t>(PageState::BURNED);
             page.capacity = 0;
-            page.content_hash = 0;
+            page.content_hash.fill(0);
         }
     }
     hw_master_key_ = 0;
@@ -435,7 +409,7 @@ bool MemoryCore::burn_page(uint32_t page_id) noexcept {
 
     page.state = static_cast<uint8_t>(PageState::BURNED);
     page.capacity = 0; // slot returns to the reusable pool
-    page.content_hash = 0;
+    page.content_hash.fill(0);
     return true;
 }
 

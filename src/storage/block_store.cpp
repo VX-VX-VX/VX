@@ -203,18 +203,57 @@ void BlockStore::tip_hash(uint8_t out[32]) const noexcept {
         return;
     }
     const RawBlock* tip = get_block(count_ - 1);
-    blockchain::hash_header(tip->header, out);
+    // Full-frame commitment (external review round 5): the header alone does
+    // not cover the tail's VM/PoGW metadata, so chain binding commits both.
+    blockchain::hash_block(*tip, out);
 }
 
-bool BlockStore::stamp_gqc_into_tail(uint64_t height, const uint8_t agg[32]) {
-    if (height >= count_ || !mapped_ || fd_ < 0) return false;
-    // The read-only mapping stays read-only — stamp through the fd instead.
-    const off_t at = static_cast<off_t>(height * blockchain::BLOCK_SIZE_BYTES +
-                                        blockchain::GQC_TAIL_OFFSET);
-    if (::pwrite(fd_, agg, 32, at) != 32) return false;
-    // MS_SYNC equivalent: certified finality must survive reboot — a failed
-    // fsync is a failed stamp (the caller must not certify).
-    return ::fsync(fd_) == 0;
+bool BlockStore::stamp_gqc(uint64_t height, const uint8_t agg[32]) {
+    if (height >= count_ || fd_ < 0) return false;
+    // Sidecar certificate record (external review round 5): the 104-byte
+    // tail has no free bytes — vm_state_root, vm_gas_used, pogw_nonce and
+    // vm_bytecode occupy all of them — so stamping into the frame would
+    // physically destroy consensus metadata of a certified block. The
+    // aggregate is stored as a versioned record in <ledger>.gqc instead;
+    // the frame itself never changes after append.
+    const int gfd = ::open((path_ + ".gqc").c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (gfd < 0) return false;
+    uint8_t rec[48];
+    std::memcpy(rec, "VXGQCRT1", 8);
+    const uint64_t h = height; // little-endian on LE hosts; read back via memcmp of height bytes
+    std::memcpy(rec + 8, &h, 8);
+    std::memcpy(rec + 16, agg, 32);
+    const bool ok = ::write(gfd, rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec)) &&
+                    ::fsync(gfd) == 0;
+    ::close(gfd);
+    return ok;
+}
+
+bool BlockStore::gqc_stamp(uint64_t height, uint8_t out[32]) const {
+    if (height >= count_) return false;
+    const int gfd = ::open((path_ + ".gqc").c_str(), O_RDONLY);
+    if (gfd < 0) return false;
+    bool found = false;
+    bool corrupt = false;
+    uint8_t rec[48];
+    // Records are appended in certification order; the LAST record for a
+    // height wins (re-certification after a re-stamp is legitimate). A
+    // corrupt record fails the whole read closed — a partially trusted
+    // certificate store is worse than none.
+    while (::read(gfd, rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec))) {
+        if (std::memcmp(rec, "VXGQCRT1", 8) != 0) {
+            corrupt = true;
+            break;
+        }
+        uint64_t h = 0;
+        std::memcpy(&h, rec + 8, 8);
+        if (h == height) {
+            std::memcpy(out, rec + 16, 32);
+            found = true;
+        }
+    }
+    ::close(gfd);
+    return found && !corrupt;
 }
 
 } // namespace vx::storage

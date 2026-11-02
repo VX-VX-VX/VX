@@ -81,11 +81,14 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     EXPECT_EQ(gqc.finalized_checkpoint_height(), tip_h);
     EXPECT_EQ(undo.finalized_checkpoint_height(), tip_h);
 
-    // The aggregate is stamped into the block tail (frame offset 65464).
+    // The aggregate is persisted as a sidecar record (<ledger>.gqc) — the
+    // frame tail has no free bytes (VM/PoGW metadata), and the certified
+    // frame must stay byte-identical after certification (round 5).
     const auto* raw = store.get_block(tip_h);
     ASSERT_NE(raw, nullptr);
-    const auto* stamped = reinterpret_cast<const uint8_t*>(raw) + vx::blockchain::GQC_TAIL_OFFSET;
-    EXPECT_EQ(std::memcmp(stamped, cert.gqc_signature_agg.data(), 32), 0);
+    uint8_t persisted[32];
+    ASSERT_TRUE(store.gqc_stamp(tip_h, persisted)) << "sidecar record missing";
+    EXPECT_EQ(std::memcmp(persisted, cert.gqc_signature_agg.data(), 32), 0);
 
     // Deep reorg below the checkpoint is now impossible. Rolling back to the
     // checkpoint itself stays legal (removes nothing above it).

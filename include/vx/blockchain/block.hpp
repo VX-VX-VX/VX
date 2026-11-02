@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <array>
+#include <cstddef>
 #include <span>
 
 namespace vx::blockchain {
@@ -40,9 +41,12 @@ inline constexpr size_t   MAX_TX_PER_BLOCK   = 580;
 // NOTE: spec said 88 B padding, but 472 + 580*112 + 88 = 65520 ≠ 65536.
 // Exactly 580 transactions of 112 B in a fixed 64 KB frame requires 104 B padding.
 inline constexpr size_t   PADDING_SIZE_BYTES = 104;
-// gqc_signature_agg is stamped into the tail padding area of the
-// 64 KB frame at this byte offset (occupies 65464..65495).
-inline constexpr uint64_t GQC_TAIL_OFFSET    = 65464;
+// NOTE (external review round 5): the tail has NO free bytes — vm_state_root
+// (65432..65463), vm_gas_used (65464..65471), pogw_nonce (65472..65479) and
+// vm_bytecode (65480..65535) occupy all 104 of them. The GQC aggregate is
+// therefore NOT stamped into the frame (that would overwrite consensus
+// metadata); it lives in a versioned sidecar record beside the ledger file
+// (see storage::BlockStore::stamp_gqc).
 
 static_assert(HEADER_SIZE_BYTES + MAX_TX_PER_BLOCK * TX_SIZE_BYTES + PADDING_SIZE_BYTES == BLOCK_SIZE_BYTES,
               "Block layout must be exactly 64 KB");
@@ -155,6 +159,14 @@ struct alignas(1) RawBlock {
 
 static_assert(sizeof(RawBlock) == BLOCK_SIZE_BYTES, "RawBlock must be exactly 65536 bytes");
 
+// Tail field offsets are consensus layout facts (external review round 5):
+// every consumer of the tail must be able to prove where each field sits.
+static_assert(offsetof(RawBlock, tail) == 65432, "tail must start at 65432");
+static_assert(offsetof(RawBlock, tail.vm_state_root) == 65432, "vm_state_root at 65432");
+static_assert(offsetof(RawBlock, tail.vm_gas_used) == 65464, "vm_gas_used at 65464");
+static_assert(offsetof(RawBlock, tail.pogw_nonce) == 65472, "pogw_nonce at 65472");
+static_assert(offsetof(RawBlock, tail.vm_bytecode) == 65480, "vm_bytecode at 65480");
+
 // Merkle commitment: recompute from the block body alone and compare
 // against the header field. External review P1: the field existed but
 // was verified nowhere on intake.
@@ -178,6 +190,17 @@ inline Address tx_address(const uint8_t raw[42]) noexcept {
  * consistent with the Merkle hashing in block.cpp.
  */
 void hash_header(const BlockHeader& header, uint8_t out[32]) noexcept;
+
+/**
+ * @brief Full consensus commitment over a block frame: header AND tail.
+ * External review round 5: hash_header covered only the 472-byte header,
+ * leaving the tail's vm_state_root / vm_gas_used / pogw_nonce / vm_bytecode
+ * outside the commitment — two frames differing only in their tail (e.g. a
+ * mutated PoGW nonce) shared one tip hash. Chain binding (tip_hash) and the
+ * RPC block-hash fields use hash_block; hash_header remains for header-only
+ * diagnostics.
+ */
+void hash_block(const RawBlock& raw, uint8_t out[32]) noexcept;
 
 // ── Block View (zero-copy over mmap'd or in-memory buffer) ──────────────────
 

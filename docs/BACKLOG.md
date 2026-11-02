@@ -174,8 +174,19 @@ External review (confirmed): `INADDR_ANY` listener, thread-per-connection
 - [ ] Bounded thread pool or connection cap; per-connection timeouts.
 - [ ] Complete request reads (loop until full header/body or cap).
 - [ ] Auth for state-changing endpoints (loopback default; token opt-in).
+- [ ] Thread lifecycle: detached HTTP/SSE workers are not tracked or
+  joined by `stop()`; a server teardown can race live workers. Replace
+  detached threads with tracked workers and join them in `stop()`.
+  (The SSE accept/EOF leak itself is fixed — round 5: handshake drained,
+  poll-based wait — but the detached-thread model remains.)
+- [ ] Demo key material out of the production RPC: `/api/crypto/canonical`
+  returns its test-vector private keys, and `/api/crypto/pq_sign` derives
+  from a public demo seed. Move fixtures to files, compile demo signers
+  out of production builds (external review round 5, finding 18).
 - Acceptance: a slow/garbage client cannot stall or exhaust the server;
-  state-changing calls fail closed without credentials.
+  state-changing calls fail closed without credentials; `stop()` leaves
+  zero live worker threads; no build reachable from the internet serves
+  a private key.
 
 ### 0.11 Undo journal serialization (no raw pointers on disk)
 

@@ -24,9 +24,9 @@
 namespace vx::consensus {
 
 inline constexpr size_t   GQC_AGG_BYTES   = 32;
-/// Byte offset of gqc_signature_agg inside a 64 KB block frame
-/// (blockchain::GQC_TAIL_OFFSET = 65464; tail bytes 32..63).
-inline constexpr uint64_t GQC_TAIL_OFFSET = blockchain::GQC_TAIL_OFFSET;
+// The aggregate is persisted as a versioned sidecar record (<ledger>.gqc),
+// NOT inside the frame: the 104-byte tail is fully occupied by VM/PoGW
+// metadata (external review round 5).
 
 struct GqcShare {
     uint16_t validator_id = 0;
