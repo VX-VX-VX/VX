@@ -115,10 +115,19 @@ void MemoryCore::fallback_alloc(size_t size) {
     }
 
     if (mlock(ptr, size) != 0) {
-        free(ptr);
-        throw std::runtime_error("MemoryCore: mlock failed");
+        // Documented Public Core degradation (memory_vault.hpp): a low
+        // RLIMIT_MEMLOCK (e.g. 8 MiB containers) must not block node
+        // launch. The arena runs unlocked - pages are resident only
+        // opportunistically - while zeroization guarantees are unaffected.
+        // Sovereign Vault editions keep mlock as a hard invariant; the
+        // actual protection level is reported via stats.mlock_active
+        // (/api/vault/memory, /api/vault/report).
+        std::fprintf(stderr, "[MemoryCore] WARNING: mlock failed "
+                             "(check RLIMIT_MEMLOCK); running WITHOUT locked pages\n");
+        arena_mlock_active_ = false;
+    } else {
+        arena_mlock_active_ = true;
     }
-    arena_mlock_active_ = true;
 
     madvise(ptr, size, MADV_DONTFORK | MADV_DONTDUMP);
     arena_ = static_cast<uint8_t*>(ptr);

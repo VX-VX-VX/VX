@@ -38,13 +38,17 @@ static uint32_t tx_nonce_local(const Transaction& tx) noexcept {
 
 
 bool Mempool::validate_pending(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    return validate_pending_locked(tx, sender_balance, sender_nonce);
+}
+
+bool Mempool::validate_pending_locked(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept {
     Address sender = tx_address(tx.sender_nfa);
     uint64_t amount = tx_amount_local(tx);
     uint32_t fee = tx_fee_local(tx);
     uint32_t nonce = tx_nonce_local(tx);
 
     // Check nonce
-    std::lock_guard<std::mutex> lock(pending_mutex_);
     auto nonce_it = pending_nonces_.find(sender);
     uint32_t expected_nonce = (nonce_it == pending_nonces_.end()) ? sender_nonce : nonce_it->second;
 
@@ -119,8 +123,13 @@ SubmitResult Mempool::submit(const Transaction& tx, const U128& sender_balance, 
         return result;
     }
 
-    // 3. Validate against pending state (nonce + balance)
-    if (!validate_pending(tx, sender_balance, sender_nonce)) {
+    // 3..7: ONE critical section. Validation and the pending-state update
+    // are atomic together — two concurrent submits of the same nonce can
+    // no longer both pass the check before either reserves (TOCTOU fix).
+    // find_slot()'s count_ CAS does not touch pending_mutex_, and no other
+    // locked section calls back into this path, so the nesting is safe.
+    std::lock_guard<std::mutex> pending_lock(pending_mutex_);
+    if (!validate_pending_locked(tx, sender_balance, sender_nonce)) {
         result.error = "nonce mismatch or insufficient balance (including pending)";
         return result;
     }
@@ -147,12 +156,9 @@ SubmitResult Mempool::submit(const Transaction& tx, const U128& sender_balance, 
     entry.sender_nonce = nonce;
     entry.valid = true;
 
-    // 7. Update pending state
-    {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_outgoing_[sender] = pending_outgoing_[sender] + U128(amount + fee);
-        pending_nonces_[sender] = nonce + 1;
-    }
+    // 7. Update pending state (same critical section as step 3)
+    pending_outgoing_[sender] = pending_outgoing_[sender] + U128(amount + fee);
+    pending_nonces_[sender] = nonce + 1;
 
     version_.fetch_add(1, std::memory_order_release);
 

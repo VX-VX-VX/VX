@@ -141,6 +141,12 @@ private:
 
     // Validate transaction against pending state
     bool validate_pending(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept;
+
+    // Same check with the assumption that pending_mutex_ is already held.
+    // The submit path needs this form: validation and pending-state update
+    // must be ONE critical section, otherwise two concurrent submits of
+    // the same nonce both pass the check before either reserves (TOCTOU).
+    bool validate_pending_locked(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept;
 };
 
 } // namespace vx::state

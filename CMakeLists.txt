@@ -122,6 +122,10 @@ target_link_libraries(crypto_deep_tests PRIVATE vx_core gtest gtest_main)
 add_executable(test_block tests/test_block.cpp)
 target_link_libraries(test_block PRIVATE vx_core gtest gtest_main)
 
+add_executable(test_documented_gaps tests/test_documented_gaps.cpp)
+target_link_libraries(test_documented_gaps PRIVATE vx_core gtest gtest_main)
+target_link_libraries(test_block PRIVATE vx_core gtest gtest_main)
+
 # Mempool test suite
 add_executable(test_mempool tests/test_mempool.cpp)
 target_link_libraries(test_mempool PRIVATE vx_core gtest gtest_main)
@@ -175,6 +179,7 @@ enable_testing()
 add_test(NAME VortexMathTest COMMAND test_vortex)
 add_test(NAME VortexDeepCryptoTest COMMAND crypto_deep_tests)
 add_test(NAME VortexBlockTest COMMAND test_block)
+add_test(NAME VortexDocumentedGapsTest COMMAND test_documented_gaps)
 add_test(NAME VortexMempoolTest COMMAND test_mempool)
 add_test(NAME VortexVMTest COMMAND test_vm)
 add_test(NAME VortexChainReorgTest COMMAND test_reorg)

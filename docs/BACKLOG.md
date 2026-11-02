@@ -120,6 +120,63 @@ re-mined.
 - Acceptance: a crafted tip-extending frame without valid PoGW is
   rejected before touching the ledger; test in the suite.
 
+### 0.7 Transaction authorization (keyless tier must go)
+
+Pinned reproducibly by `VortexDocumentedGapsTest.KeylessTheftReproducible`
+(expect: the theft SUCCEEDS today). `verify_transaction_proof` accepts a
+plain sponge digest for any sender not registered as a PQ sender — and a
+digest requires no key, so an attacker holding nothing can move funds
+from any non-PQ-bound address (external review demonstrated 1 VX out of
+the genesis receiver; re-confirmed at current main).
+
+- [ ] Bind addresses to PQ public keys in consensus state (genesis
+  allocation + on-chain registration path).
+- [ ] Reject any non-PQ-bound sender's transfer on the consensus path
+  (remove the keyless Tier 2 fallback from acceptance).
+- [ ] The demo RPC must not sign on the user's behalf.
+- Acceptance: the pin test flips to EXPECT_FALSE; a forged transfer is
+  rejected by ledger rules with a specific error.
+
+### 0.8 PQ witness on the wire (consensus-visible signatures)
+
+`PqSignatureWitness` (2376 B) lives only in the in-process
+`PqWitnessRegistry`: another node — or the same node after a restart —
+cannot verify a PQ-signed transaction (external review, confirmed).
+
+- [ ] Canonical wire/storage encoding for the witness; block or tx
+  carries the witness its verification needs.
+- [ ] Sender's XMSS root committed in block data; rules for accepting a
+  new sender key.
+- Acceptance: node A verifies node B's PQ-signed tx without shared
+  process state; restart does not orphan a witnessed chain.
+
+### 0.9 Central block validation (single intake gate)
+
+Pinned by `VortexDocumentedGapsTest.NoWorkBlockAccepted` (expect: an
+empty, no-work, timestamp-0 frame is accepted today).
+
+- [ ] One `validate_block()` covering: PoGW vs difficulty, merkle root,
+  timestamp, height/prev binding, tx count, every tx proof, state rules.
+- [ ] Called on ALL intake paths: RPC accept, P2P relay, disk write,
+  restart recovery.
+- Confirmed by reviewer PoC: a frame with a deliberately forged merkle
+  root passes `apply_block` and moves balances — the merkle field is
+  currently not re-verified anywhere on intake; it belongs to this same
+  single gate.
+- Acceptance: the pin test flips to EXPECT_FALSE; no path can append an
+  invalid frame.
+
+### 0.10 RPC server hardening
+
+External review (confirmed): `INADDR_ANY` listener, thread-per-connection
+(detached), single 8 KiB `recv()` per request, no auth.
+
+- [ ] Bounded thread pool or connection cap; per-connection timeouts.
+- [ ] Complete request reads (loop until full header/body or cap).
+- [ ] Auth for state-changing endpoints (loopback default; token opt-in).
+- Acceptance: a slow/garbage client cannot stall or exhaust the server;
+  state-changing calls fail closed without credentials.
+
 ---
 
 ## P1 — harden what ships

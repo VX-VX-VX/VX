@@ -74,6 +74,11 @@ public:
         std::vector<U128> fees(n);
         // Intra-block pending credits for intra-block spendability.
         std::unordered_map<Address, U128, AddressHash> pending_;
+        // Intra-block DEBITS per sender (amount + fee, cumulative). Without
+        // this, two spends of the same sender each pass the balance check
+        // independently and the commit loop underflows U128 — minting an
+        // astronomically large phantom balance (external review P0, fixed).
+        std::unordered_map<Address, U128, AddressHash> intra_debits_;
 
  // verify every sender has sufficient funds + nonce.
         // Track expected nonce per sender within this block (for intra-block sequential nonce)
@@ -151,10 +156,34 @@ public:
                 U128 balance = balance_of(sender);
                 auto pit = pending_.find(sender);
                 if (pit != pending_.end()) balance = balance + pit->second;
+                // Subtract this sender's earlier spends IN THE SAME BLOCK
+                // (checked): each tx must be validated against the balance
+                // the commit loop will actually see.
+                auto dit = intra_debits_.find(sender);
+                if (dit != intra_debits_.end()) {
+                    if (dit->second > balance) {
+                        res.error = "tx " + std::to_string(i) + ": insufficient funds";
+                        return res;
+                    }
+                    balance = balance - dit->second;
+                }
                 if (balance < total_cost) {
                     res.error = "tx " + std::to_string(i) + ": insufficient funds";
                     return res;
                 }
+                // Accumulate the debit NOW (checked add). Real debit sums
+                // are bounded by total supply (~2.6e14 atomics), far below
+                // 2^64; anything larger is refused instead of wrapping.
+                const U128 this_debit = U128(amount) + U128(fee);
+                U128 acc = U128{};
+                auto ait = intra_debits_.find(sender);
+                if (ait != intra_debits_.end()) acc = ait->second;
+                if (acc > U128(0xFFFFFFFFFFFFFFFFULL) ||
+                    this_debit > U128(0xFFFFFFFFFFFFFFFFULL) - acc) {
+                    res.error = "tx " + std::to_string(i) + ": debit accumulator overflow";
+                    return res;
+                }
+                intra_debits_[sender] = acc + this_debit;
                 fees[i] = U128(fee);
             }
             debits[i] = U128(amount);
@@ -185,7 +214,16 @@ public:
                                (std::strncmp(s, "MINER_", 6) == 0);
 
             if (!is_coinbase) {
-                balances_[sender] = balances_[sender] - debits[i] - fees[i];
+                // Hard underflow guard (defense in depth): the pre-check
+                // loop's intra_debits_ accounting makes this unreachable;
+                // if it ever fired, refusing is better than minting a
+                // 2^128 phantom balance.
+                const U128 outflow = debits[i] + fees[i];
+                if (balances_[sender] < outflow) {
+                    res.error = "tx " + std::to_string(i) + ": internal underflow guard";
+                    return res;
+                }
+                balances_[sender] = balances_[sender] - outflow;
                 // Update nonce for non-genesis-v1 transactions
                 if (!blockchain::is_genesis_v1_tx(tx)) {
                     set_next_nonce(sender, blockchain::tx_nonce(tx) + 1);
@@ -238,7 +276,16 @@ public:
     /// Total atomics in circulation (sanity invariant against supply inflation).
     U128 total_supply() const noexcept {
         U128 sum{};
-        for (const auto& [addr, bal] : balances_) sum = sum + bal;
+        for (const auto& [addr, bal] : balances_) {
+            // Checked accumulation: with per-sender intra-block debits
+            // enforced in apply_block, balances cannot wrap - but this
+            // sum must never silently mask a corrupted state either.
+            if (bal > U128(0xFFFFFFFFFFFFFFFFULL) ||
+                sum > U128(0xFFFFFFFFFFFFFFFFULL) - bal) {
+                return U128(0xFFFFFFFFFFFFFFFFULL); // saturated: caller must treat as anomaly
+            }
+            sum = sum + bal;
+        }
         return sum;
     }
 

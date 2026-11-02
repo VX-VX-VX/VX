@@ -213,14 +213,22 @@ frame and rejects torn tails.
 
 - **PoGW (Proof-of-Genuine-Work):** the block's attractor coordinates are the
   miner's real evaluated state; the header coordinates and the claimed work
-  must be mutually consistent.
+  must be mutually consistent. *(Prototype note: current acceptance is
+  hash-based — leading zero bits of a sponge hash; genuine-work acceptance
+  and per-node re-verification on the relay path are roadmap items —
+  see docs/BACKLOG.md 0.6.)*
 - **ASERT:** continuous difficulty adjustment
   `D_h = D_{h−1} · 2^((t_target − t_solve)/τ)` with a 5-second dev target and
-  τ = 130 half-life — no step-wise retarget cliffs.
+  τ = 130 half-life — no step-wise retarget cliffs. *(Prototype note: the
+  current implementation is not anchor-based yet — see
+  docs/VERIFICATION_RECORD.md §4.)*
 - **GQC finality:** once a tip is finalized, conflicting reorgs are rejected
   by rule, not by depth heuristics. The test suite exercises a finalized
   reorg being blocked and a split-brain partition converging on the
-  heavier-work chain.
+  heavier-work chain. *(Prototype note: validator shares are not
+  signature-authenticated yet — a quorum is forgeable from public data,
+  pinned by test `GqcQuorumForgeableFromPublicDataOnly`. VX claims NO
+  cryptographic finality until BACKLOG 0.4/2.4 ships.)*
 
 ### Vortex VM — Landauer thermodynamic gas
 

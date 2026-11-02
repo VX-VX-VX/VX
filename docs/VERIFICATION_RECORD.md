@@ -224,11 +224,32 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   under the model's assumptions") needs a written model first — BACKLOG
   2.4 (validator-set design) and the security-model write-up.
 
-### 6. Blockchain state & transactions — **Tested**
+### 6. Blockchain state & transactions — **Tested** (two external-review P0s fixed this pass; authorization still NOT claimed)
 
 - **Implementation.** `src/state/ledger_state.cpp` (deterministic
   `apply_block`), undo journal for O(1) rollback, `src/state/mempool.cpp`
   with the TDI dust gate.
+- **Fixed this pass (external review, pinned by
+  `test_documented_gaps`).**
+  - *Intra-block double spend minted phantom supply*: the pre-check
+    counted intra-block credits but not the same sender's intra-block
+    debits, so two 6 VX spends against a 10 VX balance both passed and
+    the commit underflowed U128 to ~2^128. Fixed: per-sender intra-block
+    debit accumulator (checked), a hard commit-time underflow guard, and
+    a checked `total_supply()` sum. Regression:
+    `DoubleSpendInBlockRejected` (block refused with `insufficient
+    funds`, zero mutation).
+  - *Mempool TOCTOU*: nonce/balance validation and the pending-state
+    reservation were two separate critical sections; now one.
+  - *Durability*: `append_block` now rolls back the frame and reports
+    failure if `fsync` fails, instead of acknowledging a phantom write.
+- **Still open, pinned honestly (expect-success tests).**
+  - *Keyless authorization*: `verify_transaction_proof` accepts a plain
+    sponge digest for any sender not registered as a PQ sender — a
+    digest anyone can compute, so an attacker with NO key moved 1 VX
+    from the genesis receiver (`KeylessTheftReproducible` — the theft
+    SUCCEEDS today). TX AUTH IS NOT CLAIMED until BACKLOG 0.7/0.8 ship
+    (addresses bound to PQ keys in state; witness on the wire).
 - **Test suite.** Double-spend rejection, overspend rejection (live:
   `{"error":"insufficient funds"}` leaves the tip unchanged), coinbase
   checks (`excess_reward`, `unauthorized_genesis` guard replays at
@@ -348,7 +369,16 @@ scheduled beyond the 4-node backfill test.
   conditions do not exist (and are only meaningful after the network
   items land).
 
-### 13. MemoryVault & secrets in RAM — **Tested**
+### 13. MemoryVault & secrets in RAM — **Tested** (mlock degradation now matches the documented promise)
+
+- **Fixed this pass (external review):** `MemoryCore` used to `throw` on
+  `mlock` failure, blocking node launch in containers with a low
+  `RLIMIT_MEMLOCK` — while the header itself promised graceful
+  degradation for the public build. Now the failure is loud on stderr,
+  the node launches with unlocked pages, zeroization guarantees are
+  unchanged, and the real protection level stays visible in
+  `stats.mlock_active` (`/api/vault/*`). Sovereign Vault editions keep
+  mlock as a hard invariant.
 
 - **Implementation.** `src/core/memory_vault.cpp`: mlock'd pages,
   VOID -> LOCKED -> BURNED lifecycle, huge pages, guard values;
@@ -401,6 +431,12 @@ replay, mempool tests).
 
 ### 16. RPC & API security — **Tested (this pass)**
 
+- **Transport hardening still open (external review, BACKLOG 0.10):**
+  the listener binds `INADDR_ANY`, spawns a detached thread per
+  connection, reads a request with a single 8 KiB `recv()`, and has no
+  authentication on state-changing endpoints. For any reachable
+  deployment: reverse proxy + bind/flag controls first (BACKLOG 0.3),
+  then bounded concurrency, complete request reads and auth.
 - **What this verification pass added.**
   - A public `route()` catch-all: a hostile body can no longer unwind a
     worker thread (which would terminate the node); it now answers 500.

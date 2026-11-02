@@ -169,7 +169,14 @@ bool BlockStore::append_block(const BlockFrame& frame) {
         ::ftruncate(fd_, offset); // roll back the torn frame
         return false;
     }
-    ::fsync(fd_);
+    // Durability is part of the append contract: a reported success must
+    // mean the frame survived a power cut. An fsync error is treated like
+    // any other failed write - the frame is rolled back and the caller
+    // sees a rejection, never a phantom acknowledgment.
+    if (::fsync(fd_) != 0) {
+        ::ftruncate(fd_, offset);
+        return false;
+    }
 
     ++count_;
     return ensure_mapping(count_ * BLOCK_SIZE_BYTES);
