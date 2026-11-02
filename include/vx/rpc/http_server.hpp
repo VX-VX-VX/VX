@@ -10,6 +10,7 @@
 #include "vx/core/memory_vault.hpp"
 #include "vx/core/rt_scheduler.hpp"
 #include "vx/core/ring_pipeline.hpp"
+#include "vx/crypto/pq_signature.hpp"
 #include "vx/vm/vortex_vm.hpp"
 #include "vx/crypto/zk_key_matrix.hpp"
 #include "vx/math/tensor_v6.hpp"
@@ -259,6 +260,11 @@ private:
     std::unique_ptr<vx::state::GaloisTrie> trie_ =
         std::make_unique<vx::state::GaloisTrie>();
     std::array<uint8_t, 32> trie_root_cache_{};
+
+ // Durable one-time-leaf registry for PQ signing (data_dir/pq_leaves.reg):
+ // a leaf that signed once is never handed out again, across restarts and
+ // concurrent signer processes.
+    std::unique_ptr<vx::crypto::pq::PqLeafLedger> pq_leaf_ledger_;
 };
 
 } // namespace vx::rpc

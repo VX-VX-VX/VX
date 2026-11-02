@@ -18,9 +18,11 @@
 #include "vx/blockchain/block.hpp"
 
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 namespace vx::crypto::pq {
@@ -131,23 +133,55 @@ struct PqSignTimings {
     double sign_us = 0.0;
     double verify_us = 0.0;
     bool vault_burn_verified = false;
+    // The leaf this call actually signed with (0..15). Reported per call so
+    // concurrent signers of the *same* message can each name their own
+    // witness — the by-digest registry alone cannot distinguish them.
+    uint32_t used_leaf_index = 0xFFFFFFFFu;
 };
 
 // Signs the 112-byte transaction with a post-quantum WOTS+/XMSS key:
 //   1. master_sk is committed into a mlock'ed MemoryVault page and consumed
 //      (read-once → page BURNED),
-//   2. the witness is generated; every secret chain scratch buffer is
+//   2. the one-time leaf is reserved in `leaf_ledger` when provided (see
+//      PqLeafLedger): a leaf that already signed is never reused — the
+//      caller receives the lowest free leaf instead of the nonce-derived
+//      one, and exhausting all 16 leaves of the key fails the call,
+//   3. the witness is generated; every secret chain scratch buffer is
 //      zeroized + _mm_clflush'd via scrub_execution_state,
-//   3. full_tag = Sponge256("VX_SEGPQ_ANCHOR_V1" || msg || pq_pubkey_root ||
+//   4. full_tag = Sponge256("VX_SEGPQ_ANCHOR_V1" || msg || pq_pubkey_root ||
 //      witness_digest); tx.cocoon_proof = trunc12(full_tag),
-//   4. the witness is registered in the PqWitnessRegistry bound to
+//   5. the witness is registered in the PqWitnessRegistry bound to
 //      (tx_msg_digest, sender_nfa → pq_pubkey_root).
-void pq_sign_transaction(blockchain::Transaction& tx,
+//
+// Returns false only when a ledger was supplied and no leaf could be
+// reserved (all 16 consumed, or the durable log failed validation —
+// signing must not proceed). Without a ledger the call never fails and
+// offers no reuse protection (legacy in-memory behavior).
+bool pq_sign_transaction(blockchain::Transaction& tx,
                          const std::array<uint8_t, 32>& master_sk,
-                         PqSignTimings* timings = nullptr) noexcept;
+                         PqSignTimings* timings = nullptr,
+                         class PqLeafLedger* leaf_ledger = nullptr) noexcept;
 
-// ── PqWitnessRegistry (in-memory SegPQ sidecar) ──────────────────────────────
+// ── PqLeafLedger (one-time-leaf lifecycle) ───────────────────────────────────
 
+// Makes the "every one-time key is used exactly once" property real state
+// instead of an assumption:
+//   - two signatures with the same nonce get different leaves,
+//   - a process restart keeps the consumed-leaf history (durable mode),
+//   - concurrent threads and processes are serialized on the same ledger.
+//
+// Durable mode (non-empty path) stores 33-byte append-only records
+// (32-byte key root + 1-byte leaf index), written and fsync'd BEFORE the
+// signature is produced: a crash may burn a leaf without emitting its
+// signature — fail-closed — but never emit a signature without burning
+// the leaf. The log is re-read under an exclusive flock on every
+// reservation, so two node processes sharing a data directory cannot
+// double-spend a leaf. If the log is unreadable or carries an invalid
+// record, the ledger fails closed: reserve() returns -1 forever.
+//
+// Memory-only mode (empty path) keeps the same guarantees within one
+// process lifetime; it exists for tests and callers without a data
+// directory.
 // std::hash has no std::array overload — byte-mixing hasher for map keys.
 struct PqArrayHash {
     template <size_t N>
@@ -160,6 +194,42 @@ struct PqArrayHash {
         return static_cast<size_t>(h);
     }
 };
+
+class PqLeafLedger {
+public:
+    static constexpr unsigned kLeaves = static_cast<unsigned>(XMSS_LEAVES); // 16 per key
+
+    explicit PqLeafLedger(std::string path = "");
+    ~PqLeafLedger();
+    PqLeafLedger(const PqLeafLedger&) = delete;
+    PqLeafLedger& operator=(const PqLeafLedger&) = delete;
+
+    // Reserve a leaf for `key_root`: `requested_leaf` when free, otherwise
+    // the lowest free leaf of that key. Returns the assigned leaf index
+    // (0..15), or -1 when all leaves are consumed (or, in durable mode,
+    // when the log cannot be trusted).
+    int reserve(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf);
+
+    // Number of consumed leaves for this key (0..16).
+    size_t used_count(const std::array<uint8_t, 32>& key_root) const;
+
+private:
+    bool parse_log_locked(); // rebuilds used_ from the file; false = corrupt
+    bool append_locked(const std::array<uint8_t, 32>& key_root, unsigned leaf);
+
+    mutable std::mutex mu_;
+    std::unordered_map<std::array<uint8_t, 32>, std::bitset<kLeaves>, PqArrayHash> used_;
+    std::string path_;
+    int fd_ = -1;
+    // memory_only_: no path was requested — in-process history is the
+    // whole contract. durable_ok_: the durable log validated; when a path
+    // was requested but the log fails to open/parse, BOTH stay false and
+    // reserve() refuses forever (fail-closed, never a silent fallback).
+    bool memory_only_ = false;
+    bool durable_ok_ = false;
+};
+
+// ── PqWitnessRegistry (in-memory SegPQ sidecar) ──────────────────────────────
 
 class PqWitnessRegistry {
 public:

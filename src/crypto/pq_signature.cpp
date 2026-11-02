@@ -3,8 +3,14 @@
 #include "vx/core/memory_vault.hpp"
 
 #include "vx/core/hw_intrinsics.hpp"
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace vx::crypto::pq {
 
@@ -327,8 +333,8 @@ bool pq_verify_transaction(const Transaction& tx, const PqSignatureWitness& w) n
 
 // ── SegPQ signing with MemoryVault ─────────────────────────────────────────
 
-void pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_sk,
-                         PqSignTimings* timings) noexcept {
+bool pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_sk,
+                         PqSignTimings* timings, PqLeafLedger* leaf_ledger) noexcept {
     namespace mc = vx::core;
     PqSignTimings local{};
     PqSignTimings& t = timings ? *timings : local;
@@ -370,9 +376,22 @@ void pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_
     const uint32_t leaf_idx = nonce & 0xF;
     const uint32_t subtree_index = nonce >> XMSS_H;
 
+    // 4a. One-time-leaf lifecycle: reserve before any signing work. `root`
+    //     (computed above) is this key's XMSS root — the ledger is keyed by
+    //     it, so different accounts never share leaf history. A leaf that
+    //     already signed is never handed out twice: the ledger assigns the
+    //     lowest free leaf instead, and exhausting all 16 fails the call.
+    uint32_t use_leaf = leaf_idx;
+    if (leaf_ledger) {
+        const int assigned = leaf_ledger->reserve(root, leaf_idx);
+        if (assigned < 0) return false; // key exhausted or log untrusted
+        use_leaf = static_cast<uint32_t>(assigned);
+    }
+    t.used_leaf_index = use_leaf;
+
     t0 = vx::core::hw::cycle_counter();
     const auto sg0 = std::chrono::steady_clock::now();
-    PqSignatureWitness w = pq_sign_message(leaf_idx, subtree_index, sk, pub_seed,
+    PqSignatureWitness w = pq_sign_message(use_leaf, subtree_index, sk, pub_seed,
                                            tx_msg_digest(tx));
     t1 = vx::core::hw::cycle_counter();
     t.sign_cycles = t1 - t0;
@@ -399,6 +418,140 @@ void pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_
     mc::MemoryCore::scrub_execution_state(sk.data(), 32);
     const auto stats = vault.get_stats();
     t.vault_burn_verified = stats.burned_pages > burned_before;
+    return true;
+}
+
+// ── PqLeafLedger ─────────────────────────────────────────────────────────────
+
+namespace {
+constexpr size_t kLeafRecordSize = 33; // 32-byte key root + 1-byte leaf index
+constexpr size_t kLeafLogMaxBytes = 4u * 1024u * 1024u; // sane cap (~126k records)
+} // namespace
+
+PqLeafLedger::PqLeafLedger(std::string path) : path_(std::move(path)) {
+    if (path_.empty()) {
+        memory_only_ = true; // in-process history is the whole contract
+        return;
+    }
+
+    fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd_ < 0) {
+        path_.clear();
+        return; // durable_ok_ stays false -> reserve fails closed
+    }
+    if (::flock(fd_, LOCK_EX) != 0) {
+        ::close(fd_);
+        fd_ = -1;
+        path_.clear();
+        return;
+    }
+    const bool ok = parse_log_locked();
+    ::flock(fd_, LOCK_UN);
+    if (!ok) {
+        ::close(fd_);
+        fd_ = -1;
+        path_.clear();
+    } else {
+        durable_ok_ = true;
+    }
+}
+
+PqLeafLedger::~PqLeafLedger() {
+    if (fd_ >= 0) ::close(fd_);
+}
+
+bool PqLeafLedger::parse_log_locked() {
+    if (fd_ < 0) return false;
+    if (::lseek(fd_, 0, SEEK_END) == static_cast<off_t>(-1)) return false;
+    const off_t size = ::lseek(fd_, 0, SEEK_CUR);
+    if (size < 0 || static_cast<size_t>(size) > kLeafLogMaxBytes) return false;
+    if (::lseek(fd_, 0, SEEK_SET) == static_cast<off_t>(-1)) return false;
+
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
+    size_t got = 0;
+    while (got < buf.size()) {
+        const ssize_t n = ::read(fd_, buf.data() + got, buf.size() - got);
+        if (n <= 0) return false;
+        got += static_cast<size_t>(n);
+    }
+
+    used_.clear();
+    // Complete records only: a trailing partial record can only be a torn
+    // append from a crash, which we treat as unconsumed (fail-closed for
+    // that leaf happens at append time, not parse time).
+    const size_t complete = buf.size() / kLeafRecordSize;
+    for (size_t r = 0; r < complete; ++r) {
+        const uint8_t* rec = buf.data() + r * kLeafRecordSize;
+        std::array<uint8_t, 32> key{};
+        std::memcpy(key.data(), rec, 32);
+        const unsigned leaf = rec[32];
+        if (leaf >= kLeaves) return false; // tampered record -> fail closed
+        used_[key].set(leaf);
+    }
+    return true;
+}
+
+bool PqLeafLedger::append_locked(const std::array<uint8_t, 32>& key_root, unsigned leaf) {
+    uint8_t rec[kLeafRecordSize];
+    std::memcpy(rec, key_root.data(), 32);
+    rec[32] = static_cast<uint8_t>(leaf);
+    if (::lseek(fd_, 0, SEEK_END) == static_cast<off_t>(-1)) return false;
+    size_t put = 0;
+    while (put < kLeafRecordSize) {
+        const ssize_t n = ::write(fd_, rec + put, kLeafRecordSize - put);
+        if (n <= 0) return false;
+        put += static_cast<size_t>(n);
+    }
+    return ::fsync(fd_) == 0;
+}
+
+int PqLeafLedger::reserve(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf) {
+    std::lock_guard<std::mutex> guard(mu_);
+
+    if (!memory_only_) {
+        if (!durable_ok_ || fd_ < 0) return -1;
+        // Cross-process exclusion, then refresh from disk so a sibling
+        // process that signed while we were idle is honored.
+        if (::flock(fd_, LOCK_EX) != 0) return -1;
+        if (!parse_log_locked()) {
+            durable_ok_ = false; // fail closed from here on
+            ::flock(fd_, LOCK_UN);
+            return -1;
+        }
+    }
+
+    std::bitset<kLeaves>& bits = used_[key_root];
+    unsigned assigned = (requested_leaf < kLeaves) ? requested_leaf : 0u;
+    if (bits.test(assigned)) {
+        int found = -1;
+        for (unsigned i = 0; i < kLeaves; ++i) {
+            if (!bits.test(i)) {
+                found = static_cast<int>(i);
+                break;
+            }
+        }
+        if (found < 0) {
+            if (!memory_only_) ::flock(fd_, LOCK_UN);
+            return -1; // all 16 one-time leaves of this key are consumed
+        }
+        assigned = static_cast<unsigned>(found);
+    }
+
+    if (!memory_only_ && !append_locked(key_root, assigned)) {
+        durable_ok_ = false; // fail closed from here on
+        ::flock(fd_, LOCK_UN);
+        return -1;
+    }
+    bits.set(assigned);
+
+    if (!memory_only_) ::flock(fd_, LOCK_UN);
+    return static_cast<int>(assigned);
+}
+
+size_t PqLeafLedger::used_count(const std::array<uint8_t, 32>& key_root) const {
+    std::lock_guard<std::mutex> guard(mu_);
+    const auto it = used_.find(key_root);
+    return (it == used_.end()) ? 0u : it->second.count();
 }
 
 // ── PqWitnessRegistry ────────────────────────────────────────────────────────

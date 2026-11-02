@@ -13,10 +13,14 @@
 #undef NDEBUG
 #include <cassert>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <unordered_set>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace vx::crypto::pq;
 namespace bc = vx::blockchain;
@@ -363,6 +367,88 @@ void test_negative_vector_matrix() {
               << " whole-witness mutations rejected\n\n";
 }
 
+// ── TEST 8: one-time-leaf ledger (reuse / restart / exhaustion) ─────────────
+
+void test_leaf_ledger_lifecycle() {
+    std::cout << "[TEST 8] PqLeafLedger: one-time-leaf lifecycle (durable)...\n";
+
+    char tmpl[] = "/tmp/vx_pq_leaf_XXXXXX";
+    char* d = ::mkdtemp(tmpl);
+    assert(d != nullptr);
+    const std::string log_path = std::string(d) + "/pq_leaves.reg";
+
+    const auto sk = test_msg("VX_PQ_LEDGER_MASTER_SK");
+    bc::Transaction tx = make_test_tx(7); // nonce 7 -> leaf 7 requested
+
+    // 1. Same nonce twice must yield different leaves; both verify.
+    {
+        PqLeafLedger ledger(log_path);
+        PqSignTimings t{};
+        assert(pq_sign_transaction(tx, sk, &t, &ledger));
+        const auto w1_leaf = [&] {
+            bc::Transaction last{}; PqSignatureWitness w{};
+            PqWitnessRegistry::instance().get_last(last, w);
+            return w.leaf_index;
+        }();
+        tx = make_test_tx(7); // identical request again
+        assert(pq_sign_transaction(tx, sk, &t, &ledger));
+        bc::Transaction last{}; PqSignatureWitness w{};
+        assert(PqWitnessRegistry::instance().get_last(last, w));
+        std::cout << "  ✓ same nonce signed twice: leaves " << w1_leaf
+                  << " then " << w.leaf_index << " (distinct, both valid)\n";
+        assert(w.leaf_index != w1_leaf);
+        assert(pq_verify_transaction(tx, w));
+        assert(ledger.used_count(w.pq_pubkey_root) == 2);
+    }
+
+    // 2. Restart: a fresh ledger on the same file keeps the history —
+    //    a leaf consumed before the restart is never handed out again.
+    {
+        PqLeafLedger ledger(log_path);
+        PqSignTimings t{};
+        tx = make_test_tx(7);
+        assert(pq_sign_transaction(tx, sk, &t, &ledger));
+        bc::Transaction last{}; PqSignatureWitness w{};
+        assert(PqWitnessRegistry::instance().get_last(last, w));
+        std::cout << "  ✓ after restart: leaf " << w.leaf_index
+                  << " (history survived, no reuse)\n";
+        assert(w.leaf_index != 7); // 7 burned before the restart
+    }
+
+    // 3. Exhaustion: 13 more leaves, then the key refuses to sign.
+    {
+        PqLeafLedger ledger(log_path);
+        PqSignTimings t{};
+        for (int i = 0; i < 13; ++i) {
+            tx = make_test_tx(7);
+            assert(pq_sign_transaction(tx, sk, &t, &ledger));
+        }
+        tx = make_test_tx(7);
+        assert(!pq_sign_transaction(tx, sk, &t, &ledger));
+        std::cout << "  ✓ 16/16 leaves consumed; 17th signature refused\n";
+    }
+
+    // 4. Tampered log (leaf byte out of range) must fail closed forever.
+    {
+        {
+            std::FILE* f = std::fopen(log_path.c_str(), "r+b");
+            assert(f != nullptr);
+            std::fseek(f, -1, SEEK_END);
+            std::fputc(0xFF, f);
+            std::fclose(f);
+        }
+        PqLeafLedger ledger(log_path);
+        PqSignTimings t{};
+        tx = make_test_tx(7);
+        assert(!pq_sign_transaction(tx, sk, &t, &ledger));
+        std::cout << "  ✓ tampered log: signing refused (fail-closed)\n";
+    }
+
+    ::unlink(log_path.c_str());
+    ::rmdir(d);
+    std::cout << "\n";
+}
+
 int main() {
     std::cout << "================================================================\n";
     std::cout << "  VX PHASE 46: PQ HASH-BASED SIGNATURES (WOTS+/XMSS) TEST SUITE\n";
@@ -375,6 +461,7 @@ int main() {
     test_vault_burn();
     test_sponge_kat_sac_collisions();
     test_negative_vector_matrix();
+    test_leaf_ledger_lifecycle();
 
     std::cout << "================================================================\n";
     std::cout << "  ALL PQ SIGNATURE TESTS PASSED — SHOR-VULNERABLE OPS: 0        \n";

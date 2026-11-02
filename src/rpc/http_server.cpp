@@ -4,6 +4,8 @@
 #include "vx/wif/wif_matrix.hpp"
 #include "vx/crypto/simd_accel.hpp"
 #include "vx/net/swarm_node.hpp"
+
+#include <filesystem>
 #include "vx/state/undo_engine.hpp"
 #include "vx/core/memory_vault.hpp"
 #include "vx/core/hw_intrinsics.hpp"
@@ -51,6 +53,12 @@ HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, u
     // Seed the vault memory core with a deterministic master key so the
     // live endpoints return real, reproducible data instead of uninitialized state.
     vault_core_.initialize(0x9e3779b97f4a7c15ULL ^ lock_step_.get_stats().lock_step_cycles);
+
+    // Durable PQ one-time-leaf registry, rooted in the node's data dir. A
+    // failing open leaves the node serving without PQ-signing protection
+    // (pq_sign answers the ledger error), which beats refusing to boot.
+    pq_leaf_ledger_ = std::make_unique<vx::crypto::pq::PqLeafLedger>(
+        (std::filesystem::path(data_dir_) / "pq_leaves.reg").string());
 }
 
 HttpServer::~HttpServer() {
@@ -2161,17 +2169,22 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
     bc::tx_set_nonce(tx, nonce);
 
     pq::PqSignTimings t{};
-    pq::pq_sign_transaction(tx, master_sk, &t);
+    if (!pq::pq_sign_transaction(tx, master_sk, &t, pq_leaf_ledger_.get())) {
+        return HttpResponse::error(
+            409, "pq leaf exhausted for this key (16 one-time leaves consumed)");
+    }
     const auto wall0 = std::chrono::steady_clock::now();
     const bool verified = bc::verify_transaction_proof(tx);
     const auto wall1 = std::chrono::steady_clock::now();
     t.verify_us = std::chrono::duration<double, std::micro>(wall1 - wall0).count();
 
-    bc::Transaction last{};
-    pq::PqSignatureWitness w{};
-    const bool have_last = pq::PqWitnessRegistry::instance().get_last(last, w);
-
+    // Report THIS request's witness: look it up by its own message digest.
+    // get_last() would race under concurrent signs (it names whichever
+    // request registered last, not the caller's).
     const auto msg = pq::tx_msg_digest(tx);
+    pq::PqSignatureWitness w{};
+    const bool have_last = pq::PqWitnessRegistry::instance().lookup(msg, w);
+
     std::ostringstream oss;
     oss << "{\"ok\":true,"
         << "\"verified\":" << (verified ? "true" : "false") << ","
@@ -2185,7 +2198,7 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
         << "\"xmss_leaves\":" << pq::XMSS_LEAVES << ","
         << "\"witness_size_bytes\":" << sizeof(pq::PqSignatureWitness) << ","
         << "\"tx_frame_bytes\":" << sizeof(bc::Transaction) << ","
-        << "\"leaf_index\":" << (have_last ? w.leaf_index : 0) << ","
+        << "\"leaf_index\":" << t.used_leaf_index << ","
         << "\"subtree_index\":" << (have_last ? w.subtree_index : 0) << ","
         << "\"pq_pubkey_root\":\"" << (have_last ? hex_bytes(w.pq_pubkey_root.data(), 32) : "") << "\","
         << "\"witness_digest\":\"" << (have_last ? hex_bytes(w.witness_digest.data(), 32) : "") << "\","
