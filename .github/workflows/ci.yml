@@ -95,6 +95,10 @@ jobs:
         run: >
           ./build/fuzz_wire -runs=200000 -max_len=70000 -seed=1
           -rss_limit_mb=2560 -timeout=25 /tmp/vx_corpus
+      - name: Fuzz JSON RPC surface
+        run: >
+          ./build/fuzz_rpc -runs=200000 -max_len=4096 -seed=1
+          -rss_limit_mb=2560 -timeout=25 /tmp/vx_corpus
 
   web:
     name: Web console

@@ -243,7 +243,7 @@ void HttpServer::handle_client(int client_fd) {
         ::close(client_fd);
         return;
     }
-    auto res = dispatch(req);
+    auto res = route(req);
     send_response(client_fd, res);
     ::close(client_fd);
 }
@@ -297,6 +297,19 @@ HttpResponse HttpServer::dispatch(const HttpRequest& req) {
     if (req.method == "POST" && req.path == "/api/crypto/pq_verify") return handle_crypto_pq_verify(req);
 
     return HttpResponse::error(404, "not found");
+}
+
+HttpResponse HttpServer::route(const HttpRequest& req) {
+    try {
+        return dispatch(req);
+    } catch (const std::exception&) {
+        // The message is deliberately fixed: handler exceptions can carry
+        // fragments of the request body, and echoing them back would be a
+        // reflection bug.
+        return HttpResponse::error(500, "internal error");
+    } catch (...) {
+        return HttpResponse::error(500, "internal error");
+    }
 }
 
 // ── JSON helpers ────────────────────────────────────────────────────────────
@@ -503,7 +516,7 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
             std::string numstr = req.body.substr(vstart, vend - vstart);
             try { return std::stod(numstr); } catch (...) {}
         }
-        return val.empty() ? 0.0 : std::stod(val);
+        try { return val.empty() ? 0.0 : std::stod(val); } catch (...) { return 0.0; }
     };
 
     std::string sender = extract(req.body, "sender");
@@ -665,7 +678,7 @@ HttpResponse HttpServer::handle_security_audit(const HttpRequest& req) {
         // classic 1-atomic dust transfer instead of a degenerate zero amount.
         double amount = 0.00000001;
         if (req.body.find("\"amount_vx\"") != std::string::npos) {
-            amount = std::stod(extract_num_str(req.body, "amount_vx"));
+            try { amount = std::stod(extract_num_str(req.body, "amount_vx")); } catch (...) {}
         }
         auto tdi = vx::math::TdiFilter::evaluate(112, amount);
         std::ostringstream oss;

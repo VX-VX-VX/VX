@@ -112,6 +112,13 @@ public:
     void start();
     void stop();
 
+    // Full route table behind a defensive catch-all. The HTTP worker
+    // threads and the RPC fuzz target both enter through this: a hostile
+    // body may produce an error response, never an exception escaping the
+    // RPC surface (an uncaught throw in a worker thread would terminate
+    // the whole node).
+    HttpResponse route(const HttpRequest& req);
+
     // Bind the VX60 P2P listener, register the block-relay hook and connect
     // to the given static peers (HOST:PORT each). Safe to call with no peers;
     // a failed bind only logs and leaves the node RPC-only.
