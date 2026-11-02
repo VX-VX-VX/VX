@@ -51,7 +51,7 @@ Everything cited below was produced by commands a reader can re-run:
 
 | # | Component | Status | Biggest open gap |
 |---|---|---|---|
-| 1 | WOTS+/XMSS PQ signatures | Tested | One-time-leaf lifecycle is not durable state; H=4 is a demo parameter |
+| 1 | WOTS+/XMSS PQ signatures | Tested | H=4 (16 leaves) is a demo parameter; tree rollover not designed |
 | 2 | VortexSponge256 | Tested | No published cryptanalysis battery yet |
 | 3 | Key generation & storage | Tested (demo grade) | Entropy-source argument; full per-format WIF roundtrip inventory |
 | 4 | PoGW | Implemented | Wire frames are not re-verified (no PoGW check on the relay path) |
@@ -98,14 +98,19 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
 - **Threat model.** Forgery without the secret key; replay of mutated
   witnesses; Merkle path tampering.
 - **Known limitations (important, stated plainly).**
-  1. `leaf_index` is derived from a per-signature nonce (`nonce & 0xF`),
-     not tracked as consumed durable state. There is **no** cross-restart
-     leaf registry, so the masterplan's items "indices survive restart"
-     and "two parallel processes cannot take the same leaf" are **not
-     proven** — nothing in the current code prevents a node restored from
-     a snapshot from emitting a second signature on the same leaf. This is
-     the top item to fix before any multi-user use (BACKLOG follow-up to
-     P0.5).
+  1. **Leaf lifecycle (fixed in `c1d6230`).** The leaf used to be derived
+     from the tx nonce with no consumed-leaf state — a restored node could
+     re-sign on the same one-time leaf, and concurrent signers could take
+     the same leaf. Now closed by `PqLeafLedger`: consumed leaves are
+     keyed by the key's XMSS root, persisted as fsync'd append-only
+     records in `data_dir/pq_leaves.reg`, re-read under an exclusive
+     flock on every reservation (threads and sibling processes
+     serialize), a busy leaf resolves to the lowest free leaf, the 17th
+     signature for a key is refused (RPC 409), and an unparseable log
+     fails closed. Evidence and live runs:
+     [VERIFICATION_EVIDENCE.md](VERIFICATION_EVIDENCE.md) §7. Remaining:
+     per-key durable history lives in the node's data directory only —
+     the 16-leaf capacity itself is still item 2 below.
   2. H=4 gives 16 one-time leaves — a deliberate test parameter, not a
      production configuration. The capacity question (how many signatures
      an account may emit per tree, and tree rollover) is designed but not
@@ -425,7 +430,7 @@ The masterplan's P0 list, mapped to what exists and to the backlog:
 
 | Masterplan P0 | Today's state | Next concrete step |
 |---|---|---|
-| WOTS+/XMSS key lifecycle | Tested, lifecycle gap identified (durable leaf registry) | Durable consumed-leaf state + crash/parallel tests |
+| WOTS+/XMSS key lifecycle | Tested — durable leaf ledger shipped (`c1d6230`), reuse/restart/exhaustion/tamper covered | H=4 capacity justification and tree rollover design |
 | VortexSponge256 cryptanalysis | KATs + SAC only | Differential/linear battery (BACKLOG 1.3) |
 | PoGW security model | Implemented, not wire-verified | PoGW check on relay path (BACKLOG 0.6), then model |
 | GQC safety & liveness | Split-brain demo only | Written model + adversarial simulation (BACKLOG 2.4) |
@@ -452,6 +457,11 @@ security just advanced this pass, memory safety via TSan (BACKLOG 1.4).
   200k battery then confirmed the surface stays clean).
 - The verification record itself: every claim above is tied to a test,
   an endpoint, or a script a reader can run.
+- **The top lifecycle gap closed** (`c1d6230`): the PQ one-time-leaf
+  registry is now durable, cross-process-safe and fail-closed, with
+  reuse/restart/exhaustion/tamper tests — see
+  [VERIFICATION_EVIDENCE.md](VERIFICATION_EVIDENCE.md) for the full
+  evidence chain behind every claim in this record.
 
 ## Explicitly not promised
 

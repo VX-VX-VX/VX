@@ -18,7 +18,7 @@ artifact, **P2** is protocol completeness, **P3** is expansion.
 | VortexSponge256 (12-round ARX) | shipped | KATs (test 6), SAC matrix |
 | 64 KiB block frame (472 B header, 580 tx cap) | shipped | frame tests, libFuzzer target |
 | Storage: mmap/mremap O(1) append-only ledger + undo journal | shipped | reorg test, ASan/UBSan CI lane |
-| WOTS+ (w=16, L=67) + XMSS (H=4), 2376 B witness | shipped | 9 439-mutation negative-vector matrix, MITM/chain-forgery suite |
+| WOTS+ (w=16, L=67) + XMSS (H=4), 2376 B witness | shipped | 9 424-mutation negative-vector matrix (4 672 + 4 752), MITM/chain-forgery suite, durable leaf ledger |
 | MemoryVault (mlock/huge pages, VOID→LOCKED→BURNED pages) | shipped | vault tests, sanitizer lane |
 | TDI dust filter (early-stage payload gate) | shipped | mempool tests, `/api/security/audit` |
 | 7-tier key matrix (SK/FVK/IVK/OVK/TLMK/MSRK/EK) | demo-grade | derive/scan/proof-of-life/Shamir endpoints |
