@@ -51,7 +51,7 @@ purpose:
 | **Block format** | Variable-length serialization (DER signatures, CompactSize vectors) | **Fixed 65 536-byte frame**, bit-exact layout, zero-copy `mmap` parsing in O(1) |
 | **Target block time** | 10 minutes | 5 seconds (ASERT-targeted; a dev parameter, not a consensus promise) |
 | **Difficulty** | Retarget every 2 016 blocks | **ASERT** — continuous anchor-based adjustment, half-life τ = 130 |
-| **Mining** | SHA-256d proof-of-work (ASIC-dominated) | **PoGW (Proof-of-Genuine-Work)** — work is the attractor's real evaluated state, not a hash lottery |
+| **Mining** | SHA-256d proof-of-work (ASIC-dominated) | **PoGW (Proof-of-Genuine-Work)** — work is the attractor's real evaluated state, not a hash lottery *(prototype note: current block acceptance is hash-based — leading zero bits of a sponge hash; genuine-work acceptance is on the roadmap)* |
 | **Finality** | Probabilistic (depth-based confirmation) | **GQC finality** — finalized tips reject conflicting reorgs outright |
 | **Scripting** | Bitcoin Script (stack machine, haltable) | Vortex VM — Landauer thermodynamic gas metering, not gas tables |
 | **State** | UTXO set | Galois state trie (SGMT) over GF(2⁸) |

@@ -1087,6 +1087,7 @@ Notes on fidelity:
 | `d72f6fc` | VERIFICATION_RECORD.md (18-component status) |
 | `c1d6230` | PqLeafLedger: durable one-time-leaf lifecycle, per-call leaf reporting, TEST 8 |
 | `f55fbd1` | External-review finding, fixed at HEAD: synthetic ring decoys read 35 bytes from a 32-byte buffer (3 trailing decoy bytes were adjacent stack garbage). Whole-repo `-Warray-bounds` scan after the fix: zero hits |
+| (review round 2) | Confirmed in code and closed honestly: **XMSS subtree guard** — nonces above 15 refused before any leaf burn (TEST 9: 0/15 verify, 16/17/255/2^32-1 refuse, exactly 2 leaves consumed); **GQC share forgery pinned** — new test `GqcQuorumForgeableFromPublicDataOnly` forges a 9/9 quorum with zero secrets and asserts the attack SUCCEEDS (documents the gap until validator auth, BACKLOG 0.4/2.4); **PoGW honestly renamed** — record and README now state the acceptance criterion is hash-based (leading zero bits) and difficulty is not anchor-based yet |
 
 Every commit above is GPG-signed locally and **not pushed** at the time
 of signing this document; the push decision stays with the repository

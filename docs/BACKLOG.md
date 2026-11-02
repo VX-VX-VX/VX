@@ -168,6 +168,21 @@ VortexSponge256 and the attractor round function.
 - Acceptance: no exploitable bias found, or one found and fixed — either
   way the report is public.
 
+### 1.5 XMSS tree rollover (gated today)
+
+`pq_sign_transaction` refuses any nonce above 15 (subtree guard, external
+review finding): the published root covers exactly the first 16-leaf
+tree, and a nonce above 15 would derive the secret WOTS leaf from a
+subtree the root does not span — an unverifiable signature that still
+burns a ledger leaf. Refusal is fail-closed; TEST 9 pins it
+(nonces 0/15 sign+verify; 16/17/255/UINT32_MAX refuse, zero burns).
+
+- [ ] Design tree rollover (XMSS multi-tree: top tree over subtree roots,
+  per-subtree roots published with the witness).
+- [ ] Re-test witness size and verification cost at the target height.
+
+---
+
 ### 1.4 MemoryVault hardening round 2
 
 - [ ] TSan CI lane (the swarm threading grew: listener + per-connection

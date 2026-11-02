@@ -376,6 +376,14 @@ bool pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_
     const uint32_t leaf_idx = nonce & 0xF;
     const uint32_t subtree_index = nonce >> XMSS_H;
 
+    // Subtree guard: tree rollover is not implemented. The published root
+    // covers exactly the first tree (subtree 0, leaves 0..15); a nonce
+    // above 15 derives the secret WOTS leaf from a subtree the root does
+    // not span — a signature that can never verify while still burning a
+    // one-time leaf. Refuse before reserving anything (external review
+    // finding; see VERIFICATION_EVIDENCE changelog).
+    if (subtree_index != 0) return false;
+
     // 4a. One-time-leaf lifecycle: reserve before any signing work. `root`
     //     (computed above) is this key's XMSS root — the ledger is keyed by
     //     it, so different accounts never share leaf history. A leaf that

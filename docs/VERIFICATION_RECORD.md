@@ -173,10 +173,18 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
 
 ## Stage 2 — Consensus and chain integrity
 
-### 4. PoGW (Proof-of-Genuine-Work) — **Implemented**
+### 4. PoGW (Proof-of-Genuine-Work) — **Implemented** (hash-based PoW prototype; NOT the promised mechanism)
 
 - **Implementation.** `src/consensus/pogw_miner.cpp`; miner RPC endpoints
   exist; the demo block embeds an attractor commitment.
+- **Honest naming (external review, confirmed in code).** The acceptance
+  criterion today is *leading zero bits of a VortexSponge256 hash over
+  the frame* — i.e. a hash-lottery proof-of-work prototype that USES the
+  attractor in hashing but does not accept "work" on the attractor's
+  evaluated cost. The README's "not a hash lottery" line describes the
+  intended design, not this code. Difficulty is not yet anchored either:
+  `calculate_difficulty()` assumes `prev_difficulty = 16` per call and
+  uses `double`/`pow()` — not a real ASERT anchor.
 - **What is proven today.** Blocks mine, verify structurally, and apply
   deterministically; the multi-node testnet shows a locally mined block
   propagating and being applied on three independent nodes.
@@ -192,8 +200,15 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     GPU engine deliberately lives outside the repo (BACKLOG P3.1).
 - **Reproducibility.** Miner endpoints in the cookbook; multi-node script.
 
-### 5. GQC finality — **Implemented**
+### 5. GQC finality — **Implemented** (share derivation is NOT authenticated — finality NOT cryptographically claimed)
 
+- **Documented gap (external review, pinned by a test).** Validator shares
+  are derived from public data only (block hash, height, validator id);
+  `collect_share` does not authenticate the submitter. Anyone holding
+  zero secrets can produce a full quorum. This is pinned reproducibly by
+  the test `GqcQuorumForgeableFromPublicDataOnly` (expect: the forge
+  SUCCEEDS today) — flip the test when signature-bearing shares ship
+  (BACKLOG 0.4/2.4). Until then VX claims **no** cryptographic finality.
 - **Implementation.** `src/consensus/gqc_finality.cpp`;
   `/api/consensus/finality_status` reports checkpoint height, pending
   finality and the rollback guard; `/api/swarm/simulate_split_reorg`

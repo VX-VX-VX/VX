@@ -112,6 +112,51 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     std::filesystem::remove_all(tmp_dir);
 }
 
+// Honest-gap test (external review finding): the share derivation consumes
+// ONLY public data (block hash, height, validator id) — no validator secret
+// exists yet. This test deliberately forges a full quorum without holding
+// any key and EXPECTS the attack to succeed, pinning the gap until
+// validator authentication (BACKLOG 0.4 / 2.4) ships. Flip this test when
+// shares become signature-bearing.
+TEST(VortexGqcRingStealthTest, GqcQuorumForgeableFromPublicDataOnly) {
+    const std::string tmp_dir = (std::filesystem::temp_directory_path() / ("vx_gqc_forge_" + std::to_string(::getpid()))).string();
+    std::filesystem::create_directories(tmp_dir);
+
+    vx::storage::BlockStore store(tmp_dir + "/gqc_forge_ledger.vxb", "genesis.bin");
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(tmp_dir, store, ledger);
+    GqcFinality gqc(undo, store);
+
+    const uint64_t height = store.chain_height();
+    ASSERT_GE(height, 1u);
+    const uint64_t tip_h = height - 1;
+    uint8_t tip[32];
+    store.tip_hash(tip);
+    std::array<uint8_t, 32> block_hash{};
+    std::memcpy(block_hash.data(), tip, 32);
+
+    // Attack: derive every validator's share from public data alone.
+    constexpr uint32_t kValidators = 9;
+    for (uint16_t v = 0; v < kValidators; ++v) {
+        gqc.collect_share(tip_h, block_hash, v,
+                          GqcFinality::derive_validator_share(block_hash, tip_h, v));
+    }
+    const auto cert = gqc.finalize_block(tip_h, block_hash, kValidators);
+
+    // The honest assertion: TODAY the forge succeeds. A quorum certificate
+    // can be produced by anyone who knows (block hash, height, validator
+    // count) and holds no validator secret at all.
+    ASSERT_TRUE(cert.certified) << cert.error;
+    EXPECT_EQ(cert.share_count, 9u);
+    std::cout << "  [documented gap] GQC quorum forged from public data only: "
+              << cert.share_count << "/" << kValidators
+              << " shares, zero secrets used. Validator authentication is a"
+              << " BACKLOG 0.4/2.4 item; until then cryptographic finality is"
+              << " NOT claimed.\n";
+
+    std::filesystem::remove_all(tmp_dir);
+}
+
 TEST(VortexGqcRingStealthTest, GqcAggregationDeterministic) {
     std::array<uint8_t, 32> hash{};
     for (size_t i = 0; i < 32; ++i) hash[i] = static_cast<uint8_t>(i * 7);

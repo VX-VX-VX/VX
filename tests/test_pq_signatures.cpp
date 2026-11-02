@@ -339,7 +339,6 @@ void test_negative_vector_matrix() {
     vx::blockchain::set_nfa_field(tx.sender_nfa, "PQNEGVEC_TEST_ACCOUNT_PQNEGVEC_TEST_ACC");
     pq_sign_transaction(tx, sk);
 
-    bc::Transaction reg_tx{};
     PqSignatureWitness rw{};
     const auto msg_digest = tx_msg_digest(tx);
     assert(PqWitnessRegistry::instance().lookup(msg_digest, rw));
@@ -449,6 +448,40 @@ void test_leaf_ledger_lifecycle() {
     std::cout << "\n";
 }
 
+// ── TEST 9: subtree guard (nonces above the first 16-leaf tree) ─────────────
+
+void test_subtree_guard() {
+    std::cout << "[TEST 9] Subtree guard: nonces outside the first tree refuse...\n";
+
+    const auto sk = test_msg("VX_PQ_SUBTREE_MASTER_SK");
+    PqLeafLedger ledger(""); // memory-only: counts the burns, nothing durable
+    PqSignTimings t{};
+
+    // In-tree nonces still sign and verify.
+    std::array<uint8_t, 32> root{};
+    for (const uint32_t nonce : {0u, 15u}) {
+        bc::Transaction tx = make_test_tx(nonce);
+        assert(pq_sign_transaction(tx, sk, &t, &ledger));
+        bc::Transaction last{}; PqSignatureWitness w{};
+        assert(PqWitnessRegistry::instance().get_last(last, w));
+        assert(pq_verify_transaction(tx, w));
+        root = w.pq_pubkey_root;
+        std::cout << "  ✓ nonce " << nonce << " -> leaf " << w.leaf_index
+                  << ", verify ok\n";
+    }
+
+    // Out-of-tree nonces must refuse without burning a leaf.
+    for (const uint32_t nonce : {16u, 17u, 255u, 0xFFFFFFFFu}) {
+        bc::Transaction tx = make_test_tx(nonce);
+        assert(!pq_sign_transaction(tx, sk, &t, &ledger));
+        std::cout << "  ✓ nonce " << nonce << " -> refused (no leaf burned)\n";
+    }
+
+    // Exactly the two in-tree signs consumed leaves; nothing else.
+    assert(ledger.used_count(root) == 2);
+    std::cout << "  ✓ ledger holds exactly 2 consumed leaves after the sweep\n\n";
+}
+
 int main() {
     std::cout << "================================================================\n";
     std::cout << "  VX PHASE 46: PQ HASH-BASED SIGNATURES (WOTS+/XMSS) TEST SUITE\n";
@@ -462,6 +495,7 @@ int main() {
     test_sponge_kat_sac_collisions();
     test_negative_vector_matrix();
     test_leaf_ledger_lifecycle();
+    test_subtree_guard();
 
     std::cout << "================================================================\n";
     std::cout << "  ALL PQ SIGNATURE TESTS PASSED — SHOR-VULNERABLE OPS: 0        \n";
