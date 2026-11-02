@@ -33,15 +33,10 @@ verified, not before.
   3-node block propagation with tip convergence, garbage-packet
   resistance, in-process split-brain reorg; plus the P2P wiring that made
   it real (`--p2p`/`--peer` now bind, handshake, relay and gossip)
-
-## Near term — hardening the artifact
-
-These items make the codebase itself more trustworthy before anything is
-asked of the network:
-
-2. **RPC input fuzzing** — the JSON surface is still only covered by the
-   chaos fuzzer's fixed vectors; a libFuzzer target needs the RPC parser
-   extracted into a callable unit first.
+- RPC input fuzzing (`fuzz/fuzz_rpc.cpp`) — the whole 34-endpoint JSON
+  surface behind a public `route()` catch-all; oversized numerals on the
+  transfer/audit paths no longer throw out of the RPC, and CI runs the
+  target for 200k fixed-seed execs
 
 ## Mid term — earning the right to be called a protocol
 

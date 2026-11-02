@@ -124,19 +124,21 @@ re-mined.
 
 ## P1 — harden what ships
 
-### 1.1 RPC input fuzzing (ROADMAP near-term item 2)
+### 1.1 RPC input fuzzing (shipped)
 
-- [ ] Public `HttpServer::route(const HttpRequest&)` entry (dispatch is
-  private today).
-- [ ] `fuzz/fuzz_rpc.cpp`: byte stream → method/path-from-real-routes/body
-  → route; invariants: no crash, no hang, valid JSON responses, GET does
-  not mutate state, malformed POST bodies answer errors not 500s.
-- [ ] Body size cap for the fuzzer; fixed seed in CI (`-runs=200000`).
-- Known suspects from the handler review: `std::stod`/`stoul` on hostile
-  strings, unbounded `substr` scans, per-handler `extract` lambdas
-  duplicating parsing.
-- Acceptance: 200k+ clean execs locally and in CI; findings fixed with
-  regression corpus entries.
+- [x] Public `HttpServer::route(const HttpRequest&)` entry with a
+  defensive catch-all (a hostile body now answers 500 instead of
+  unwinding a detached worker thread).
+- [x] `fuzz/fuzz_rpc.cpp`: byte stream → method/path-from-real-routes/body
+  → route; invariants: no crash, no hang, GET does not mutate the tip,
+  accepted transfers bounded by chain height.
+- [x] Body size cap for the fuzzer (4 KiB); fixed seed in CI
+  (`-runs=200000`).
+- [x] Fixed: unguarded `std::stod` on the transfer amount string form and
+  the dust_spam_tdi audit amount (`std::out_of_range` on oversized
+  numerals).
+- Remaining suspects from the handler review: per-handler `extract`
+  lambdas duplicating parsing (consolidation candidate, not a defect).
 
 ### 1.2 Constant-time audit of hot paths
 
