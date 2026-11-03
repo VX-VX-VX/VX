@@ -261,26 +261,37 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    // Height 1: fund the sender with exactly 10 VX via the GENESIS_2 mint.
-    // The sender is a PQ account: spends require a WOTS+/XMSS witness now.
-    const PqAccount sender_acc = make_pq_account("VX_TEST_DSPEND_SK_V1");
+    // Height 1: the GENESIS_2 mint is now bound to its exact protocol
+    // shape (review round 5): 100,000 VX to the demo spender address
+    // (Address #2), whose demo key is public — a documented testnet key.
+    // The sender is a PQ account: spends require a WOTS+/XMSS witness.
+    // The demo spender is a BOUND (not self-certifying) address: the
+    // binding table maps the attractor-derived Address #2 payload to the
+    // root of the public demo key, so the account couples that key with
+    // the pinned receiver payload — NOT the PQA address its key derives.
+    PqAccount sender_acc = make_pq_account("VX_DEMO_SPENDER_SK_V1");
+    sender_acc.addr = vx::blockchain::genesis2_mint_receiver_payload();
     const Address& sender = sender_acc.addr;
-    const Address sink = addr_of("NFA_DSPEND_SINK_0000000000000000000000000000");
+    ASSERT_EQ(std::memcmp(sender.data(),
+                          vx::blockchain::genesis2_mint_receiver_payload().data(), 42), 0)
+        << "the pinned mint receiver must be the demo spender address";    const Address sink = addr_of("NFA_DSPEND_SINK_0000000000000000000000000000");
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
-        Transaction mint = make_tx(addr_of("GENESIS_2"), sender, 1000000000u, 0);
+        Transaction mint = make_tx(addr_of("GENESIS_2"), sender,
+                                   vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
         sign_transaction(mint);
         ASSERT_TRUE(b.add_transaction(mint));
         ASSERT_TRUE(push_block(store, ledger, b));
     }
-    ASSERT_EQ(ledger.balance_of(sender), U128(1000000000u)); // 10 VX
+    ASSERT_EQ(ledger.balance_of(sender),
+              U128(vx::blockchain::GENESIS_2_MINT_ATOMICS)); // 100,000 VX
 
-    // Height 2: TWO spends of 6 VX each (total 12 VX > 10 VX balance),
-    // sequential nonces, both proofs individually valid.
+    // Height 2: TWO spends of 60,001 VX each (total 120,002 VX > 100,000 VX
+    // balance), sequential nonces, both proofs individually valid.
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
-        Transaction s1 = make_tx(sender, sink, 600000000u, 0);
-        Transaction s2 = make_tx(sender, sink, 600000000u, 1);
+        Transaction s1 = make_tx(sender, sink, 6000100000000ull, 0);
+        Transaction s2 = make_tx(sender, sink, 6000100000000ull, 1);
         ASSERT_TRUE(pq_sign(s1, sender_acc));
         ASSERT_TRUE(pq_sign(s2, sender_acc));
         EXPECT_TRUE(verify_transaction_proof(s1));
@@ -303,8 +314,10 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
         EXPECT_EQ(res.error.find("underflow"), std::string::npos)
             << "underflow guard must never fire - pre-check must reject first";
 
-        // No mutation: sender still holds exactly 10 VX, no phantom supply.
-        EXPECT_EQ(ledger.balance_of(sender), U128(1000000000u));
+        // No mutation: sender still holds exactly 100,000 VX, no phantom
+        // supply.
+        EXPECT_EQ(ledger.balance_of(sender),
+                  U128(vx::blockchain::GENESIS_2_MINT_ATOMICS));
         EXPECT_EQ(ledger.total_supply(), ledger.total_supply()); // sane path
         std::cout << "  [fixed] intra-block double spend rejected with"
                   << " 'insufficient funds'; no U128 underflow, no phantom"
@@ -404,14 +417,14 @@ TEST(VortexDocumentedGapsTest, SecondGenesisMintInBlockRejected) {
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
     const U128 supply_before = ledger.total_supply();
 
-    const Address r1 = addr_of("NFA_GEN2_MINT_TARGET_A_0000000000000000000");
+    const Address r1 = vx::blockchain::genesis2_mint_receiver_payload(); // the pinned receiver
     const Address r2 = addr_of("NFA_GEN2_MINT_TARGET_B_0000000000000000000");
     auto mint_tx = [](const Address& to) {
         Transaction tx{};
         std::memcpy(tx.sender_nfa, "GENESIS_2", 9);
         for (size_t i = 9; i < 42; ++i) tx.sender_nfa[i] = '0';
         std::memcpy(tx.receiver_nfa, to.data(), 42);
-        tx_set_amount(tx, 100000ULL * 100000000ULL); // 100k VX each
+        tx_set_amount(tx, vx::blockchain::GENESIS_2_MINT_ATOMICS); // 100k VX each
         sign_transaction(tx);
         return tx;
     };
@@ -926,7 +939,10 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
     std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    const PqAccount sender_acc = make_pq_account("VX_TEST_REORG_UNDO_SK_V1");
+    // The pinned GENESIS_2 mint pays the demo spender (Address #2), so the
+    // fork's sender IS the demo spender: its public key signs the spends.
+    PqAccount sender_acc = make_pq_account("VX_DEMO_SPENDER_SK_V1");
+    sender_acc.addr = vx::blockchain::genesis2_mint_receiver_payload();
     const Address& sender = sender_acc.addr;
     const Address sink = addr_of("NFA_REORG_SINK_0000000000000000000000000");
     const uint64_t ts = std::time(nullptr);
@@ -935,10 +951,11 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
     {
         vx::state::UndoEngine undo(dir, *store, ledger);
 
-        // Height 1: fund the sender (GENESIS_2 mint, legacy window).
+        // Height 1: fund the sender (the protocol-shaped GENESIS_2 mint).
         {
             BlockBuilder b = next_block(*store, ts);
-            Transaction mint = make_tx(addr_of("GENESIS_2"), sender, 1000000000u, 0);
+            Transaction mint = make_tx(addr_of("GENESIS_2"), sender,
+                                       vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
             sign_transaction(mint);
             ASSERT_TRUE(b.add_transaction(mint));
             b.finalize();
@@ -1069,14 +1086,16 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
     std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    const PqAccount sender_acc = make_pq_account("VX_TEST_NONCE_SK_V1");
+    PqAccount sender_acc = make_pq_account("VX_DEMO_SPENDER_SK_V1");
+    sender_acc.addr = vx::blockchain::genesis2_mint_receiver_payload();
     const Address& sender = sender_acc.addr;
     const Address sink = addr_of("NFA_NONCE_SINK_00000000000000000000000000");
 
-    // Height 1: fund the sender (GENESIS_2 mint, legacy window).
+    // Height 1: fund the sender (the protocol-shaped GENESIS_2 mint).
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
-        Transaction mint = make_tx(addr_of("GENESIS_2"), sender, 1000000000u, 0);
+        Transaction mint = make_tx(addr_of("GENESIS_2"), sender,
+                                   vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
         sign_transaction(mint);
         ASSERT_TRUE(b.add_transaction(mint));
         ASSERT_TRUE(push_block(store, ledger, b));
@@ -1528,13 +1547,29 @@ TEST(VortexDocumentedGapsTest, SelfCertifyingAddressAutoBinds) {
     // commitment.
     const PqAccount acc = make_pq_account("VX_TEST_SELFCERT_SK_V1");
     const Address sink = addr_of("NFA_SELFCERT_SINK_00000000000000000000000");
+    PqAccount demo = make_pq_account("VX_DEMO_SPENDER_SK_V1");
+    demo.addr = vx::blockchain::genesis2_mint_receiver_payload();
 
-    // Height 1: the genesis mint funds it (mints may pay any receiver).
+    // Height 1: the protocol mint funds the demo spender (pinned shape).
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
-        Transaction mint = make_tx(addr_of("GENESIS_2"), acc.addr, 1000000000u, 0);
+        Transaction mint = make_tx(addr_of("GENESIS_2"), demo.addr,
+                                   vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
         sign_transaction(mint); // system sender: structural digest only
         ASSERT_TRUE(b.add_transaction(mint));
+        ASSERT_TRUE(push_block(store, ledger, b));
+    }
+    ASSERT_EQ(ledger.balance_of(demo.addr),
+              U128(vx::blockchain::GENESIS_2_MINT_ATOMICS));
+
+    // Height 2: the demo spender funds the fresh account with a plain PQ
+    // transfer (mints pay only the pinned receiver - a keyless digest can
+    // no longer mint to an arbitrary address, review round 5).
+    {
+        BlockBuilder b = next_block(store, std::time(nullptr));
+        Transaction fund = make_tx(demo.addr, acc.addr, 1000000000u, 0);
+        ASSERT_TRUE(pq_sign(fund, demo));
+        ASSERT_TRUE(b.add_transaction(fund));
         ASSERT_TRUE(push_block(store, ledger, b));
     }
     ASSERT_EQ(ledger.balance_of(acc.addr), U128(1000000000u));

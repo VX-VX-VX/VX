@@ -450,6 +450,61 @@ including a not-yet-written entry (reads a default Transaction).
   admission wiring (nothing feeds `submit()` from the network stack yet)
   is part of the swarm-intake work.
 
+### External review round 5 — ledger/rollback hardening (CLOSED 2026-11-03)
+
+Adversarial review of the post-0.14 tree found two P1s and a set of
+durability gaps; all code-side findings are fixed here (the process-level
+ones are tracked below).
+
+- [x] **P1 rollback phantom supply:** `rollback_to_height` reversed
+  balances tx-by-tx with clamp-at-zero arithmetic — an address whose
+  intra-block credit was reversed before its debit went negative mid
+  loop, the debit then clamped to zero, and the shortfall was minted
+  from nothing. Fixed with two-phase netting per undo record: phase A
+  accumulates one reversal delta per address (credit vs debit kept
+  separate), phase B applies the net exactly via a new unchecked
+  `revert_balance_exact` that reports underflow instead of clamping;
+  underflow means state/journal corruption and aborts the rollback with
+  `ERR_UNDO_STATE_MISMATCH` (the journal erase now happens after the
+  reversal so the records stay diagnosable). Burned supply is restored
+  from the record's recomputed `floor(fees/2)` — no wire-format change.
+- [x] **P1 unbounded mint:** the height-1 `GENESIS_2` mint was gated only
+  by count — whoever mined block 1 could mint any amount to any receiver
+  with a keyless digest and capture the remaining supply. The mint is
+  now bound to its exact protocol shape: height 1, sender tag
+  `GENESIS_2`, exactly 100,000 VX (`GENESIS_2_MINT_ATOMICS`) to the
+  pinned demo-spender payload (`genesis2_mint_receiver_payload()`), an
+  untracked receiver, one per block. The one-per-block count check runs
+  BEFORE the shape check, so a second mint of any shape is caught by the
+  count rule.
+- [x] **P2 torn sidecar record:** `stamp_gqc` could leave a partial
+  48-byte record mid-file after a short write; the reader cannot heal a
+  torn middle, so every later restart failed closed and silently reset
+  the finality guard. Writes are now a full EINTR-retrying loop plus
+  fsync.
+- [x] **P2 unfsynced rollback truncate:** `rollback_last_append` shrank
+  the store without fsync — a power cut could resurrect the refused
+  frame, the replay then throws and the node cannot start. The truncate
+  is fsynced.
+- [x] **P3 torn multi-tx journal tail:** a torn tail inside a multi-tx
+  record was reported as corruption; the loader now probes the record's
+  tx count and heals a tail that can no longer hold the remaining
+  transactions (bounds-checked), else still fails closed.
+- [x] **P2 journal coverage guard:** a rollback against a journal that
+  does not cover the full rollback span is refused with
+  `ERR_UNDO_JOURNAL_GAP` instead of silently leaving heights applied.
+- Acceptance: the documented-gaps suite exercises the double-spend
+  rollback netting (no phantom supply, no lost debit), the pinned mint
+  shape (wrong amount/receiver/height refused, second mint in one block
+  refused, mint-to-tracked-address refused) and the reorg round-trip
+  against the pinned mint. 17/17 ctest on the GCC, sanitizer and fuzzer
+  lanes.
+- Honest remainder (not code bugs, tracked): mempool admission is not
+  yet wired to the network stack and the pool has no per-sender eviction
+  (swarm-intake work, fee-market spec 2.5); a half-applied block commit
+  guard belongs to the atomic-commit work; the redundant finality-guard
+  persistence source and the displaced-cap wording are doc cleanups.
+
 ---
 
 ## P1 — harden what ships

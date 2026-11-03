@@ -61,4 +61,16 @@ const std::string& demo_receiver_seed_hex();  // Address #3 (target)
 std::string demo_spender_address_nfa();       // "NFA_V6_..." (deterministic)
 std::string demo_receiver_address_nfa();      // "NFA_V6_..." (deterministic)
 
+// ── The one-time secondary genesis mint (review round 5, P1) ────────────────
+// The mint's authorization used to be the keyless cocoon digest with only a
+// height gate — whoever mined block 1 could mint ANY amount to ANY untracked
+// receiver and capture the remaining supply at height 1. The mint is now
+// bound to its exact protocol shape: 100,000 VX to the demo spender address
+// (Address #2 of the canonical demo run), once, at height 1.
+inline constexpr uint64_t GENESIS_2_MINT_ATOMICS = 100'000ULL * 100'000'000ULL;
+
+/// The exact 42-byte receiver payload the one-time GENESIS_2 mint must pay
+/// (the demo spender address, deterministic; computed once per process).
+const Address& genesis2_mint_receiver_payload();
+
 } // namespace vx::blockchain

@@ -167,6 +167,16 @@ std::array<uint8_t, 32> tag_root(const char* tag, size_t len) {
 const std::string& demo_spender_seed_hex() { return demo_spender_seed(); }
 const std::string& demo_receiver_seed_hex() { return demo_receiver_seed(); }
 
+const Address& genesis2_mint_receiver_payload() {
+    static const Address payload = [] {
+        Address a{};
+        const std::string nfa = demo_spender_address_nfa(); // "NFA_V6_" + 42 bytes
+        std::memcpy(a.data(), nfa.data() + 7, 42);
+        return a;
+    }();
+    return payload;
+}
+
 std::string demo_spender_address_nfa() {
     static const std::string nfa = [] {
         return vx::math::VortexAttractor::run(demo_spender_seed(), 1000, true).addressNFA;

@@ -218,18 +218,23 @@ public:
 
             if (is_genesis || is_miner) {
                 if (is_genesis) {
-                    if (next_height_ > 0 && !(next_height_ == 1 &&
-                        std::strncmp(s, "GENESIS_2", 9) == 0 &&
-                        !tracked_addresses_containing(blockchain::tx_address(tx.receiver_nfa)))) {
-                        res.error = "tx " + std::to_string(i) + ": GENESIS mint unauthorized at height " + std::to_string(next_height_);
-                        return res;
-                    }
-                    // The untracked-receiver check above reads committed
+                    // The one-time secondary mint is bound to its exact
+                    // protocol shape: sender tag GENESIS_2, height 1,
+                    // EXACTLY 100,000 VX to the demo spender address
+                    // (Address #2), once per chain, to an untracked
+                    // receiver. Review round 5: the old gate bounded only
+                    // the count — whoever mined block 1 could mint any
+                    // amount to any receiver and capture the remaining
+                    // supply at height 1 with a keyless digest.
+                    // The untracked-receiver check below reads committed
                     // balances_, and balances_ only changes in the commit
                     // loop AFTER this pre-check - so within one block every
                     // further mint also saw its receiver as "untracked" and
                     // a single height-1 block could mint unlimited GENESIS_2
-                    // supply (N x 100k VX). Enforce one mint per block.
+                    // supply (N x 100k VX). Enforce one mint per block FIRST
+                    // - the count check must precede the shape check so a
+                    // second mint of ANY shape is caught by this rule, not
+                    // only one that happens to copy the protocol shape.
                     if (next_height_ == 1) {
                         if (genesis_mint_seen) {
                             res.error = "tx " + std::to_string(i) +
@@ -237,6 +242,16 @@ public:
                             return res;
                         }
                         genesis_mint_seen = true;
+                    }
+                    if (next_height_ > 0 && !(next_height_ == 1 &&
+                        std::strncmp(s, "GENESIS_2", 9) == 0 &&
+                        amount == blockchain::GENESIS_2_MINT_ATOMICS &&
+                        std::memcmp(tx.receiver_nfa,
+                                    blockchain::genesis2_mint_receiver_payload().data(),
+                                    42) == 0 &&
+                        !tracked_addresses_containing(blockchain::tx_address(tx.receiver_nfa)))) {
+                        res.error = "tx " + std::to_string(i) + ": GENESIS mint unauthorized at height " + std::to_string(next_height_);
+                        return res;
                     }
                 }
                 if (is_miner) {
@@ -532,6 +547,31 @@ public:
                 balances_[a] = U128{0};
             }
         }
+    }
+
+    /// Exact reversal for the reorg undo (review round 5, P1): subtract
+    /// WITHOUT clamping to zero. The undo nets each address's per-block
+    /// deltas first, so a valid rollback restores the true pre-block
+    /// balance and can never underflow — a clamp here silently converted a
+    /// mid-reversal negative into free supply (an address that received
+    /// and then spent within one block kept its spend as phantom balance
+    /// after the reversal). Returns false when the ledger and the journal
+    /// disagree (corruption): the caller must abort, not fabricate.
+    bool revert_balance_exact(const Address& a, const U128& amount) {
+        const auto it = balances_.find(a);
+        if (it == balances_.end() || it->second < amount) return false;
+        it->second = it->second - amount;
+        return true;
+    }
+
+    /// Exact burned-supply reversal (review round 5, P3): a rolled-back
+    /// block's TDI burn (floor(total_fees / 2), recomputed from the undo
+    /// record's fees — no format change) must leave the burned counter or
+    /// a fork re-apply double-counts the burn. Returns false on mismatch.
+    bool revert_burned(const U128& amount) {
+        if (burned_supply_ < amount) return false;
+        burned_supply_ = burned_supply_ - amount;
+        return true;
     }
 
     /// Set height directly for reorg

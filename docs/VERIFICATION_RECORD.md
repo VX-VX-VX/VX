@@ -919,6 +919,20 @@ security just advanced this pass, memory safety via TSan (BACKLOG 1.4).
   concurrent reader never sees an unwritten slot; pinned by four
   regressions including a multi-threaded stress test that is
   ThreadSanitizer-clean across 6 runs.
+- **Adversarial review round 5, ledger/rollback hardening**
+  (2026-11-03): the reorg rollback now nets reversal deltas per address
+  and applies them exactly — an underflow aborts with
+  `ERR_UNDO_STATE_MISMATCH` instead of minting phantom supply through
+  the clamp-at-zero path; the height-1 `GENESIS_2` mint is bound to its
+  exact protocol shape (100,000 VX to the pinned demo-spender payload,
+  untracked receiver, one per block, count check before shape check);
+  the GQC sidecar stamp and the rollback truncate are fsynced
+  full-record writes; a torn multi-tx journal tail heals when the
+  record's own tx count proves the damage is tail-only; a rollback
+  against a journal that does not cover the full span is refused with
+  `ERR_UNDO_JOURNAL_GAP`. Unfixed items are process-level and tracked
+  in the BACKLOG (mempool admission wiring, half-applied-block commit
+  guard).
 
 ## Explicitly not promised
 

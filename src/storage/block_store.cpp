@@ -211,6 +211,12 @@ bool BlockStore::rollback_last_append() noexcept {
     if (count_ <= 1) return false; // the genesis frame is never rolled back
     const off_t offset = static_cast<off_t>((count_ - 1) * BLOCK_SIZE_BYTES);
     if (::ftruncate(fd_, offset) != 0) return false;
+    // Persist the shrink immediately (review round 5, P2): append_block
+    // fsyncs only successes, so an unfsynced truncate left a refused frame
+    // recoverable on disk after a power loss — the replay then throws on
+    // the ledger refusal and the node cannot start until an operator
+    // truncates the file by hand.
+    ::fsync(fd_);
     --count_;
     last_error_ = "last append rolled back";
     return ensure_mapping(count_ * BLOCK_SIZE_BYTES);
@@ -249,8 +255,20 @@ bool BlockStore::stamp_gqc(uint64_t height, const uint8_t agg[32]) {
     const uint64_t h = height; // little-endian on LE hosts; read back via memcmp of height bytes
     std::memcpy(rec + 8, &h, 8);
     std::memcpy(rec + 16, agg, 32);
-    const bool ok = ::write(gfd, rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec)) &&
-                    ::fsync(gfd) == 0;
+    // Full-write loop (review round 5, P2): a partial ::write of the 48-byte
+    // record left corrupt bytes mid-file, which the reader can never heal
+    // (it only truncates a torn TAIL) — every later restart then took the
+    // fail-closed branch and silently reset the finality guard to 0. A
+    // complete record (or none) is the only durable outcome.
+    size_t written = 0;
+    bool ok = true;
+    while (written < sizeof(rec)) {
+        const ssize_t n = ::write(gfd, rec + written, sizeof(rec) - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ok = false; break; }
+        written += static_cast<size_t>(n);
+    }
+    if (ok && ::fsync(gfd) != 0) ok = false;
     ::close(gfd);
     return ok;
 }

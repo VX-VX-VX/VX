@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -396,8 +397,12 @@ void UndoEngine::load_latest_undo_journal() {
     // Parse records sequentially. A record that does not parse cleanly
     // mid-file is corruption, not a torn tail — discard everything (the
     // journal rebuilds from live application; consensus never depends on
-    // it). Only a torn TAIL (bytes left over that cannot form a record
-    // header) is healed by truncation.
+    // it). Only a torn TAIL is healed by truncation. A torn tail is also
+    // detectable for real (multi-tx) records (review round 5, P3): the
+    // record header's tx_count is readable ahead of the transaction array,
+    // so if the remaining bytes cannot possibly hold that record's
+    // minimum body, the crash happened mid-append and everything up to
+    // the previous record boundary is healed instead of discarded.
     ByteReader r{buffer.data() + kUndoHeaderSize, buffer.data() + buffer.size()};
     size_t good_end = kUndoHeaderSize; // offset after the last complete record
     bool corrupt = false;
@@ -408,7 +413,23 @@ void UndoEngine::load_latest_undo_journal() {
         // a torn tail from a crash mid-append; anything else is corruption.
         ByteReader probe = r;
         if (!parse_record(probe, rec)) {
-            if (static_cast<size_t>(r.end - r.p) < kMinRecordSize) break; // torn tail
+            const size_t remaining = static_cast<size_t>(r.end - r.p);
+            if (remaining < kMinRecordSize) break; // torn tail (zero-tx shape)
+            // Torn multi-tx record: the header up to tx_count is 80 bytes
+            // (height 8 | ts 8 | prev_tip 32 | supply 16 | accounts 8 |
+            // tx_count 8). If tx_count is sane and the remaining bytes are
+            // fewer than the record's minimum body, this is a crash
+            // mid-append — heal; otherwise the file is truly corrupt.
+            if (remaining >= 80) {
+                ByteReader hdr_probe = r;
+                const uint8_t* skipped = nullptr;
+                const bool readable = hdr_probe.take(72, &skipped);
+                const uint64_t torn_tx_count = readable ? hdr_probe.get_u64() : 0;
+                if (readable && torn_tx_count <= blockchain::MAX_TX_PER_BLOCK &&
+                    remaining < 88 + torn_tx_count * kUndoTxSize) {
+                    break; // torn tail of a multi-tx record
+                }
+            }
             corrupt = true;
             break;
         }
@@ -444,6 +465,28 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
     // height — so "rollback to 0" means undoing all records with height > 0.
     if (undo_journal_.empty()) return false;
 
+    // Coverage guard (review round 5, P2): the ledger may be AHEAD of the
+    // journal — blocks applied without an undo record (a live intake path
+    // that bypasses UndoEngine::apply_block) cannot be reversed, and a
+    // rollback that regresses the height over their un-reversed effects
+    // silently corrupts the state. Refuse unless the journal covers every
+    // height above the target, up to the ledger's current tip.
+    const uint64_t ledger_tip = ledger_.next_expected_height(); // next block height = tip + 1
+    if (ledger_tip > 0) {
+        const uint64_t first_needed = target_height + 1;
+        const uint64_t last_needed = ledger_tip - 1;
+        if (first_needed <= last_needed) {
+            size_t covered = 0;
+            for (const auto& r : undo_journal_) {
+                if (r.height >= first_needed && r.height <= last_needed) ++covered;
+            }
+            if (covered != static_cast<size_t>(last_needed - first_needed + 1)) {
+                last_error_ = "ERR_UNDO_JOURNAL_GAP";
+                return false;
+            }
+        }
+    }
+
     // Collect records above the target, in reverse (newest-first) order.
     std::vector<UndoRecord> to_remove;
     for (auto it = undo_journal_.rbegin(); it != undo_journal_.rend(); ++it) {
@@ -457,17 +500,25 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
     // displaced frames survive in the side journal.
     journal_displaced_frames(target_height);
 
-    // Drop them from the journal.
-    undo_journal_.erase(
-        std::remove_if(undo_journal_.begin(), undo_journal_.end(),
-                       [target_height](const UndoRecord& r) {
-                           return r.height > target_height;
-                       }),
-        undo_journal_.end());
-
     // Reverse transaction effects, newest block first.
     for (const auto& record : to_remove) {
-        // Emission accounting for this record (see the block below).
+        // ── Phase A: net the per-address deltas of this block (review
+        // round 5, P1). The old code reversed transaction-by-transaction
+        // with a clamp-at-zero adjust_balance, so an address whose
+        // intra-block credit was reversed before its intra-block debit
+        // went negative mid-stream — the debit was silently lost and the
+        // next reversal resurrected the money as phantom supply. Netting
+        // per record removes the order dependence entirely: pre_block =
+        // post_block − (Σ apply-credits − Σ apply-debits), one exact
+        // adjustment per address. `net` accumulates the REVERSAL deltas:
+        // a reversal credit re-funds a sender (apply debited it), a
+        // reversal debit un-credits a receiver or un-mints a coinbase.
+        struct NetDelta {
+            core::U128 credit{0};
+            core::U128 debit{0};
+        };
+        std::unordered_map<Address, NetDelta, AddressHash> net;
+        net.reserve(record.transactions.size() * 2 + 1);
         core::U128 coinbase_sum{0};
         core::U128 record_fees{0};
         for (const auto& tx : record.transactions) {
@@ -481,13 +532,15 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
             const bool is_coinbase = (std::strncmp(s, "GENESIS", 7) == 0) ||
                                      (std::strncmp(s, "MINER_", 6) == 0);
             if (is_coinbase) {
-                // Coinbase reversal: only remove the receiver credit (un-mint).
-                ledger_.adjust_balance(receiver, tx.amount, false);
+                // Coinbase reversal: remove the receiver credit (un-mint).
+                net[receiver].debit = net[receiver].debit + tx.amount;
+                coinbase_sum = coinbase_sum + tx.amount;
             } else {
                 // Regular transfer: sender gets back amount + fee,
                 // receiver loses the credited amount.
-                ledger_.adjust_balance(sender, tx.amount + tx.fee, true);
-                ledger_.adjust_balance(receiver, tx.amount, false);
+                net[sender].credit = net[sender].credit + tx.amount + tx.fee;
+                net[receiver].debit = net[receiver].debit + tx.amount;
+                record_fees = record_fees + tx.fee;
                 // Nonce restore (BACKLOG 0.12): put the sender's next-nonce
                 // counter back where it stood before this block applied.
                 // Records unwind newest-first, so the oldest pre-block
@@ -495,14 +548,33 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
                 // rolled-back blocks — exactly the pre-reorg state.
                 ledger_.set_next_nonce(sender, tx.prev_sender_nonce);
             }
-            // Issuance reversal (emission schedule, 2026-11-03): recompute
-            // the block's issuance exactly as apply_block priced it — all
-            // coinbase credits minus the fee share re-credited to the
-            // producer — and take it back out of the issued-supply counter
-            // so the 7,000,000,000 VX cap gate stays exact after a reorg.
-            if (is_coinbase) coinbase_sum = coinbase_sum + tx.amount;
-            if (!is_coinbase) record_fees = record_fees + tx.fee;
         }
+
+        // ── Phase B: apply the net exactly (no clamp). A valid rollback
+        // cannot underflow: the pre-block state was real, so post − delta
+        // ≥ 0 by construction. An underflow means the ledger and the
+        // journal disagree — abort instead of fabricating supply.
+        bool mismatch = false;
+        for (const auto& [addr, d] : net) {
+            if (d.credit >= d.debit) {
+                ledger_.adjust_balance(addr, d.credit - d.debit, true);
+            } else if (!ledger_.revert_balance_exact(addr, d.debit - d.credit)) {
+                std::fprintf(stderr,
+                             "[UNDO] state/journal mismatch: exact reversal underflow at height %llu\n",
+                             static_cast<unsigned long long>(record.height));
+                mismatch = true;
+            }
+        }
+        if (mismatch) {
+            last_error_ = "ERR_UNDO_STATE_MISMATCH";
+            return false;
+        }
+
+        // Issuance reversal (emission schedule, 2026-11-03): recompute
+        // the block's issuance exactly as apply_block priced it — all
+        // coinbase credits minus the fee share re-credited to the
+        // producer — and take it back out of the issued-supply counter
+        // so the 7,000,000,000 VX cap gate stays exact after a reorg.
         {
             const core::U128 fee_share = record_fees - record_fees / core::U128(2);
             const core::U128 recredited =
@@ -511,6 +583,17 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
                 ledger_.adjust_issued_supply(coinbase_sum - recredited, false);
             }
         }
+        // Burned-supply reversal (review round 5, P3): apply_block burned
+        // floor(total_fees / 2) from the same fees this record carries —
+        // recompute it instead of adding a field to the journal format.
+        if (!ledger_.revert_burned(record_fees / core::U128(2))) {
+            std::fprintf(stderr,
+                         "[UNDO] state/journal mismatch: burned-supply reversal underflow at height %llu\n",
+                         static_cast<unsigned long long>(record.height));
+            last_error_ = "ERR_UNDO_STATE_MISMATCH";
+            return false;
+        }
+
         // Untrack the addresses this block CREATED (BACKLOG 0.12): after
         // the reversal their balance is zero, so they return to the
         // untracked pre-fork state — the account map converges with a
@@ -523,6 +606,17 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
             ledger_.forget_empty_address(created_addr);
         }
     }
+
+    // Drop the rolled-back records from the journal (AFTER the reversal
+    // succeeds — an abort mid-rollback must leave the records in place so
+    // the state stays diagnosable and the operation can be retried or
+    // investigated).
+    undo_journal_.erase(
+        std::remove_if(undo_journal_.begin(), undo_journal_.end(),
+                       [target_height](const UndoRecord& r) {
+                           return r.height > target_height;
+                       }),
+        undo_journal_.end());
 
     // Restore the ledger height pointer to target + 1.
     ledger_.set_next_height(target_height + 1);
