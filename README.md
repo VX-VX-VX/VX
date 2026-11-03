@@ -64,9 +64,12 @@ purpose:
 **What VX keeps from Bitcoin's lessons.** Deterministic genesis (everyone
 computes Block #0 from a published seed — nothing is shipped or copied), a
 fixed unit account (`1 VX = 10⁸ atomics`), a hard-coded emission schedule
-(at most 7,000,000,000 VX can ever exist; a flat 1,000 VX block subsidy
-over the first 7,000,000 blocks, then zero — the schedule is consensus
-code, not a parameter), explicit reward-validation rules (excess coinbase
+(at most 7,000,000,000 VX can ever exist; every valid block earns a
+guaranteed 50 VX floor, and the block's own hash can lift the reward to
+75 / 100 / 200 / 400 VX and — for an exceptionally rare hash — the 1,000 VX
+jackpot, so a bigger reward is strictly more proof-of-work, never a
+parameter —
+the schedule is consensus code, not a parameter), explicit reward-validation rules (excess coinbase
 is a consensus violation, not a bug report), and a strict
 "always regenerate, never copy" hygiene for chain bootstrap.
 

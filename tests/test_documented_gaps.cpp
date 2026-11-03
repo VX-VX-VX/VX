@@ -344,7 +344,7 @@ TEST(VortexDocumentedGapsTest, CoinbaseReplayRejected) {
     std::memcpy(cb.sender_nfa, "MINER_", 6);
     for (size_t i = 6; i < 42; ++i) cb.sender_nfa[i] = '0';
     std::memcpy(cb.receiver_nfa, miner_recv.data(), 42);
-    tx_set_amount(cb, 1000ULL * 100000000ULL); // exactly the reward limit
+    tx_set_amount(cb, 50ULL * 100000000ULL); // the guaranteed floor reward: valid for any hash
     tx_set_fee(cb, 0);
     tx_set_nonce(cb, 0);
     set_coinbase_binding(cb, 1, tip);
@@ -376,7 +376,7 @@ TEST(VortexDocumentedGapsTest, CoinbaseReplayRejected) {
     // THEN: the honest block goes through and the producer is credited.
     EXPECT_TRUE(store.append_block(f));
     EXPECT_TRUE(ledger.apply_block(BlockView(f)).ok);
-    EXPECT_EQ(ledger.balance_of(miner_recv), U128(1000ULL * 100000000ULL))
+    EXPECT_EQ(ledger.balance_of(miner_recv), U128(50ULL * 100000000ULL))
         << "the bound coinbase pays the block producer";
 
     std::cout << "  [closed] coinbase bound to the chain position: replaying"
@@ -439,16 +439,22 @@ TEST(VortexDocumentedGapsTest, SecondGenesisMintInBlockRejected) {
 }
 
 // ── Emission schedule (user-directed, 2026-11-03): a hard 7,000,000,000 VX
-// supply cap and a flat 1,000 VX subsidy over 7,000,000 blocks. The helper
-// below applies a single-MINER_-coinbase block straight to the ledger at
-// the ledger's own expected height (apply_block is the consensus authority
-// under test; the store's PoGW gate is exercised elsewhere). The coinbase
-// binding and the block's prev hash are kept consistent, so the ONLY
-// failing check in these tests is the emission gate itself.
+// supply cap and a hash-dependent block reward: 50 VX guaranteed for every
+// valid block, up to 1,000 VX when the block's own PoGW hash carries at
+// least 20/24/28/32/40 leading zero bits. The helper below applies a
+// single-MINER_-coinbase block straight to the ledger at the ledger's own
+// expected height (apply_block is the consensus authority under test; the
+// store's PoGW gate is exercised elsewhere). The coinbase binding and the
+// block's prev hash are kept consistent, so the ONLY failing check in
+// these tests is the emission gate itself. The optional nonce, hash
+// out-param and timestamp let a test pin the exact frame its reward is
+// computed from.
 namespace {
 
 bool apply_coinbase_block(vx::state::LedgerState& ledger, uint64_t amount_atoms,
-                          const Address& recv, std::string* err) {
+                          const Address& recv, std::string* err,
+                          uint64_t nonce = 0, uint8_t* frame_hash_out = nullptr,
+                          std::time_t ts = 0) {
     Transaction cb{};
     std::memcpy(cb.sender_nfa, "MINER_", 6);
     for (size_t i = 6; i < 42; ++i) cb.sender_nfa[i] = '0';
@@ -459,7 +465,8 @@ bool apply_coinbase_block(vx::state::LedgerState& ledger, uint64_t amount_atoms,
     const uint64_t h = ledger.next_expected_height();
     BlockBuilder b;
     b.set_height(h);
-    b.set_timestamp(std::time(nullptr));
+    b.set_timestamp(ts != 0 ? ts : std::time(nullptr));
+    b.set_nonce(nonce);
     uint8_t prev[32];
     std::memset(prev, 0x11, sizeof(prev));
     b.set_prev_hash(prev);
@@ -470,6 +477,10 @@ bool apply_coinbase_block(vx::state::LedgerState& ledger, uint64_t amount_atoms,
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    if (frame_hash_out) {
+        vx::blockchain::VortexSponge256::compute(f.data(), BLOCK_SIZE_BYTES,
+                                                 frame_hash_out);
+    }
     const auto res = ledger.apply_block(BlockView(f));
     if (err) *err = res.error;
     return res.ok;
@@ -477,106 +488,177 @@ bool apply_coinbase_block(vx::state::LedgerState& ledger, uint64_t amount_atoms,
 
 } // namespace
 
-// The 7-theme arithmetic must hold exactly: 7,000,000 blocks x 1,000 VX
-// = the 7,000,000,000 VX hard cap (7e17 atoms), flat inside the window,
-// zero at the genesis height and after it.
-TEST(VortexDocumentedGapsTest, EmissionScheduleShapeSevenBillion) {
-    EXPECT_EQ(vx::blockchain::EMISSION_WINDOW_BLOCKS * vx::blockchain::BLOCK_SUBSIDY_VX,
-              vx::blockchain::MAX_SUPPLY_VX);
-    EXPECT_EQ(vx::blockchain::subsidy_atoms(0), 0ULL);
-    EXPECT_EQ(vx::blockchain::subsidy_atoms(1), 1000ULL * vx::blockchain::ATOMS_PER_VX);
-    EXPECT_EQ(vx::blockchain::subsidy_atoms(vx::blockchain::EMISSION_WINDOW_BLOCKS),
-              1000ULL * vx::blockchain::ATOMS_PER_VX);
-    EXPECT_EQ(vx::blockchain::subsidy_atoms(vx::blockchain::EMISSION_WINDOW_BLOCKS + 1), 0ULL);
+// The reward is a pure function of the block's own hash: the 50 VX floor
+// for any valid block, the 75/100/200/400/1000 VX tiers at 20/24/28/32/40
+// leading zero bits, and the 7,000,000,000 VX lifetime cap (7e17 atoms).
+TEST(VortexDocumentedGapsTest, EmissionRewardTiersAndCap) {
+    using vx::blockchain::ATOMS_PER_VX;
+    using vx::blockchain::BLOCK_REWARD_BASE_VX;
+    using vx::blockchain::BLOCK_REWARD_MAX_VX;
+    using vx::blockchain::block_reward_vx;
+    using vx::blockchain::leading_zero_bits;
+
+    // A 32-byte hash whose first z bits are zero and the rest are ones.
+    auto hash_with_zeros = [](uint64_t z) {
+        std::array<uint8_t, 32> h{};
+        h.fill(0xFF);
+        const uint64_t full = z / 8;
+        for (uint64_t i = 0; i < full && i < 32; ++i) h[i] = 0;
+        if (full < 32) h[full] = static_cast<uint8_t>(0xFF >> (z % 8));
+        return h;
+    };
+    for (const uint64_t z : {uint64_t{0}, uint64_t{1}, uint64_t{7},
+                             uint64_t{8}, uint64_t{19}, uint64_t{20},
+                             uint64_t{23}, uint64_t{24}, uint64_t{27},
+                             uint64_t{28}, uint64_t{31}, uint64_t{32},
+                             uint64_t{39}, uint64_t{40}, uint64_t{63}}) {
+        EXPECT_EQ(leading_zero_bits(hash_with_zeros(z).data()), z) << z;
+    }
+
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(0).data()), 50ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(19).data()), 50ULL);   // below tier 1: the floor
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(20).data()), 75ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(23).data()), 75ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(24).data()), 100ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(27).data()), 100ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(28).data()), 200ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(31).data()), 200ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(32).data()), 400ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(39).data()), 400ULL);
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(40).data()), 1000ULL); // the jackpot
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(63).data()), 1000ULL); // saturated
+
+    EXPECT_EQ(BLOCK_REWARD_BASE_VX, 50ULL);
+    EXPECT_EQ(BLOCK_REWARD_MAX_VX, 1000ULL);
     EXPECT_EQ(vx::blockchain::max_supply_atoms(), 700'000'000'000'000'000ULL);
-    uint64_t total = 0;
-    for (uint64_t h = 1; h <= vx::blockchain::EMISSION_WINDOW_BLOCKS; ++h)
-        total += vx::blockchain::subsidy_atoms(h);
-    EXPECT_EQ(total, vx::blockchain::max_supply_atoms())
-        << "the full schedule must mint exactly the hard cap";
-    std::cout << "  [closed] emission hard-coded: 1,000 VX x 7,000,000 blocks"
-              << " = 7,000,000,000 VX lifetime cap (the root-of-seven digit).\n";
+    EXPECT_EQ(BLOCK_REWARD_MAX_VX * ATOMS_PER_VX, 1000ULL * ATOMS_PER_VX);
+    std::cout << "  [closed] emission hard-coded: 50 VX floor, hash tiers"
+              << " 75/100/200/400/1000 VX at 20/24/28/32/40 zero bits,"
+              << " lifetime cap 7,000,000,000 VX (the root-of-seven digit).\n";
 }
 
-// The producer's coinbase may carry at most the schedule subsidy plus the
-// block's fee share — one atom above the entitlement is refused, the exact
-// subsidy mints, and issuance is booked.
+// The producer's coinbase may carry at most the reward the block's own
+// hash earns plus the block's fee share - one atom above the entitlement is
+// refused, the exact floor reward mints, and issuance is booked. The
+// coinbase amount is part of the hashed frame, so the probe below replays
+// the exact claim on throwaway ledgers to pin a nonce whose frame hash
+// stays below the first bonus tier; the same frame then reproduces the
+// refusal on the ledger under test. A claim above the absolute 1,000 VX
+// jackpot is refused for every hash a frame can carry.
 TEST(VortexDocumentedGapsTest, CoinbaseEntitlementEnforced) {
+    using vx::blockchain::ATOMS_PER_VX;
+    using vx::blockchain::leading_zero_bits;
+    const std::time_t ts = std::time(nullptr);
     vx::state::LedgerState ledger;
     ledger.set_next_height(1); // fresh ledger staged at the first mined height
     const Address recv = addr_of("NFA_EMISSION_MINER_A_000000000000000000");
     std::string err;
+    uint8_t frame_hash[32];
 
-    EXPECT_FALSE(apply_coinbase_block(ledger, 1001ULL * vx::blockchain::ATOMS_PER_VX,
-                                      recv, &err))
+    // Pin a nonce whose floor-plus-one claim is over-entitled (its hash
+    // stays below the 20-zero-bit first tier - the expected number of
+    // probes is ~1). Each probe uses a fresh throwaway ledger, so every
+    // attempt hashes the exact frame the real ledger will see.
+    uint64_t pinned = 1000;
+    for (uint64_t nonce = 0; nonce < 1000; ++nonce) {
+        vx::state::LedgerState probe;
+        probe.set_next_height(1);
+        if (apply_coinbase_block(probe, 50ULL * ATOMS_PER_VX + 1, recv, &err,
+                                 nonce, frame_hash, ts)) {
+            continue; // that rare frame earned a bonus tier; try the next nonce
+        }
+        EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos)
+            << err;
+        pinned = nonce;
+        break;
+    }
+    ASSERT_LT(pinned, 1000ULL) << "no sub-tier nonce found in 1000 probes";
+
+    // One atom above the floor is over-entitled at that frame's hash.
+    EXPECT_FALSE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX + 1, recv,
+                                      &err, pinned, nullptr, ts))
         << "a coinbase above the emission entitlement was accepted!";
     EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos)
         << "expected the entitlement refusal, got: " << err;
     EXPECT_EQ(ledger.balance_of(recv), U128{})
         << "a refused coinbase must not credit its receiver";
 
-    EXPECT_TRUE(apply_coinbase_block(ledger, 1000ULL * vx::blockchain::ATOMS_PER_VX,
-                                     recv, &err))
+    // The exact floor reward mints and is booked as issuance.
+    EXPECT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err,
+                                     pinned, nullptr, ts))
         << err;
-    EXPECT_EQ(ledger.balance_of(recv), U128(1000ULL * vx::blockchain::ATOMS_PER_VX));
-    EXPECT_EQ(ledger.issued_supply(), U128(1000ULL * vx::blockchain::ATOMS_PER_VX))
-        << "the subsidy must be booked into the issued-supply counter";
+    EXPECT_EQ(ledger.balance_of(recv), U128(50ULL * ATOMS_PER_VX));
+    EXPECT_EQ(ledger.issued_supply(), U128(50ULL * ATOMS_PER_VX))
+        << "the reward must be booked into the issued-supply counter";
+
+    // The jackpot is the absolute maximum: 1,001 VX is refused even if the
+    // hash had earned a tier (it cannot earn more than 1,000 VX).
+    EXPECT_FALSE(apply_coinbase_block(ledger, 1001ULL * ATOMS_PER_VX, recv,
+                                      &err, pinned, nullptr, ts));
+    EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos)
+        << err;
 }
 
 // The cap is load-bearing: with the issued counter one VX short of
 // 7,000,000,000, nothing larger than the headroom can be issued; the final
-// partial subsidy closes the cap exactly; afterwards not one more atom of
+// partial reward closes the cap exactly; afterwards not one more atom of
 // issuance can ever enter state (zero-amount coinbases stay legal so fee
 // redistribution survives the closed cap).
 TEST(VortexDocumentedGapsTest, SupplyCapHardStopsIssuance) {
+    using vx::blockchain::ATOMS_PER_VX;
+    const std::time_t ts = std::time(nullptr);
     vx::state::LedgerState ledger;
     ledger.set_next_height(1);
     const Address recv = addr_of("NFA_EMISSION_MINER_B_000000000000000000");
     std::string err;
 
-    ASSERT_TRUE(apply_coinbase_block(ledger, 500ULL * vx::blockchain::ATOMS_PER_VX,
-                                     recv, &err))
+    // The exact floor reward is under every hash: it always mints.
+    ASSERT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err))
         << err;
     const U128 cap(vx::blockchain::max_supply_atoms());
-    const U128 leave = U128(1ULL * vx::blockchain::ATOMS_PER_VX);
+    const U128 leave = U128(1ULL * ATOMS_PER_VX);
     ledger.adjust_issued_supply(cap - leave - ledger.issued_supply(), true);
 
-    EXPECT_FALSE(apply_coinbase_block(ledger, 1000ULL * vx::blockchain::ATOMS_PER_VX,
-                                      recv, &err))
+    // A 2 VX claim is under the 50 VX floor for every hash, so the
+    // entitlement check passes and the refusal below is purely the cap.
+    EXPECT_FALSE(apply_coinbase_block(ledger, 2ULL * ATOMS_PER_VX, recv, &err,
+                                      0, nullptr, ts))
         << "issuance beyond the 7,000,000,000 VX cap was accepted!";
     EXPECT_NE(err.find("supply cap exceeded"), std::string::npos)
         << "expected the supply-cap refusal, got: " << err;
 
-    EXPECT_TRUE(apply_coinbase_block(ledger, 1ULL * vx::blockchain::ATOMS_PER_VX,
-                                     recv, &err))
+    EXPECT_TRUE(apply_coinbase_block(ledger, 1ULL * ATOMS_PER_VX, recv, &err,
+                                     0, nullptr, ts))
         << err;
     EXPECT_EQ(ledger.issued_supply(), cap)
-        << "the final partial subsidy must close the cap exactly";
+        << "the final partial reward must close the cap exactly";
 
-    EXPECT_TRUE(apply_coinbase_block(ledger, 0, recv, &err)) << err;
-    EXPECT_FALSE(apply_coinbase_block(ledger, 1, recv, &err));
+    EXPECT_TRUE(apply_coinbase_block(ledger, 0, recv, &err, 0, nullptr, ts)) << err;
+    EXPECT_FALSE(apply_coinbase_block(ledger, 1, recv, &err, 0, nullptr, ts));
     EXPECT_NE(err.find("supply cap exceeded"), std::string::npos) << err;
     EXPECT_EQ(ledger.issued_supply(), cap)
         << "nothing may move the issued counter after the cap closed";
 }
 
-// After block 7,000,000 the subsidy is zero: even the exact old reward is
-// now over-entitled and refused, while a zero-amount coinbase (fee
-// redistribution) still applies.
-TEST(VortexDocumentedGapsTest, SubsidyEndsAfterEmissionWindow) {
+// The reward depends on the block's hash, not on its height: there is no
+// emission window to fall out of, so the 50 VX floor still mints at any
+// height (here eight figures past the retired 12,000,000-block window of
+// the earlier draft schedule) and a zero-amount coinbase stays legal.
+TEST(VortexDocumentedGapsTest, RewardIndependentOfHeight) {
+    using vx::blockchain::ATOMS_PER_VX;
     vx::state::LedgerState ledger;
-    ledger.set_next_height(vx::blockchain::EMISSION_WINDOW_BLOCKS + 1);
+    ledger.set_next_height(400'000'000ULL);
     const Address recv = addr_of("NFA_EMISSION_TAIL_A_000000000000000000");
     std::string err;
 
-    EXPECT_FALSE(apply_coinbase_block(ledger, 1000ULL * vx::blockchain::ATOMS_PER_VX,
-                                      recv, &err))
-        << "the subsidy was paid after the emission window closed!";
-    EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos)
-        << "expected the entitlement refusal, got: " << err;
+    EXPECT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err))
+        << err;
+    EXPECT_EQ(ledger.issued_supply(), U128(50ULL * ATOMS_PER_VX))
+        << "the floor reward must mint at any height";
+    EXPECT_EQ(ledger.balance_of(recv), U128(50ULL * ATOMS_PER_VX));
 
     EXPECT_TRUE(apply_coinbase_block(ledger, 0, recv, &err)) << err;
-    EXPECT_EQ(ledger.issued_supply(), U128{});
+    EXPECT_EQ(ledger.issued_supply(), U128(50ULL * ATOMS_PER_VX));
 }
 
 // ── Regression (round 4, fixed): the genesis-v1 tx shape (fee=0 and

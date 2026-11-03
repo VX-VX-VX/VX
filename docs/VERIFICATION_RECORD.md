@@ -702,10 +702,22 @@ The emission schedule is now hard consensus code, not a parameter
 (user-directed 2026-11-03; `include/vx/blockchain/emission.hpp`):
 - **Hard lifetime cap: 7,000,000,000 VX** (7e17 atoms; the 7 is the
   protocol's signature digit). `static_assert`ed; no height, vote or
-  config can issue the 7,000,000,001st VX.
-- **Flat 1,000 VX block subsidy for heights 1..7,000,000**, zero at the
-  genesis height and zero after the window — 7,000,000 blocks x 1,000 VX
-  mints exactly the cap.
+  config can issue the 7,000,000,001st VX. The cap — not a height
+  window — is the only end of emission: at the 50 VX floor rate it
+  closes after roughly 140 million blocks.
+- **Hash-dependent block reward**: a deterministic function of the
+  block's own PoGW hash (the full-frame VortexSponge256 commitment the
+  intake gate already checks). 50 VX is guaranteed for every valid
+  block; the hash's leading zero bits unlock the bonus tiers — at
+  20/24/28/32/40 zero bits the reward steps to 75/100/200/400 and the
+  1,000 VX jackpot (frequencies ~1 in 1M / 17M / 268M / 4.3B / 1.1T
+  blocks). A miner cannot mint the bonus, only FIND a rarer hash, so a
+  bigger reward is strictly more proof-of-work; the thresholds are
+  absolute, so any node verifies the reward by recounting the zeros in
+  the hash it already computes — no difficulty estimate enters
+  consensus accounting, and as network difficulty grows past a
+  threshold the effective reward steps up (emission accelerates only
+  when the security behind the chain grows, bounded by the cap).
 - The gated quantity is cumulative **issuance**: all coinbase credits
   minus the fee share re-credited to the producer (fees re-entering
   circulation are redistribution, not new emission). Genesis allocations
@@ -715,14 +727,17 @@ The emission schedule is now hard consensus code, not a parameter
   state (zero-amount coinbases remain legal so fee redistribution
   survives).
 - Enforcement lives in `LedgerState::apply_block` BEFORE any state
-  mutation (a refused block leaves the ledger byte-identical); the reorg
-  undo recomputes and reverses a block's issuance; the miner's coinbase
-  carries subsidy + fee share clamped to the headroom; `/api/status`
-  reports `max_supply_vx`, `issued_supply_atomics`,
-  `issuance_headroom_vx`, `emission_window_blocks`.
-- Regressions: `EmissionScheduleShapeSevenBillion`,
+  mutation (a refused block leaves the ledger byte-identical) and
+  recomputes the frame hash itself; the reorg undo recomputes and
+  reverses a block's issuance; the miner claims a tier and searches for
+  a hash that justifies the claim (escalating when the found hash is
+  rarer than claimed), with the coinbase clamped to the headroom;
+  `/api/status` reports `max_supply_vx`, `issued_supply_atomics`,
+  `issuance_headroom_vx`, `block_reward_base_vx`,
+  `block_reward_max_vx`, `reward_tier_count`.
+- Regressions: `EmissionRewardTiersAndCap`,
   `CoinbaseEntitlementEnforced`, `SupplyCapHardStopsIssuance`,
-  `SubsidyEndsAfterEmissionWindow`. Genesis frame and hash unchanged.
+  `RewardIndependentOfHeight`. Genesis frame and hash unchanged.
 
 Still open (BACKLOG 2.5): a written fee-market description, dust
 thresholds and simulation of the masterplan's scenarios (dominant
@@ -849,9 +864,11 @@ security just advanced this pass, memory safety via TSan (BACKLOG 1.4).
   [VERIFICATION_EVIDENCE.md](VERIFICATION_EVIDENCE.md) for the full
   evidence chain behind every claim in this record.
 - **Emission schedule hard-coded** (user-directed, 2026-11-03): lifetime
-  cap 7,000,000,000 VX, flat 1,000 VX subsidy over 7,000,000 blocks,
-  issuance gated in the ledger before any state mutation and reversed by
-  the reorg undo — see component 14 and BACKLOG 2.5.
+  cap 7,000,000,000 VX, hash-dependent block reward (50 VX guaranteed
+  floor; bonus tiers 75/100/200/400/1,000 VX at 20/24/28/32/40 leading
+  zero bits of the block's own PoGW hash; the cap, not a height window,
+  ends emission), issuance gated in the ledger before any state mutation
+  and reversed by the reorg undo — see component 14 and BACKLOG 2.5.
 
 ## Explicitly not promised
 

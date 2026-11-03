@@ -51,7 +51,9 @@ curl -s http://localhost:18099/api/status | python3 -m json.tool
     "max_supply_vx": 7000000000,
     "issued_supply_atomics": "254000000000000",
     "issuance_headroom_vx": "6997460000.00000000",
-    "emission_window_blocks": 7000000,
+    "block_reward_base_vx": 50,
+    "block_reward_max_vx": 1000,
+    "reward_tier_count": 5,
     "tracked_accounts_count": 1,
     "tip_hash_hex": "485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d",
     "crypto_engine": "3-Trunk Galois Attractor (3072-bit CRT) + VortexSponge256 (12-Round ARX)",
@@ -75,8 +77,11 @@ than some JSON parsers' integers. 1 VX = 10^8 atomics.
 
 The emission fields are the hard-coded schedule (user-directed
 2026-11-03): at most **7,000,000,000 VX** can ever be issued
-(`max_supply_vx`), a flat 1,000 VX block subsidy runs for heights
-1..`emission_window_blocks` (7,000,000) and zero afterwards,
+(`max_supply_vx`); the block reward is a deterministic function of the
+block's own hash — `block_reward_base_vx` (50) is guaranteed for every
+valid block, and the hash's leading zero bits step the reward up toward
+`block_reward_max_vx` (1,000, the jackpot) across `reward_tier_count` (5)
+absolute thresholds (20/24/28/32/40 zero bits pay 75/100/200/400/1,000),
 `issued_supply_atomics` is the cumulative issuance actually booked
 (coinbase credits minus the fee share re-credited to the producer), and
 `issuance_headroom_vx` is what remains under the cap — the final

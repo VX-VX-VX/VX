@@ -322,17 +322,29 @@ public:
         // Runs AFTER the whole block validates and BEFORE any state mutation,
         // so a refused block leaves the ledger byte-identical.
         //
-        // 1. Subsidy entitlement: the producer's coinbase may carry at most
-        //    the schedule's block subsidy (1,000 VX for heights 1..7,000,000,
-        //    zero outside) plus this block's fee share. Fees re-credited to
+        // 1. Reward entitlement: the producer's coinbase may carry at most
+        //    the block's schedule reward - a deterministic function of the
+        //    block's own PoGW hash (the full-frame VortexSponge256 commitment
+        //    the work gate already checks): 50 VX guaranteed for any valid
+        //    block, 75/100/200/400/1000 VX when the hash carries at least
+        //    20/24/28/32/40 leading zero bits. The bonus is unforgeable: a
+        //    "better hash" is strictly more PoGW work. On top of it the
+        //    producer may claim this block's fee share. Fees re-credited to
         //    the producer are redistribution of value that already left the
         //    senders — not new emission.
         // 2. Hard supply cap: cumulative ISSUANCE (all coinbase credits
         //    minus the re-credited fee share) may never exceed
         //    7,000,000,000 VX. Genesis allocations count against the cap,
-        //    so near the end of the schedule the cap - not the schedule -
-        //    determines the last partial subsidy, and after it no further
-        //    subsidy can enter state.
+        //    so near the end of emission the cap - not the tier table -
+        //    determines the last partial rewards, and after it no further
+        //    issuance can enter state.
+        uint8_t frame_hash[32];
+        blockchain::VortexSponge256::compute(block.bytes().data(),
+                                             blockchain::BLOCK_SIZE_BYTES,
+                                             frame_hash);
+        const U128 schedule_reward =
+            U128(blockchain::block_reward_atoms(frame_hash));
+
         U128 total_fees{0};
         for (uint32_t i = 0; i < n; ++i) {
             total_fees = total_fees + fees[i];
@@ -342,14 +354,12 @@ public:
 
         U128 block_issuance{0};
         {
-            const U128 entitlement =
-                U128(blockchain::subsidy_atoms(block.header().block_height)) +
-                miner_reward;
+            const U128 entitlement = schedule_reward + miner_reward;
             if (miner_mint_sum > entitlement) {
-                res.error = "coinbase exceeds emission entitlement (subsidy " +
-                            std::to_string(blockchain::subsidy_atoms(block.header().block_height) /
-                                           blockchain::ATOMS_PER_VX) +
-                            " VX + fee share); height " +
+                res.error = "coinbase exceeds emission entitlement (reward " +
+                            std::to_string((schedule_reward /
+                                            U128(blockchain::ATOMS_PER_VX)).lo) +
+                            " VX from this block's hash + fee share); height " +
                             std::to_string(block.header().block_height);
                 return res;
             }

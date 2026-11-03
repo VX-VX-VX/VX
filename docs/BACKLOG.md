@@ -475,17 +475,25 @@ lifecycle → attractor collision behavior.
 
 - [x] Emission schedule hard-coded in consensus (2026-11-03,
   user-directed): `include/vx/blockchain/emission.hpp` — lifetime cap
-  7,000,000,000 VX (7e17 atoms; the 7 is the protocol's signature digit),
-  flat 1,000 VX block subsidy for heights 1..7,000,000, zero afterwards.
-  Cumulative issuance (all coinbase credits minus the fee share
-  re-credited to the producer) is gated in `LedgerState::apply_block`
-  before any state mutation, restored by the reorg undo, and reported by
-  `/api/status` (`max_supply_vx`, `issued_supply_atomics`,
-  `issuance_headroom_vx`). Genesis allocations count against the cap, so
-  the final emission blocks mint exactly the remaining headroom.
-  Regression: `EmissionScheduleShapeSevenBillion`,
+  7,000,000,000 VX (7e17 atoms; the 7 is the protocol's signature digit).
+  The per-block reward is a deterministic function of the block's own PoGW
+  hash (the full-frame VortexSponge256 commitment the intake gate already
+  checks): 50 VX guaranteed for every valid block, with bonus tiers at
+  20/24/28/32/40 leading zero bits paying 75/100/200/400 and — for an
+  exceptionally rare hash — the 1,000 VX jackpot. A miner cannot mint the
+  bonus, only find a rarer hash, so a bigger reward is strictly more
+  proof-of-work; the thresholds are absolute, so any node verifies the
+  reward by recounting zeros in the hash it already computes. Cumulative
+  issuance (all coinbase credits minus the fee share re-credited to the
+  producer) is gated in `LedgerState::apply_block` before any state
+  mutation, restored by the reorg undo, and reported by `/api/status`
+  (`max_supply_vx`, `issued_supply_atomics`, `issuance_headroom_vx`,
+  `block_reward_base_vx`, `block_reward_max_vx`, `reward_tier_count`).
+  Genesis allocations count against the cap, so the final emission blocks
+  mint exactly the remaining headroom.
+  Regressions: `EmissionRewardTiersAndCap`,
   `CoinbaseEntitlementEnforced`, `SupplyCapHardStopsIssuance`,
-  `SubsidyEndsAfterEmissionWindow`.
+  `RewardIndependentOfHeight`.
 - [ ] Fee market spec: dust thresholds, minimum relay fee, reward
   pressure vs. TDI-filtered spam economics (simulate).
 - Acceptance: `docs/design/tokenomics.md`; remaining parameters land in

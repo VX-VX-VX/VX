@@ -821,9 +821,15 @@ set.
 
 - Coinbase (index 0) collects **50% of fees**; the other 50% is burned —
   a fee market with a deflationary sink (EIP-1559's lesson, applied harder).
-- The base coinbase amount for a `MINER_`-tagged mint is capped at
-  1000 VX; anything above the fee-derived reward is rejected by the ledger
-  state machine (`excess_reward`).
+- The emission schedule is hard consensus code: at most **7,000,000,000
+  VX** can ever be issued. The per-block reward is a deterministic
+  function of the block's own PoGW hash — a guaranteed 50 VX floor for
+  every valid block, with bonus tiers at 20/24/28/32/40 leading zero bits
+  stepping the reward to 75/100/200/400 and the 1,000 VX jackpot; a miner
+  cannot mint the bonus, only find a rarer hash. The ledger rejects any
+  coinbase above the hash-earned reward plus the fee share
+  (`excess_reward` / `coinbase exceeds emission entitlement`), and
+  cumulative issuance above the cap (`supply cap exceeded`).
 - The total initial supply is exactly the genesis coinbase: 2 540 000 VX.
 
 ---
