@@ -624,6 +624,12 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     auto frame_span = builder.bytes();
     vx::blockchain::BlockFrame frame;
     std::memcpy(frame.data(), frame_span.data(), 65536);
+    // BACKLOG 0.9: the intake gate enforces real PoGW work on every appended
+    // block, so the transfer path seals its frame before offering it — same
+    // work rule as the background miner, one definition (pogw_meets_target).
+    if (!vx::blockchain::seal_pogw_nonce(frame, store_.required_pogw_bits())) {
+        return HttpResponse::error(500, "pogw seal failed");
+    }
     bool appended = store_.append_block(frame);
     if (!appended) return HttpResponse::error(500, "block rejected");
 

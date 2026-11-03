@@ -36,7 +36,11 @@ void PoGWMiner::mining_loop() {
 
 void PoGWMiner::mine_one() {
     uint64_t height = store_.chain_height();
-    uint64_t diff = calculate_difficulty();
+    // The search target must never sit below the store's live-intake gate
+    // (BACKLOG 0.9): a block mined to less work than the gate requires would
+    // be rejected at append and waste the sealing work. In dev mode ASERT
+    // hovers around 16 anyway; the max() keeps the two honest if they drift.
+    uint64_t diff = std::max(calculate_difficulty(), store_.required_pogw_bits());
 
     uint8_t tip[32];
     store_.tip_hash(tip);

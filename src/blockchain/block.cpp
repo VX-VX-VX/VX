@@ -21,6 +21,75 @@ void hash_block(const RawBlock& raw, uint8_t out[32]) noexcept {
     sponge.finalize(out);
 }
 
+// ── PoGW work + intake gate (BACKLOG 0.9) ────────────────────────────────────
+
+bool pogw_meets_target(const uint8_t* frame65536, uint64_t difficulty_bits) noexcept {
+    if (difficulty_bits == 0) return true;
+    if (difficulty_bits > 256) return false;
+    uint8_t hash[32];
+    VortexSponge256::compute(frame65536, BLOCK_SIZE_BYTES, hash);
+    uint64_t zeros = 0;
+    for (size_t i = 0; i < sizeof(hash); ++i) {
+        if (hash[i] != 0) {
+            uint8_t b = hash[i];
+            while ((b & 0x80) == 0) { ++zeros; b <<= 1; }
+            break;
+        }
+        zeros += 8;
+    }
+    return zeros >= difficulty_bits;
+}
+
+bool seal_pogw_nonce(BlockFrame& frame, uint64_t difficulty_bits, uint64_t max_attempts) noexcept {
+    if (difficulty_bits == 0) return true;
+    auto* raw = reinterpret_cast<RawBlock*>(frame.data());
+    for (uint64_t nonce = 0; nonce < max_attempts; ++nonce) {
+        raw->tail.pogw_nonce = nonce;
+        if (pogw_meets_target(frame.data(), difficulty_bits)) return true;
+    }
+    return false;
+}
+
+bool validate_block(const RawBlock& raw, const BlockIntakeContext& ctx,
+                    std::string* error) noexcept {
+    auto fail = [&](const char* why) {
+        if (error) *error = why;
+        return false;
+    };
+
+    // 1. Frame magic — the cheapest rejection first.
+    if (raw.header.magic != BLOCK_MAGIC) return fail("bad frame magic");
+
+    // 2. Chain position: the block must extend the current tip exactly.
+    if (raw.header.block_height != ctx.expected_height) return fail("height != tip + 1");
+
+    // 3. Chain binding: prev_block_hash must commit the current tip
+    //    (full-frame commitment, header AND tail).
+    if (std::memcmp(raw.header.prev_block_hash, ctx.expected_prev_hash, 32) != 0)
+        return fail("prev_block_hash does not bind the current tip");
+
+    // 4. Body bound: an oversized tx_count would poison the ledger file
+    //    permanently (recovery then fails on reopen).
+    if (raw.header.tx_count > MAX_TX_PER_BLOCK) return fail("tx_count exceeds MAX_TX_PER_BLOCK");
+
+    // 5. Merkle commitment recomputed from the body alone.
+    if (!verify_block_merkle(raw)) return fail("merkle_root does not commit the block body");
+
+    // 6. Timestamp: monotonic against the tip, not far in the future.
+    //    (Genesis never passes through this gate — the store seeds it
+    //    directly — so height 0 needs no special case.)
+    if (raw.header.timestamp < ctx.prev_timestamp) return fail("timestamp older than the tip");
+    if (raw.header.timestamp > ctx.now_unix + 300) return fail("timestamp too far in the future");
+
+    // 7. PoGW: the full-frame commitment must carry the required work.
+    //    This is the expensive check, so it runs last.
+    if (!pogw_meets_target(reinterpret_cast<const uint8_t*>(&raw), ctx.difficulty_bits))
+        return fail("insufficient PoGW work for the current difficulty");
+
+    if (error) error->clear();
+    return true;
+}
+
 // ── Merkle root logic using Sponge ──────────────────────────────────────────
 
 void hash_tx(const Transaction& tx, uint8_t out[32]) noexcept {

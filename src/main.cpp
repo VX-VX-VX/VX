@@ -170,6 +170,12 @@ void run_demo_script(vx::storage::BlockStore& store,
     vx::blockchain::BlockFrame frame;
     std::memcpy(frame.data(), frame_span.data(), 65536);
 
+    // BACKLOG 0.9: the intake gate enforces real PoGW work, so the demo seals
+    // its frame like every other producer (dev-mode difficulty, ~seconds).
+    if (!vx::blockchain::seal_pogw_nonce(frame, store.required_pogw_bits())) {
+        throw std::runtime_error("PoGW seal failed: no nonce met the difficulty");
+    }
+
     bool appended = store.append_block(frame);
     std::cout << "      append_block(#" << next_h << ") → " << (appended ? "OK ✓" : "FAILED ✗") << "\n";
     if (!appended) throw std::runtime_error("BlockStore rejected Block #" + std::to_string(next_h));

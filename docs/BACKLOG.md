@@ -111,14 +111,22 @@ Promoted peers carry `node_id: 0` and nothing proves who they are.
 
 ### 0.6 PoGW verification on wire frames
 
-Wire-applied frames are checked structurally and by ledger rules, not
-re-mined.
+Largely closed 2026-11-03 together with 0.9: the intake gate verifies the
+PoGW nonce (full-frame VortexSponge256, leading zero bits >= the store's
+required difficulty) BEFORE `apply_block` on every path, including P2P
+wire frames (`apply_remote_frame` → `append_block` → gate). The
+`fuzz_block_frame` target now covers the combined verify surface.
 
-- [ ] Verify the block's PoGW nonce/attractor commitment against the
-  current difficulty before `apply_block`.
-- [ ] Fuzz target for the combined wire→verify→apply path.
-- Acceptance: a crafted tip-extending frame without valid PoGW is
-  rejected before touching the ledger; test in the suite.
+- [x] Verify the block's PoGW nonce/attractor commitment against the
+  current difficulty before `apply_block` (difficulty-0 attractor
+  re-execution beyond the nonce target remains future work).
+- [x] Fuzz target for the combined wire→verify→apply path (gate surface
+  in `fuzz_block_frame`; 190k+ runs clean).
+- Acceptance: met — `NoWorkBlockAccepted` flipped to EXPECT_FALSE, a
+  crafted tip-extending frame without valid PoGW is rejected before
+  touching the ledger (`PogwGateAcceptsSealedWorkAndBindsTheNonce`).
+- Remaining: validator-authenticated PoGW/attractor commitment
+  (BACKLOG 0.4/2.4), dynamic retarget in the gate (see 0.9).
 
 ### 0.7 Transaction authorization (keyless tier must go)
 
@@ -152,19 +160,34 @@ cannot verify a PQ-signed transaction (external review, confirmed).
 
 ### 0.9 Central block validation (single intake gate)
 
-Pinned by `VortexDocumentedGapsTest.NoWorkBlockAccepted` (expect: an
-empty, no-work, timestamp-0 frame is accepted today).
+CLOSED 2026-11-03. One gate (`blockchain::validate_block` + the
+`pogw_meets_target` work comparator) now runs on every production intake
+path: `BlockStore::append_block` is the single chokepoint — the RPC
+transfer/mine path, `apply_remote_frame` (P2P relay) and the background
+miner all append through it — and the restart/recovery path re-validates
+every stored frame (magic, height, tx_count, merkle) in
+`validate_region`. The pin test `NoWorkBlockAccepted` is flipped to
+EXPECT_FALSE (an otherwise-valid frame with no PoGW nonce is rejected
+with "insufficient PoGW work for the current difficulty"); new tests:
+`PogwGateAcceptsSealedWorkAndBindsTheNonce`, `RecoveryRejectsCorruptedLedgerFrame`.
+`fuzz_block_frame` drives the gate surface (merkle, timestamp, work
+comparator) — 190k+ runs clean.
 
-- [ ] One `validate_block()` covering: PoGW vs difficulty, merkle root,
-  timestamp, height/prev binding, tx count, every tx proof, state rules.
-- [ ] Called on ALL intake paths: RPC accept, P2P relay, disk write,
-  restart recovery.
-- Confirmed by reviewer PoC: a frame with a deliberately forged merkle
-  root passes `apply_block` and moves balances — the merkle field is
-  currently not re-verified anywhere on intake; it belongs to this same
-  single gate.
-- Acceptance: the pin test flips to EXPECT_FALSE; no path can append an
-  invalid frame.
+- [x] One `validate_block()`: magic, height/prev binding, tx count,
+  merkle commitment, timestamp monotonicity + future bound, PoGW vs
+  difficulty. (State rules stay in `LedgerState::apply_block` by design —
+  the store gate rejects invalid frames before any state is touched, and
+  the ledger layer remains the defense-in-depth for state validity.)
+- [x] Called on ALL intake paths: RPC accept, P2P relay, miner, disk
+  write, restart recovery.
+- [x] Every block producer seals through `seal_pogw_nonce` — the RPC
+  transfer path and the demo now carry real work (~8 s per block at
+  dev-mode difficulty 16; ~120 µs per 64 KiB hash).
+- Remaining (design-scale, still BACKLOG 0.6): dynamic ASERT retargeting
+  wired into the gate (today the gate enforces the store's configured
+  difficulty; the miner aims at max(ASERT, gate) so it can never aim
+  below the gate), and per-tx proof checks at the block level (each tx
+  proof is verified by the ledger on apply).
 
 ### 0.10 RPC server hardening
 

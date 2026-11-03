@@ -31,7 +31,7 @@ Tested. That is the honest ceiling until the independent review (BACKLOG
 
 Everything cited below was produced by commands a reader can re-run:
 
-- **Test suite:** 16/16 gtest binaries pass (`ctest`, GCC and Clang in CI,
+- **Test suite:** 17/17 gtest tests pass (`ctest`, GCC and Clang in CI,
   plus an ASan+UBSan lane and CodeQL on every push).
 - **Fuzzing:** three libFuzzer targets in CI (`fuzz_block_frame` 100k,
   `fuzz_pq_witness` 20k, `fuzz_wire` 200k execs, fixed seeds); the JSON RPC
@@ -44,6 +44,25 @@ Everything cited below was produced by commands a reader can re-run:
 - **Live RPC:** every response in [RPC_COOKBOOK.md](RPC_COOKBOOK.md) was
   captured from a running node; the hostile-input smoke for this pass
   answered clean JSON errors and kept serving.
+
+## Independent replication (external review rounds 1-6)
+
+Every defect listed below was first REPRODUCED INDEPENDENTLY by the
+external reviewer — with their own proof-of-concept code, run against the
+shipped library or a live node — before we fixed it. The fixes therefore
+respond to demonstrated defects, not to theoretical ones, and each fix is
+pinned by an automated regression so the replication stays checkable. The
+reviewer's PoCs for rounds 3-5 ran standalone against `libvx_core.a`
+(their note: the project's own ctest selection was incomplete on their
+machine), which makes the reproduction independent of our test harness.
+
+| Round | Independently replicated by the reviewer | Where the fix is pinned |
+|---|---|---|
+| 1-2 | RPC surface defects, including the two number-parsing crashes | `fuzz_rpc` battery + RPC hardening (§16) |
+| 3 | Intra-block double spend minting phantom supply; mempool TOCTOU; phantom fsync acknowledgment | `DoubleSpendInBlockRejected`; single-critical-section mempool; append rollback (§6) |
+| 4 | Genesis-v1 nonce replay; `tx_count` poisoning; unverified merkle field; miner draining mempool on a rejected block; RPC-controlled fee/nonce | `NonceZeroReplayRejected`, `OversizedTxCountRejected`, `TamperedMerkleRejected`; miner commit checks; node-stamped fee/nonce (§6) |
+| 5 | Vault RPC plaintext exposure; HTLC VM-branch mismatch; GQC tail-stamp overlap; vault page clobber; 32-bit vault token digest; block id ignoring the tail; SSE descriptor leak; demo keys in fixtures; MemoryCore 4×32-bit digest | `HtlcVmFailureForcesLocked`, `VaultTokenDigestFullyChecked`, `VaultPoolFullNotClobber`, `TailMetadataCommitted`, sidecar GQC stamp (§5, §13, §16); WOTS+ leaf reuse was reported stale — already fixed by the durable leaf ledger |
+| 6 (2026-11-03) | No-work blocks accepted on every intake path (the round-4 forged-merkle PoC now belongs to the same gate) | `NoWorkBlockAccepted` (flipped to EXPECT_FALSE), `PogwGateAcceptsSealedWorkAndBindsTheNonce`, `RecoveryRejectsCorruptedLedgerFrame` (§4, §6) |
 
 ---
 
@@ -187,13 +206,22 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   uses `double`/`pow()` — not a real ASERT anchor.
 - **What is proven today.** Blocks mine, verify structurally, and apply
   deterministically; the multi-node testnet shows a locally mined block
-  propagating and being applied on three independent nodes.
+  propagating and being applied on three independent nodes. Since the
+  single intake gate shipped (round 6, BACKLOG 0.9/0.6 closed), every
+  intake path — RPC transfer/mine, P2P `apply_remote_frame`, the miner —
+  re-verifies the PoGW nonce (full-frame VortexSponge256, leading zero
+  bits >= the configured difficulty) BEFORE the frame touches the ledger;
+  producers seal through the same comparator the gate judges, so the
+  definition of "enough work" cannot drift between miner and verifier.
 - **What is NOT proven (the masterplan's own questions, answered
   honestly).**
-  - *Cheap verification by other nodes:* the wire relay path applies
-    frames structurally and by ledger rules, **without re-verification of
-    the PoGW nonce/attractor commitment** (BACKLOG P0.6). Today a crafted
-    tip-extending frame with an invalid proof is not rejected at the wire.
+  - *Cheap verification beyond the nonce target:* the gate verifies the
+    hash-lottery nonce; it does not re-execute the attractor commitment
+    or bind the coinbase to the mining work (BACKLOG 0.4/0.6 remainder —
+    the `MinerEmissionForgeable` pin stays open). Dynamic ASERT
+    retargeting is not wired into the gate: today the gate enforces the
+    store's configured difficulty (dev mode 16) while the miner aims at
+    max(ASERT, gate).
   - *Formal security model:* no model of "genuine work" as a cost function
     exists in writing; no Sybil/replay/timestamp-manipulation simulations.
   - *Hardware asymmetry:* nothing quantifies GPU-vs-CPU advantage; the
@@ -282,7 +310,20 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   - *RPC transfer auto-fields*: `handle_transfer` left fee/nonce to the
     (attacker-controlled) request body; the node now stamps fee and the
     ledger's next nonce itself.
-- **Still open, pinned honestly (expect-success tests).**
+- **Fixed in external-review round 6 (2026-11-03, BACKLOG 0.9 + 0.6).**
+  - *Single intake gate*: `append_block` used to enforce only
+    magic/height/prev + tx_count/merkle; a tip-extending frame carrying
+    zero mining work was appended and applied by every path. Now one
+    `validate_block()` (magic, height/prev binding, tx_count bound,
+    merkle commitment, timestamp monotonicity + future bound, PoGW
+    full-frame work) runs at the single chokepoint every producer
+    appends through; the recovery path re-validates every stored frame
+    (tx_count + merkle) on reopen and fails closed. Regressions:
+    `NoWorkBlockAccepted` FLIPPED to EXPECT_FALSE,
+    `PogwGateAcceptsSealedWorkAndBindsTheNonce`,
+    `RecoveryRejectsCorruptedLedgerFrame`. The RPC transfer path and the
+    demo now seal their frames (`seal_pogw_nonce`) instead of appending
+    unworked ones; `fuzz_block_frame` drives the gate surface.
 - **Still open, pinned honestly (expect-success tests).**
   - *Keyless authorization*: `verify_transaction_proof` accepts a plain
     sponge digest for any sender not registered as a PQ sender — a
@@ -292,10 +333,12 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     (addresses bound to PQ keys in state; witness on the wire).
   - *MINER_ emission*: a coinbase needs only the `MINER_` sender prefix,
     index 0 and an amount at or below the 1000 VX limit — no identity, no
-    PoGW binding — so anyone mints the maximum reward per block
-    (`MinerEmissionForgeable` — the mint SUCCEEDS today). EMISSION
-    INTEGRITY IS NOT CLAIMED until PoGW verification gates coinbase
-    intake (BACKLOG 0.6 + 0.9).
+    binding to the block's actual mining work — so anyone still mints the
+    maximum reward per block (`MinerEmissionForgeable` — the mint
+    SUCCEEDS today). The PoGW work gate (round 6) no longer accepts
+    no-work BLOCKS, but the coinbase transaction itself is still not
+    bound to the mined nonce or a miner identity. EMISSION INTEGRITY IS
+    NOT CLAIMED until that binding ships (BACKLOG 0.6 remainder).
   - *Undo journal serialization*: `UndoRecord` holds `std::string` /
     `std::vector` / `time_point` and is written with a raw
     `write(fd, &record, sizeof(record))` — heap pointers serialized as

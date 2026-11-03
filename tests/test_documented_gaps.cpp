@@ -46,8 +46,11 @@
 #include "vx/vm/vortex_vm.hpp"
 
 #include <cstring>
+#include <ctime>
+#include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <unistd.h>
 
@@ -80,12 +83,15 @@ Transaction make_tx(const Address& sender, const Address& receiver,
     return tx;
 }
 
-// Append + ledger-apply a builder's frame, in one step.
+// Append + ledger-apply a builder's frame, in one step. The frame is sealed
+// (PoGW nonce search at the store's required difficulty) before the gate
+// sees it — the same work rule every production producer follows.
 bool push_block(vx::storage::BlockStore& store, vx::state::LedgerState& ledger,
                 BlockBuilder& b) {
     b.finalize();
     BlockFrame frame;
     std::memcpy(frame.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    if (!seal_pogw_nonce(frame, store.required_pogw_bits())) return false;
     if (!store.append_block(frame)) return false;
     return ledger.apply_block(BlockView(frame)).ok;
 }
@@ -104,11 +110,14 @@ BlockBuilder next_block(vx::storage::BlockStore& store, uint64_t ts) {
 
 } // namespace
 
-// ── Gap pin 1: a block with no work, no timestamp, no transactions is
-// accepted by append_block (magic/height/prev only) and by apply_block.
-// Fix: one validate_block() on every intake path (BACKLOG 0.6/0.9).
+// ── Gap pin 1 (CLOSED 2026-11-03, BACKLOG 0.9): a block carrying no PoGW
+// work is rejected by the single intake gate. The frame below is otherwise
+// perfectly formed — valid magic, correct height, prev-hash bound to the
+// tip, sane timestamp, valid merkle — so the ONLY failing check is the
+// full-frame work requirement, which is exactly what the pin claims.
 TEST(VortexDocumentedGapsTest, NoWorkBlockAccepted) {
     const std::string dir = temp_dir("vx_gap_block");
+    // Production difficulty: the gate demands the real 16-bit work.
     vx::storage::BlockStore store(dir + "/gap.vxb", "genesis.bin");
     vx::state::LedgerState ledger;
 
@@ -119,21 +128,16 @@ TEST(VortexDocumentedGapsTest, NoWorkBlockAccepted) {
     std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    BlockBuilder b = next_block(store, 0); // timestamp 0: no rule enforced
-    // NOTE: no PoGW nonce, no attractor commitment, zero transactions.
+    BlockBuilder b = next_block(store, std::time(nullptr));
+    // NOTE: no PoGW nonce — the frame carries zero work, everything else valid.
 
     BlockFrame f;
     b.finalize();
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
-    EXPECT_TRUE(store.append_block(f))
-        << "gap closed? then flip this expectation to EXPECT_FALSE";
-    EXPECT_TRUE(ledger.apply_block(BlockView(f)).ok)
-        << "gap closed? then flip this expectation to EXPECT_FALSE";
-
-    std::cout << "  [documented gap] empty/no-work frame (timestamp 0, no"
-              << " PoGW) accepted at height " << store.chain_height() - 1
-              << ". Single validate_block() on all intake paths is BACKLOG"
-              << " 0.6/0.9.\n";
+    EXPECT_FALSE(store.append_block(f));
+    EXPECT_EQ(store.last_error(), "insufficient PoGW work for the current difficulty");
+    // The gate refused the frame: chain height must not have moved.
+    EXPECT_EQ(store.chain_height(), 1u);
 
     std::filesystem::remove_all(dir);
 }
@@ -145,7 +149,7 @@ TEST(VortexDocumentedGapsTest, NoWorkBlockAccepted) {
 // victim and the ledger credits the attacker (BACKLOG 0.7/0.8).
 TEST(VortexDocumentedGapsTest, KeylessTheftReproducible) {
     const std::string dir = temp_dir("vx_gap_theft");
-    vx::storage::BlockStore store(dir + "/theft.vxb", "genesis.bin");
+    vx::storage::BlockStore store(dir + "/theft.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
     // Apply genesis so its mint receiver holds a real balance.
@@ -172,7 +176,7 @@ TEST(VortexDocumentedGapsTest, KeylessTheftReproducible) {
         << "gap closed? then flip this expectation to EXPECT_FALSE";
 
     // Ship it as a normal block; the ledger must (and, today, does) accept.
-    BlockBuilder b = next_block(store, 12345);
+    BlockBuilder b = next_block(store, std::time(nullptr));
     ASSERT_TRUE(b.add_transaction(theft));
     const bool applied = push_block(store, ledger, b);
     EXPECT_TRUE(applied) << "theft block rejected - gap may be closing";
@@ -196,7 +200,7 @@ TEST(VortexDocumentedGapsTest, KeylessTheftReproducible) {
 // debits were not) and the commit loop underflowed U128 to ~2^128.
 TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     const std::string dir = temp_dir("vx_gap_dspend");
-    vx::storage::BlockStore store(dir + "/dspend.vxb", "genesis.bin");
+    vx::storage::BlockStore store(dir + "/dspend.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
     // Height 0: apply genesis.
@@ -210,7 +214,7 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     const Address sender = addr_of("NFA_DSPEND_VICTIM_000000000000000000000000");
     const Address sink = addr_of("NFA_DSPEND_SINK_0000000000000000000000000000");
     {
-        BlockBuilder b = next_block(store, 1);
+        BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction mint = make_tx(addr_of("GENESIS_2"), sender, 1000000000u, 0);
         sign_transaction(mint);
         ASSERT_TRUE(b.add_transaction(mint));
@@ -221,7 +225,7 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     // Height 2: TWO spends of 6 VX each (total 12 VX > 10 VX balance),
     // sequential nonces, both proofs individually valid.
     {
-        BlockBuilder b = next_block(store, 2);
+        BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction s1 = make_tx(sender, sink, 600000000u, 0);
         Transaction s2 = make_tx(sender, sink, 600000000u, 1);
         sign_transaction(s1);
@@ -231,11 +235,14 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
         ASSERT_TRUE(b.add_transaction(s1));
         ASSERT_TRUE(b.add_transaction(s2));
 
-        // The block must be REJECTED outright - no partial application.
+        // The block is structurally valid (the store gate passes it after
+        // sealing); the STATE layer must reject it outright - no partial
+        // application.
         b.finalize();
         BlockFrame f;
         std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
-        EXPECT_TRUE(store.append_block(f)); // store gate is gap pin 1
+        ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+        EXPECT_TRUE(store.append_block(f));
         const auto res = ledger.apply_block(BlockView(f));
         EXPECT_FALSE(res.ok) << "double spend accepted - regression!";
         EXPECT_NE(res.error.find("insufficient funds"), std::string::npos)
@@ -262,7 +269,7 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
 // which itself depends on the PoGW-verification design item 0.6).
 TEST(VortexDocumentedGapsTest, MinerEmissionForgeable) {
     const std::string dir = temp_dir("vx_gap_miner");
-    vx::storage::BlockStore store(dir + "/miner.vxb", "genesis.bin");
+    vx::storage::BlockStore store(dir + "/miner.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
     const auto* g = store.get_block(0);
@@ -283,11 +290,14 @@ TEST(VortexDocumentedGapsTest, MinerEmissionForgeable) {
     tx_set_nonce(cb, 0);
     sign_transaction(cb); // keyless, like the real coinbase path
 
-    BlockBuilder b = next_block(store, 777);
+    BlockBuilder b = next_block(store, std::time(nullptr));
     ASSERT_TRUE(b.add_transaction(cb)); // index 0, as required
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    // Sealed so the emission pin is judged on its own, not masked by the
+    // new work gate.
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
     EXPECT_TRUE(store.append_block(f))
         << "gap closed? then flip this expectation to EXPECT_FALSE";
     EXPECT_TRUE(ledger.apply_block(BlockView(f)).ok)
@@ -309,7 +319,7 @@ TEST(VortexDocumentedGapsTest, MinerEmissionForgeable) {
 // the genesis replay window (next_height <= 1).
 TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
     const std::string dir = temp_dir("vx_gap_nonce");
-    vx::storage::BlockStore store(dir + "/nonce.vxb", "genesis.bin");
+    vx::storage::BlockStore store(dir + "/nonce.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
     const auto* g = store.get_block(0);
@@ -323,7 +333,7 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
 
     // Height 1: fund the sender (GENESIS_2 mint, legacy window).
     {
-        BlockBuilder b = next_block(store, 1);
+        BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction mint = make_tx(addr_of("GENESIS_2"), sender, 1000000000u, 0);
         sign_transaction(mint);
         ASSERT_TRUE(b.add_transaction(mint));
@@ -333,7 +343,7 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
     // Height 2: a real spend consumes nonce 0 (window is closed here:
     // next_height == 2). Fee 100, so it is NOT genesis-v1-shaped.
     {
-        BlockBuilder b = next_block(store, 2);
+        BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction spend = make_tx(sender, sink, 100000000u, 0);
         sign_transaction(spend);
         ASSERT_TRUE(b.add_transaction(spend));
@@ -344,7 +354,7 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
     // same sender whose expected nonce is now 1. Before the scoping fix
     // the shape alone bypassed the nonce check; now it must be refused.
     {
-        BlockBuilder b = next_block(store, 3);
+        BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction replay = make_tx(sender, sink, 100000000u, 0);
         tx_set_fee(replay, 0); // shape: fee=0 + nonce=0 == genesis v1
         sign_transaction(replay);
@@ -353,7 +363,10 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
         b.finalize();
         BlockFrame f;
         std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
-        EXPECT_TRUE(store.append_block(f)); // store gate is gap pin 1
+        // Structurally valid block: the store gate (sealed) passes it; the
+        // STATE layer must refuse the genesis-v1-shaped replay.
+        ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+        EXPECT_TRUE(store.append_block(f));
         const auto res = ledger.apply_block(BlockView(f));
         EXPECT_FALSE(res.ok) << "genesis-v1-shaped replay accepted!";
         EXPECT_NE(res.error.find("nonce mismatch"), std::string::npos)
@@ -372,7 +385,7 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
 // now refuses tx_count > MAX_TX_PER_BLOCK before anything else reads it.
 TEST(VortexDocumentedGapsTest, OversizedTxCountRejected) {
     const std::string dir = temp_dir("vx_gap_txcount");
-    vx::storage::BlockStore store(dir + "/txcount.vxb", "genesis.bin");
+    vx::storage::BlockStore store(dir + "/txcount.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
     const auto* g = store.get_block(0);
@@ -382,7 +395,7 @@ TEST(VortexDocumentedGapsTest, OversizedTxCountRejected) {
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // A perfectly valid 1-tx block...
-    BlockBuilder b = next_block(store, 42);
+    BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction t = make_tx(addr_of("GENESIS_2"),
                             addr_of("NFA_TXCOUNT_TARGET_00000000000000000000"),
                             100000000u, 0);
@@ -391,6 +404,8 @@ TEST(VortexDocumentedGapsTest, OversizedTxCountRejected) {
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    // Seal first: the rejection below must name tx_count, not missing work.
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
 
     // ...then poison ONLY the tx_count header field (offset 0x1D4): 581
     // transactions in a frame that physically holds at most 580.
@@ -410,7 +425,7 @@ TEST(VortexDocumentedGapsTest, OversizedTxCountRejected) {
 // applied. append_block now recomputes the root and rejects mismatches.
 TEST(VortexDocumentedGapsTest, TamperedMerkleRejected) {
     const std::string dir = temp_dir("vx_gap_merkle");
-    vx::storage::BlockStore store(dir + "/merkle.vxb", "genesis.bin");
+    vx::storage::BlockStore store(dir + "/merkle.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
     const auto* g = store.get_block(0);
@@ -419,7 +434,7 @@ TEST(VortexDocumentedGapsTest, TamperedMerkleRejected) {
     std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    BlockBuilder b = next_block(store, 43);
+    BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction t = make_tx(addr_of("GENESIS_2"),
                             addr_of("NFA_MERKLE_TARGET_000000000000000000000"),
                             100000000u, 0);
@@ -428,6 +443,8 @@ TEST(VortexDocumentedGapsTest, TamperedMerkleRejected) {
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    // Seal first: the rejection below must name the merkle commitment.
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
 
     // Flip one byte of the committed merkle root (header offset 0x02C):
     // the transaction set no longer commits to this header.
@@ -559,9 +576,9 @@ TEST(VortexDocumentedGapsTest, VaultPoolFullNotClobber) {
 // in their PoGW nonce shared one tip hash. hash_block now commits both.
 TEST(VortexDocumentedGapsTest, TailMetadataCommitted) {
     const std::string dir = temp_dir("vx_gap_tailcommit");
-    vx::storage::BlockStore store(dir + "/tail.vxb", "genesis.bin");
+    vx::storage::BlockStore store(dir + "/tail.vxb", "genesis.bin", 8);
 
-    BlockBuilder b = next_block(store, 44);
+    BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction t = make_tx(addr_of("GENESIS_2"),
                             addr_of("NFA_TAIL_TARGET_00000000000000000000000"),
                             100000000u, 0);
@@ -590,6 +607,75 @@ TEST(VortexDocumentedGapsTest, TailMetadataCommitted) {
         << "precondition: header-only digest ignores the tail";
     EXPECT_NE(std::memcmp(h1, h2, 32), 0)
         << "a mutated PoGW nonce must change the block commitment";
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── Gap closed (2026-11-03, BACKLOG 0.9): the intake gate accepts work that
+// meets the configured difficulty and binds the producer to the exact nonce —
+// a one-off nonce mutation of a sealed frame is rejected with the same
+// "insufficient PoGW work" verdict as a never-sealed frame.
+TEST(VortexDocumentedGapsTest, PogwGateAcceptsSealedWorkAndBindsTheNonce) {
+    const std::string dir = temp_dir("vx_gap_work");
+    // Difficulty 12: ~4096 expected hashes (~0.5 s) — real PoGW, fast test.
+    vx::storage::BlockStore store(dir + "/work.vxb", "genesis.bin", 12);
+    vx::state::LedgerState ledger;
+
+    const auto* g = store.get_block(0);
+    ASSERT_NE(g, nullptr);
+    BlockFrame gf;
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+
+    BlockBuilder b = next_block(store, std::time(nullptr));
+    b.finalize();
+    BlockFrame f;
+    std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+
+    // A sealed frame's nonce is load-bearing: change it and the work is gone.
+    BlockFrame forged = f;
+    auto* forged_raw = reinterpret_cast<RawBlock*>(forged.data());
+    forged_raw->tail.pogw_nonce ^= 1;
+    EXPECT_FALSE(store.append_block(forged));
+    EXPECT_EQ(store.last_error(), "insufficient PoGW work for the current difficulty");
+
+    // The untouched sealed frame goes through.
+    EXPECT_TRUE(store.append_block(f));
+    EXPECT_EQ(store.chain_height(), 2u);
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── Gap closed (2026-11-03, BACKLOG 0.9): the recovery/reopen path no longer
+// trusts magic + height alone. A ledger whose stored frame lost its merkle
+// commitment must fail the open loudly instead of serving corrupted history.
+TEST(VortexDocumentedGapsTest, RecoveryRejectsCorruptedLedgerFrame) {
+    const std::string dir = temp_dir("vx_gap_reopen");
+    const std::string path = dir + "/reopen.vxb";
+    {
+        vx::storage::BlockStore store(path, "genesis.bin", 8);
+        vx::state::LedgerState ledger;
+        const auto* g = store.get_block(0);
+        ASSERT_NE(g, nullptr);
+        BlockFrame gf;
+        std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+        ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+        BlockBuilder b = next_block(store, std::time(nullptr));
+        ASSERT_TRUE(push_block(store, ledger, b));
+    }
+    // Corrupt one byte of frame 1's committed merkle root on disk.
+    const int fd = ::open(path.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+    const off_t off = static_cast<off_t>(BLOCK_SIZE_BYTES + offsetof(RawBlock, header.merkle_root));
+    uint8_t byte = 0;
+    ASSERT_EQ(::pread(fd, &byte, 1, off), 1);
+    byte = static_cast<uint8_t>(byte ^ 0xA5);
+    ASSERT_EQ(::pwrite(fd, &byte, 1, off), 1);
+    ::close(fd);
+
+    EXPECT_THROW({ vx::storage::BlockStore reopen(path, "genesis.bin", 8); },
+                 std::runtime_error);
 
     std::filesystem::remove_all(dir);
 }

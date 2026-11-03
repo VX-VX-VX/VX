@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <span>
+#include <string>
 
 namespace vx::blockchain {
 
@@ -201,6 +202,57 @@ void hash_header(const BlockHeader& header, uint8_t out[32]) noexcept;
  * diagnostics.
  */
 void hash_block(const RawBlock& raw, uint8_t out[32]) noexcept;
+
+// ── PoGW work: one definition for miner and intake gate ─────────────────────
+
+/// Default live-intake PoGW difficulty: required leading zero bits of the
+/// full-frame VortexSponge256 commitment. Dev-mode value matching the miner's
+/// ASERT base difficulty; dynamic retargeting is BACKLOG 0.6 follow-up.
+inline constexpr uint64_t DEFAULT_POGW_DIFFICULTY_BITS = 16;
+
+/// PoGW target check, single source of truth (BACKLOG 0.9): the miner's
+/// success condition and the intake gate both call this, so the definition
+/// of "enough work" can never drift between producer and verifier. The hash
+/// covers the whole 65536-byte frame including the pogw_nonce field.
+bool pogw_meets_target(const uint8_t* frame65536, uint64_t difficulty_bits) noexcept;
+
+/// Finds the smallest pogw_nonce whose full-frame hash meets the target.
+/// Writes each candidate into the frame before hashing. Returns false when
+/// max_attempts is exhausted (the frame is left at the last tried nonce).
+/// Every block producer outside the background miner (RPC transfer/mine
+/// path, demo) seals through this, so all produced blocks carry real work.
+bool seal_pogw_nonce(BlockFrame& frame, uint64_t difficulty_bits,
+                     uint64_t max_attempts = 1ULL << 26) noexcept;
+
+// ── Single intake gate (BACKLOG 0.9) ─────────────────────────────────────────
+
+/// Everything a verifier needs to judge one candidate block against the
+/// current chain. Built by the caller from store tip + wall clock; the gate
+/// itself is stateless.
+struct BlockIntakeContext {
+    uint64_t expected_height;
+    uint8_t  expected_prev_hash[32];
+    uint64_t prev_timestamp;   // tip's timestamp (genesis ts for height 1)
+    uint64_t now_unix;         // caller's wall clock
+    uint64_t difficulty_bits;  // required leading zero bits of the full-frame hash
+};
+
+/**
+ * @brief The one consensus gate every intake path runs (BACKLOG 0.9).
+ *
+ * Checks, in cheap-to-expensive order: frame magic, height == expected,
+ * prev_block_hash binding to the current tip, tx_count bound, merkle
+ * commitment recomputed from the body, timestamp monotonicity
+ * (ts >= prev_ts) and sanity (ts <= now + 300s), and finally PoGW work
+ * (full-frame hash leading zero bits >= difficulty_bits). Returning true
+ * means the block may be appended and applied; every rejection reason is
+ * written to *error when non-null. The recovery/reopen path runs the
+ * deterministic subset (magic, height, tx_count, merkle) via
+ * BlockStore::validate_region — time-dependent checks are meaningless
+ * against historical blocks.
+ */
+bool validate_block(const RawBlock& raw, const BlockIntakeContext& ctx,
+                    std::string* error = nullptr) noexcept;
 
 // ── Block View (zero-copy over mmap'd or in-memory buffer) ──────────────────
 

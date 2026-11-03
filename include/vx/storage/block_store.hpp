@@ -19,17 +19,31 @@ namespace vx::storage {
 class BlockStore {
 public:
     /// Opens (or creates) the ledger file. If empty, seeds it with genesis.bin.
-    /// Throws std::runtime_error on I/O failure or corrupt frames.
-    explicit BlockStore(const std::string& path, const std::string& genesis_path = "genesis.bin");
+    /// `required_pogw_bits` is the live-intake work requirement enforced by
+    /// append_block (BACKLOG 0.9); production uses the default (16), tests
+    /// may lower it to keep PoGW search fast. Throws std::runtime_error on
+    /// I/O failure or corrupt frames.
+    explicit BlockStore(const std::string& path, const std::string& genesis_path = "genesis.bin",
+                        uint64_t required_pogw_bits = blockchain::DEFAULT_POGW_DIFFICULTY_BITS);
 
     ~BlockStore() noexcept;
 
     BlockStore(const BlockStore&) = delete;
     BlockStore& operator=(const BlockStore&) = delete;
 
-    /// Appends a validated frame at the chain tip. O(1) (single pwrite).
-    /// Rejects frames with wrong magic or height != current tip + 1 (no genesis double-append).
+    /// Appends a frame at the chain tip after the single intake gate
+    /// (BACKLOG 0.9): magic, height == tip + 1, prev-hash binding, tx_count
+    /// bound, merkle commitment, timestamp monotonicity/sanity and PoGW work.
+    /// O(1) append (single pwrite + fsync).
     bool append_block(const blockchain::BlockFrame& frame);
+
+    /// Reason of the most recent append_block rejection (empty after a
+    /// success). Diagnostics only — the bool return is the contract.
+    const std::string& last_error() const noexcept { return last_error_; }
+
+    /// Live-intake difficulty this store enforces (miners query it so their
+    /// search never aims below the gate).
+    uint64_t required_pogw_bits() const noexcept { return required_pogw_bits_; }
 
     /// Zero-copy O(1) view of the block at height H. nullptr if out of range.
     const blockchain::RawBlock* get_block(uint64_t height) const noexcept;
@@ -62,6 +76,8 @@ private:
     void* mapped_ = nullptr;
     uint64_t mapped_bytes_ = 0;
     uint64_t count_ = 0;
+    uint64_t required_pogw_bits_ = blockchain::DEFAULT_POGW_DIFFICULTY_BITS;
+    std::string last_error_;
 };
 
 } // namespace vx::storage

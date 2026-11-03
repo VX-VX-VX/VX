@@ -652,7 +652,7 @@ struct SimNode {
         std::filesystem::create_directories(dir);
         const std::string ledger_path = dir + "/ledger.vxb";
         std::filesystem::remove(ledger_path); // fresh partition state each run
-        store = std::make_unique<BlockStore>(ledger_path, genesis_path);
+        store = std::make_unique<BlockStore>(ledger_path, genesis_path, 1); // sim: difficulty-1 PoGW
         ledger = std::make_unique<LedgerState>();
         undo = std::make_unique<vx::state::UndoEngine>(dir, *store, *ledger);
         // Apply genesis to state (journal entry stays in memory for O(1) undo)
@@ -692,7 +692,7 @@ struct SimNode {
 
             BlockBuilder b;
             b.set_height(h);
-            b.set_timestamp(1'700'000'000ULL + h * 5);
+            b.set_timestamp(1'761'000'000ULL + h * 5); // >= genesis ts (intake monotonicity)
             b.set_prev_hash(tip);
             b.add_transaction(cb);
             b.finalize();
@@ -922,7 +922,7 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             // Truncate Node A's ledger back to genesis only.
             node_a.store.reset(); // close mmap/fd
             std::filesystem::resize_file(base + "/node_a/ledger.vxb", SB_BLOCK_BYTES);
-            node_a.store = std::make_unique<BlockStore>(base + "/node_a/ledger.vxb", genesis_path);
+            node_a.store = std::make_unique<BlockStore>(base + "/node_a/ledger.vxb", genesis_path, 1);
             // The journal survived the rollback; re-point it at the reopened
             // store (its old reference died with store.reset() above).
             node_a.undo->attach_store(*node_a.store);

@@ -38,5 +38,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         (void)vx::blockchain::verify_transaction_proof(tx);
         (void)is_genesis_v1_tx(tx);
     }
+
+    // BACKLOG 0.9: the single intake gate is on the fuzz surface. The
+    // context mirrors the frame's own height/prev so the fuzzer reaches the
+    // deep checks (merkle, timestamp sanity, work comparator) instead of
+    // stopping at the chain binding; difficulty 0 keeps the per-input cost
+    // at one merkle pass, and the work comparator is exercised separately
+    // with an input-derived target.
+    auto* raw = reinterpret_cast<const RawBlock*>(frame.data());
+    BlockIntakeContext ctx{};
+    std::memcpy(ctx.expected_prev_hash, raw->header.prev_block_hash, 32);
+    ctx.expected_height = raw->header.block_height;
+    ctx.prev_timestamp = 0;
+    ctx.now_unix = 1'800'000'000ULL;
+    ctx.difficulty_bits = 0;
+    std::string err;
+    (void)validate_block(*raw, ctx, &err);
+    (void)pogw_meets_target(frame.data(), size > 0 ? (data[0] % 33) : 0);
     return 0;
 }

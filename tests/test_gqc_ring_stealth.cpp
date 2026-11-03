@@ -30,13 +30,13 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     const std::string tmp_dir = (std::filesystem::temp_directory_path() / ("vx_gqc_test_" + std::to_string(::getpid()))).string();
     std::filesystem::create_directories(tmp_dir);
 
-    vx::storage::BlockStore store(tmp_dir + "/gqc_ledger.vxb", "genesis.bin");
+    vx::storage::BlockStore store(tmp_dir + "/gqc_ledger.vxb", "genesis.bin", 1);
 
     // Ensure a real (non-genesis) tip exists to certify.
     if (store.chain_height() < 2) {
         vx::blockchain::BlockBuilder builder;
         builder.set_height(store.chain_height());
-        builder.set_timestamp(1);
+        builder.set_timestamp(1'761'000'005ULL); // >= genesis ts
         uint8_t tip0[32] = {};
         store.tip_hash(tip0);
         builder.set_prev_hash(tip0);
@@ -52,6 +52,7 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
         builder.finalize();
         vx::blockchain::BlockFrame frame;
         std::memcpy(frame.data(), builder.bytes().data(), 65536);
+        ASSERT_TRUE(vx::blockchain::seal_pogw_nonce(frame, 1)) << "PoGW seal failed";
         ASSERT_TRUE(store.append_block(frame)) << "test block rejected";
     }
 

@@ -8,6 +8,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <stdexcept>
 
@@ -36,21 +37,28 @@ static bool load_frame(const std::string& path, BlockFrame& out) {
     return f.gcount() == static_cast<std::streamsize>(BLOCK_SIZE_BYTES);
 }
 
-/// Validates every frame in [start, end): magic + strictly increasing height.
+/// Validates every frame in [start, end): magic, strictly increasing height,
+/// tx_count bound and a merkle commitment recomputed from the body — the
+/// deterministic subset of blockchain::validate_block (BACKLOG 0.9). The
+/// time-dependent checks (PoGW target, timestamp sanity) are meaningless
+/// against historical blocks: a block was mined for its own moment, and
+/// re-judging it against today's clock would make every old ledger fail.
 /// Genesis (height 0) must be the very first frame exactly once.
 static bool validate_region(const uint8_t* base, uint64_t from, uint64_t to) {
     for (uint64_t h = from; h < to; ++h) {
-        BlockView v(std::span<const uint8_t, BLOCK_SIZE_BYTES>(
-            base + h * BLOCK_SIZE_BYTES, BLOCK_SIZE_BYTES));
-        if (!v.valid_magic()) return false;
-        if (v.header().block_height != h) return false;
+        const RawBlock* raw = reinterpret_cast<const RawBlock*>(base + h * BLOCK_SIZE_BYTES);
+        if (raw->header.magic != blockchain::BLOCK_MAGIC) return false;
+        if (raw->header.block_height != h) return false;
+        if (raw->header.tx_count > blockchain::MAX_TX_PER_BLOCK) return false;
+        if (!blockchain::verify_block_merkle(*raw)) return false;
     }
     return true;
 }
 
 // ── BlockStore ───────────────────────────────────────────────────────────────
 
-BlockStore::BlockStore(const std::string& path, const std::string& genesis_path) : path_(path) {
+BlockStore::BlockStore(const std::string& path, const std::string& genesis_path,
+                       uint64_t required_pogw_bits) : path_(path), required_pogw_bits_(required_pogw_bits) {
     fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd_ < 0) {
         throw std::runtime_error("BlockStore: cannot open '" + path + "': " + std::strerror(errno));
@@ -111,7 +119,8 @@ BlockStore::BlockStore(const std::string& path, const std::string& genesis_path)
 
     if (!validate_region(static_cast<const uint8_t*>(mapped_), 0, count_)) {
         throw std::runtime_error("BlockStore: ledger '" + path +
-                                 "' contains frames with bad magic or non-sequential heights");
+                                 "' contains frames with bad magic, non-sequential heights, "
+                                 "oversized tx_count or a broken merkle commitment");
     }
 }
 
@@ -146,28 +155,35 @@ bool BlockStore::ensure_mapping(uint64_t new_bytes) {
 }
 
 bool BlockStore::append_block(const BlockFrame& frame) {
+    last_error_.clear();
     BlockView v{std::span<const uint8_t, BLOCK_SIZE_BYTES>(frame)};
     const uint64_t expected_height = count_; // next after tip
-
-    if (!v.valid_magic() || v.header().block_height != expected_height) return false;
-
-    // Structural + commitment gate (external review): an oversized tx_count
-    // would poison the ledger file permanently (recovery then fails on
-    // reopen), and an unchecked merkle field is not a commitment at all.
-    if (v.header().tx_count > blockchain::MAX_TX_PER_BLOCK) return false;
-    if (!blockchain::verify_block_merkle(
-            *reinterpret_cast<const blockchain::RawBlock*>(frame.data())))
+    if (!v.valid_magic() || v.header().block_height != expected_height) {
+        last_error_ = "bad magic or height != tip + 1";
         return false;
-
-    // Chain binding: prev_block_hash must equal the commitment of the current tip,
-    // and the genesis prev-hash must be all zeros.
-    uint8_t want_prev[32];
-    if (count_ == 0) {
-        std::memset(want_prev, 0, 32);
-    } else {
-        tip_hash(want_prev);
     }
-    if (std::memcmp(want_prev, v.header().prev_block_hash, 32) != 0) return false;
+
+    // Single intake gate (BACKLOG 0.9): every production intake path —
+    // RPC transfer/mine, P2P apply_remote_frame, the background miner and
+    // any future producer — appends through this method, so this is the one
+    // place the full consensus gate runs. Cheap rejections happen inside
+    // validate_block first; the expensive full-frame PoGW hash runs last.
+    blockchain::BlockIntakeContext ctx{};
+    ctx.expected_height = expected_height;
+    if (count_ == 0) {
+        std::memset(ctx.expected_prev_hash, 0, 32);
+        ctx.prev_timestamp = 0;
+    } else {
+        tip_hash(ctx.expected_prev_hash);
+        const RawBlock* tip = get_block(count_ - 1);
+        ctx.prev_timestamp = tip ? tip->header.timestamp : 0;
+    }
+    ctx.now_unix = static_cast<uint64_t>(std::time(nullptr));
+    ctx.difficulty_bits = required_pogw_bits_;
+    if (!blockchain::validate_block(*reinterpret_cast<const blockchain::RawBlock*>(frame.data()),
+                                    ctx, &last_error_)) {
+        return false;
+    }
 
     // Grow the file by one frame, then pwrite it atomically at the tip offset.
     const off_t offset = static_cast<off_t>(expected_height * BLOCK_SIZE_BYTES);

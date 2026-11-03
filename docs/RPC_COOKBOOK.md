@@ -122,6 +122,10 @@ Field notes:
   server strips it;
 - the transfer is applied to the ledger immediately (this is the demo/CLI
   path, not the mempool path — there is no fee market on this endpoint);
+  since the single intake gate shipped (BACKLOG 0.9), the node seals the
+  block with a real PoGW nonce before appending, so the request takes a
+  few seconds at the dev-mode difficulty (leading 16 zero bits of the
+  full-frame hash) instead of returning instantly;
 - overspending answers `{"error":"insufficient funds"}` and changes
   nothing.
 
