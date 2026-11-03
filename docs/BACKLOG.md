@@ -293,13 +293,38 @@ not payloads. On replay the reconstructed record points at freed/garbage
 memory; the journal is corrupt-by-design the moment it holds a
 non-trivial member.
 
-- [ ] Versioned, fixed-width record format: length-prefixed payload
+- [x] Versioned, fixed-width record format: length-prefixed payload
   fields written byte-wise (no `sizeof(struct)` writes), a format version
   in the header, and a reader that refuses unknown versions.
-- [ ] Reject-or-migrate on open: a journal whose version/magic does not
-  match is rebuilt from the ledger, never replayed.
-- [ ] Fuzz target: journal bytes -> replay; invariant: no crash, no
-  pointer-looking field is ever dereferenced.
+  (2026-11-03) The journal is now magic `VXUNDOJL` + u32 version, then
+  fixed-width little-endian records — u64 height, i64 timestamp_ns,
+  32 B prev tip hash, 16 B prev supply, u64 accounts, u64 tx_count, then
+  per transaction 42+42 B addresses and 16+16 B amount/fee — every field
+  byte-wise, partial writes handled, fsync on append and rewrite. The
+  replay path touches only plain bytes.
+- [x] Reject-or-migrate on open: a journal whose version/magic does not
+  match is rebuilt from the ledger, never replayed. (2026-11-03) Wrong
+  magic or version (including every pre-0.11 raw-pointer file) -> file
+  discarded, journal rebuilds from live block application. Mid-file
+  corruption (>= one minimal record of garbage) -> discarded; a short or
+  torn tail (fewer bytes than a minimal record) is healed by truncating
+  to the last complete record. Two adjacent bugs closed the same day: a
+  reloaded journal was re-committed wholesale (duplicating every record,
+  so a later rollback reversed each effect twice — fixed with a
+  committed-baseline offset), and a block the ledger refused left its
+  pre-state journal record behind (new `UndoEngine::drop_last_record()`,
+  wired into the swarm resync path).
+- [x] Fuzz target: journal bytes -> replay; invariant: no crash, no
+  pointer-looking field is ever dereferenced. (2026-11-03)
+  `fuzz_undo_journal` (journal bytes -> parse -> rollback -> reload;
+  200k execs over a hostile/valid seed corpus, 0 crashes). ASan acceptance:
+  `UndoJournalRejectsHostileFiles` rolls back over pointer-shaped poison
+  clean.
+  Regressions: `UndoJournalByteFormatRoundTrip`,
+  `UndoJournalRejectsHostileFiles`.
+  Honest remainder for 0.12: the in-memory journal now retains records
+  after commit (rollback must keep working post-commit), so journal
+  pruning below the GQC checkpoint belongs to 0.12/0.13.
 - Acceptance: the replay path touches only plain bytes; ASan lane runs a
   rollback-over-poisoned-journal case clean.
 

@@ -1062,6 +1062,11 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
                     node_a.undo->commit_undo_point();
                     node_a.store->append_block(b_frames[h - 1]);
                     ++report.blocks_resynced;
+                } else {
+                    // The block never entered the ledger: its pre-state
+                    // journal record must not survive, or a later rollback
+                    // would reverse effects that never happened.
+                    node_a.undo->drop_last_record();
                 }
             }
             report.vx60_bytes_transferred = bytes_total;

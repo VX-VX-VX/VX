@@ -43,6 +43,16 @@ public:
     // Record state changes before applying a block
     void apply_block(const blockchain::BlockView& block);
 
+    // Drop the newest in-memory record: the caller recorded a pre-state
+    // entry but the block did NOT enter the ledger (apply refused), so a
+    // later rollback must not reverse effects that never happened. Only
+    // uncommitted records can be dropped.
+    void drop_last_record() noexcept {
+        if (undo_journal_.size() > committed_upto_ && !undo_journal_.empty()) {
+            undo_journal_.pop_back();
+        }
+    }
+
     // Commit undo point to journal file
     void commit_undo_point();
 
@@ -73,6 +83,11 @@ private:
     LedgerState& ledger_;
     std::filesystem::path undo_file_;
     std::vector<UndoRecord> undo_journal_;
+    // Records [0, committed_upto_) are already durable in the file; a
+    // commit appends only the tail. Reloaded records are durable by
+    // definition, so the baseline starts at the loaded size — re-committing
+    // them would duplicate every record and double-revert on rollback.
+    size_t committed_upto_ = 0;
  uint64_t finalized_checkpoint_height_ = 0; // GQC cement
     std::string last_error_;
 

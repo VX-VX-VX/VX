@@ -5,10 +5,175 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <vector>
 
 namespace vx::state {
+
+namespace {
+
+// ── Journal wire format (BACKLOG 0.11: no raw pointers on disk) ─────────────
+// The external round-4 review found the journal writing `sizeof(UndoRecord)`
+// — serializing std::string/vector/time_point HEAP POINTERS, so any replay
+// dereferenced freed or garbage memory. The journal is now a versioned,
+// fixed-width byte format: every field is written byte-wise, the reader
+// refuses unknown versions, and a torn or malformed file is never replayed
+// into memory as pointers.
+//
+//   header:  magic "VXUNDOJL" (8 B) + u32 LE format version
+//   record:  u64 height | i64 timestamp_ns | 32 B prev_tip_hash |
+//            16 B prev_supply (lo, hi) | u64 prev_accounts_count |
+//            u64 tx_count | tx_count x (42 B sender | 42 B receiver |
+//                                        16 B amount | 16 B fee)
+//
+// All integers are little-endian. Loss of the journal never endangers
+// consensus (it only costs reorg capability): a file with a wrong
+// magic/version or a malformed record is discarded and rebuilt from live
+// block application; only a TORN TAIL (a crash mid-append) is healed by
+// truncating to the last complete record.
+
+constexpr char kUndoMagic[8] = {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'};
+constexpr uint32_t kUndoVersion = 1;
+constexpr size_t kUndoHeaderSize = 12;
+constexpr size_t kUndoTxSize = 42 + 42 + 16 + 16;
+// A zero-tx record: the smallest possible complete record. Fewer bytes
+// than this at the end of a file cannot start a valid record — that is a
+// torn tail, not corruption.
+constexpr size_t kMinRecordSize = 80;
+// A safety cap on replay input, not a real limit: 64 MiB covers roughly
+// 400k single-tx records; larger files are treated as malformed.
+constexpr size_t kUndoFileCap = 64ULL * 1024 * 1024;
+
+void put_u32(std::vector<uint8_t>& out, uint32_t v) {
+    for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+void put_u64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+void put_u128(std::vector<uint8_t>& out, const U128& v) {
+    put_u64(out, v.lo);
+    put_u64(out, v.hi);
+}
+void put_bytes(std::vector<uint8_t>& out, const uint8_t* p, size_t n) {
+    out.insert(out.end(), p, p + n);
+}
+
+size_t record_bytes(const UndoRecord& r) {
+    return 8 + 8 + 32 + 16 + 8 + 8 + r.transactions.size() * kUndoTxSize;
+}
+
+void serialize_record(const UndoRecord& r, std::vector<uint8_t>& out) {
+    put_u64(out, r.height);
+    put_u64(out, static_cast<uint64_t>(
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         r.timestamp.time_since_epoch()).count()));
+    // Fixed 32-byte field: pad a short hash with zeros, never write the
+    // std::string's heap internals.
+    uint8_t tip[32] = {0};
+    std::memcpy(tip, r.prev_tip_hash.data(),
+                std::min(r.prev_tip_hash.size(), size_t(32)));
+    put_bytes(out, tip, 32);
+    put_u128(out, r.prev_supply);
+    put_u64(out, r.prev_accounts_count);
+    put_u64(out, r.transactions.size());
+    for (const auto& tx : r.transactions) {
+        uint8_t addr[42] = {0};
+        std::memcpy(addr, tx.sender.data(), std::min(tx.sender.size(), size_t(42)));
+        put_bytes(out, addr, 42);
+        std::memset(addr, 0, sizeof(addr));
+        std::memcpy(addr, tx.receiver.data(), std::min(tx.receiver.size(), size_t(42)));
+        put_bytes(out, addr, 42);
+        put_u128(out, tx.amount);
+        put_u128(out, tx.fee);
+    }
+}
+
+struct ByteReader {
+    const uint8_t* p;
+    const uint8_t* end;
+    bool ok = true;
+
+    bool take(size_t n, const uint8_t** out) {
+        if (!ok || static_cast<size_t>(end - p) < n) {
+            ok = false;
+            return false;
+        }
+        *out = p;
+        p += n;
+        return true;
+    }
+    uint64_t get_u64() {
+        const uint8_t* b;
+        if (!take(8, &b)) return 0;
+        uint64_t v = 0;
+        for (int i = 7; i >= 0; --i) v = (v << 8) | b[i];
+        return v;
+    }
+    U128 get_u128() {
+        const uint64_t lo = get_u64();
+        const uint64_t hi = get_u64();
+        return U128(lo, hi);
+    }
+    void get_bytes(uint8_t* dst, size_t n) {
+        const uint8_t* b;
+        if (!take(n, &b)) return;
+        std::memcpy(dst, b, n);
+    }
+};
+
+bool parse_record(ByteReader& r, UndoRecord& out) {
+    out = UndoRecord{};
+    out.height = r.get_u64();
+    const uint64_t ns = r.get_u64();
+    out.timestamp = std::chrono::system_clock::time_point(
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::nanoseconds(static_cast<int64_t>(ns))));
+    uint8_t tip[32] = {0};
+    r.get_bytes(tip, 32);
+    out.prev_tip_hash.assign(reinterpret_cast<const char*>(tip), 32);
+    out.prev_supply = r.get_u128();
+    out.prev_accounts_count = r.get_u64();
+    const uint64_t tx_count = r.get_u64();
+    if (!r.ok) return false;
+    if (tx_count > blockchain::MAX_TX_PER_BLOCK) return false; // malformed
+    out.transactions.reserve(tx_count);
+    for (uint64_t i = 0; i < tx_count; ++i) {
+        UndoRecord::UndoTransaction tx;
+        uint8_t addr[42] = {0};
+        r.get_bytes(addr, 42);
+        tx.sender.assign(reinterpret_cast<const char*>(addr), 42);
+        std::memset(addr, 0, sizeof(addr));
+        r.get_bytes(addr, 42);
+        tx.receiver.assign(reinterpret_cast<const char*>(addr), 42);
+        tx.amount = r.get_u128();
+        tx.fee = r.get_u128();
+        if (!r.ok) return false;
+        out.transactions.push_back(std::move(tx));
+    }
+    return r.ok;
+}
+
+bool write_all(int fd, const uint8_t* data, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::write(fd, data + off, len - off);
+        if (n <= 0) return false;
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool write_header(int fd) {
+    std::vector<uint8_t> header;
+    header.reserve(kUndoHeaderSize);
+    put_bytes(header, reinterpret_cast<const uint8_t*>(kUndoMagic), 8);
+    put_u32(header, kUndoVersion);
+    return write_all(fd, header.data(), header.size());
+}
+
+} // namespace
 
 UndoEngine::UndoEngine(const std::string& data_dir, storage::BlockStore& store, LedgerState& ledger)
     : data_dir_(data_dir), store_(&store), ledger_(ledger) {
@@ -55,36 +220,46 @@ void UndoEngine::apply_block(const blockchain::BlockView& block) {
 }
 
 void UndoEngine::commit_undo_point() {
-    if (undo_journal_.empty()) return;
+    // Only records not yet on disk are appended. A reloaded journal must
+    // never be re-committed: that used to duplicate every record in the
+    // file, and a later rollback then reversed each effect twice.
+    if (undo_journal_.size() <= committed_upto_) return;
+    if (committed_upto_ > undo_journal_.size()) committed_upto_ = undo_journal_.size();
 
-    // Write undo journal to file (append mode)
+    // Append the pending records byte-wise (BACKLOG 0.11). The file gains
+    // its versioned header on first write; a pre-existing file keeps its
+    // header. A torn tail from a crash is healed on the next load.
     int fd = ::open(undo_file_.string().c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) {
         std::cerr << "Failed to open undo file" << std::endl;
         return;
     }
 
-    // Write journal size and records
-    uint64_t count = undo_journal_.size();
-    ssize_t written = ::write(fd, &count, sizeof(count));
-    if (written != (ssize_t)sizeof(count)) {
-        ::close(fd);
+    struct stat st{};
+    bool ok = ::fstat(fd, &st) == 0;
+    if (ok && st.st_size == 0) ok = write_header(fd);
+
+    std::vector<uint8_t> buf;
+    if (ok) {
+        for (size_t i = committed_upto_; i < undo_journal_.size(); ++i) {
+            const auto& record = undo_journal_[i];
+            buf.clear();
+            buf.reserve(record_bytes(record));
+            serialize_record(record, buf);
+            if (!write_all(fd, buf.data(), buf.size())) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (ok) ok = ::fsync(fd) == 0;
+    ::close(fd);
+    if (!ok) {
+        std::cerr << "Failed to append undo journal" << std::endl;
         return;
     }
 
-    for (const auto& record : undo_journal_) {
-        // Write record structure
-        ssize_t written = ::write(fd, &record, sizeof(record));
-        if (written != (ssize_t)sizeof(record)) {
-            ::close(fd);
-            return;
-        }
-    }
-
-    ::close(fd);
-
-    // Clear journal in memory
-    undo_journal_.clear();
+    committed_upto_ = undo_journal_.size();
 
     // Also update undo.vxl metadata
     update_undo_metadata();
@@ -96,36 +271,75 @@ void UndoEngine::load_latest_undo_journal() {
     int fd = ::open(undo_file_.string().c_str(), O_RDONLY);
     if (fd < 0) return;
 
-    // Read file size
     struct stat st{};
     if (fstat(fd, &st) < 0) {
         ::close(fd);
         return;
     }
-
-    // Read entire file into memory (max 64KB for safety)
-    size_t file_size = st.st_size;
-    std::vector<uint8_t> buffer(file_size);
-    ssize_t read = ::read(fd, buffer.data(), file_size);
-    ::close(fd);
-    if (read != (ssize_t)file_size) return;
-
-    // Parse undo records
-    size_t offset = 0;
-    while (offset < file_size) {
-        if (offset + sizeof(uint64_t) > file_size) break;
-        uint64_t count;
-        std::memcpy(&count, buffer.data() + offset, sizeof(count));
-        offset += sizeof(count);
-        if (offset + count * sizeof(UndoRecord) > file_size) break;
-
-        for (uint64_t i = 0; i < count; ++i) {
-            UndoRecord record;
-            std::memcpy(&record, buffer.data() + offset, sizeof(record));
-            undo_journal_.push_back(record);
-            offset += sizeof(record);
-        }
+    if (static_cast<uint64_t>(st.st_size) > kUndoFileCap) {
+        // Oversized input is malformed by policy: discard and rebuild.
+        ::close(fd);
+        std::filesystem::remove(undo_file_);
+        return;
     }
+
+    std::vector<uint8_t> buffer(static_cast<size_t>(st.st_size));
+    const ssize_t got = ::read(fd, buffer.data(), buffer.size());
+    ::close(fd);
+    if (got != static_cast<ssize_t>(buffer.size())) return;
+
+    // Header check: wrong magic or version is never replayed — the journal
+    // is rebuilt from live block application instead (reject-or-migrate,
+    // BACKLOG 0.11; this also rejects every pre-0.11 raw-pointer file).
+    if (buffer.size() < kUndoHeaderSize ||
+        std::memcmp(buffer.data(), kUndoMagic, 8) != 0) {
+        std::filesystem::remove(undo_file_);
+        return;
+    }
+    const uint8_t* vp = buffer.data() + 8;
+    const uint32_t version = uint32_t(vp[0]) | (uint32_t(vp[1]) << 8) |
+                             (uint32_t(vp[2]) << 16) | (uint32_t(vp[3]) << 24);
+    if (version != kUndoVersion) {
+        std::filesystem::remove(undo_file_);
+        return;
+    }
+
+    // Parse records sequentially. A record that does not parse cleanly
+    // mid-file is corruption, not a torn tail — discard everything (the
+    // journal rebuilds from live application; consensus never depends on
+    // it). Only a torn TAIL (bytes left over that cannot form a record
+    // header) is healed by truncation.
+    ByteReader r{buffer.data() + kUndoHeaderSize, buffer.data() + buffer.size()};
+    size_t good_end = kUndoHeaderSize; // offset after the last complete record
+    bool corrupt = false;
+    while (r.p != r.end) {
+        UndoRecord rec;
+        // A record's length is not self-delimiting, so parse a copy first.
+        // Failure with fewer bytes left than a minimal (zero-tx) record is
+        // a torn tail from a crash mid-append; anything else is corruption.
+        ByteReader probe = r;
+        if (!parse_record(probe, rec)) {
+            if (static_cast<size_t>(r.end - r.p) < kMinRecordSize) break; // torn tail
+            corrupt = true;
+            break;
+        }
+        undo_journal_.push_back(std::move(rec));
+        r = probe;
+        good_end = static_cast<size_t>(r.p - buffer.data());
+    }
+
+    if (corrupt) {
+        undo_journal_.clear();
+        std::filesystem::remove(undo_file_);
+        return;
+    }
+    if (r.p != r.end) {
+        // Torn tail: truncate the file to the last complete record.
+        std::filesystem::resize_file(undo_file_, static_cast<uintmax_t>(good_end));
+    }
+    // Everything loaded (or healed) is durable on disk — a later commit
+    // must append only records applied after this load.
+    committed_upto_ = undo_journal_.size();
 }
 
 bool UndoEngine::rollback_to_height(uint64_t target_height) {
@@ -216,21 +430,30 @@ void UndoEngine::truncate_undo_file() {
         return;
     }
 
-    // Rewrite undo file with current journal
+    // Rewrite undo file from scratch: versioned header + byte-wise records.
     int fd = ::open(undo_file_.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return;
 
-    // Write current journal
-    uint64_t count = current_size;
-    ssize_t written = ::write(fd, &count, sizeof(count));
-    if (written == (ssize_t)sizeof(count)) {
+    bool ok = write_header(fd);
+    std::vector<uint8_t> buf;
+    if (ok) {
         for (const auto& record : undo_journal_) {
-            written = ::write(fd, &record, sizeof(record));
-            if (written != (ssize_t)sizeof(record)) break;
+            buf.clear();
+            buf.reserve(record_bytes(record));
+            serialize_record(record, buf);
+            if (!write_all(fd, buf.data(), buf.size())) {
+                ok = false;
+                break;
+            }
         }
     }
-
+    if (ok) ok = ::fsync(fd) == 0;
     ::close(fd);
+    if (!ok) {
+        std::cerr << "Failed to rewrite undo journal" << std::endl;
+        return;
+    }
+    committed_upto_ = undo_journal_.size();
 }
 
 void UndoEngine::update_undo_metadata() {

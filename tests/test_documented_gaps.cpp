@@ -44,6 +44,7 @@
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
+#include "vx/state/undo_engine.hpp"
 #include "vx/core/memory_vault.hpp"
 #include "vx/vm/vortex_vm.hpp"
 
@@ -659,6 +660,194 @@ TEST(VortexDocumentedGapsTest, RewardIndependentOfHeight) {
 
     EXPECT_TRUE(apply_coinbase_block(ledger, 0, recv, &err)) << err;
     EXPECT_EQ(ledger.issued_supply(), U128(50ULL * ATOMS_PER_VX));
+}
+
+// ── BACKLOG 0.11: the undo journal is a versioned byte format, never a
+// raw struct dump (the round-4 review found sizeof(UndoRecord) writes
+// serializing std::string/vector heap POINTERS). Round-trip: records
+// survive commit + reload, a rollback over them restores balances and the
+// issued-supply counter exactly, and a reload + commit does not duplicate
+// records (a duplicated record would double-revert on rollback).
+TEST(VortexDocumentedGapsTest, UndoJournalByteFormatRoundTrip) {
+    const std::string dir = temp_dir("vx_gap_undo_rt");
+    vx::storage::BlockStore store(dir + "/undo_rt.vxb", "genesis.bin", 8);
+    vx::state::LedgerState ledger;
+    const Address recv_a = addr_of("NFA_UNDO_MINER_A_0000000000000000000000");
+    const Address recv_b = addr_of("NFA_UNDO_MINER_B_0000000000000000000000");
+    {
+        vx::state::UndoEngine undo(dir, store, ledger);
+        auto* g = store.get_block(0);
+        ASSERT_NE(g, nullptr);
+        BlockFrame gf;
+        std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+        ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+        undo.apply_block(BlockView(gf));
+
+        // Two MINER_ coinbase blocks (10 VX each — under the 50 VX floor,
+        // so the emission gate never refuses them), journaled pre-state.
+        for (int i = 0; i < 2; ++i) {
+            BlockBuilder b = next_block(store, std::time(nullptr));
+            vx::blockchain::Transaction cb{};
+            std::memcpy(cb.sender_nfa, "MINER_", 6);
+            for (size_t k = 6; k < 42; ++k) cb.sender_nfa[k] = '0';
+            std::memcpy(cb.receiver_nfa, (i == 0 ? recv_a : recv_b).data(), 42);
+            vx::blockchain::tx_set_amount(cb, 10ULL * 100000000ULL);
+            vx::blockchain::tx_set_fee(cb, 0);
+            vx::blockchain::tx_set_nonce(cb, 0);
+            uint8_t tip[32];
+            store.tip_hash(tip);
+            vx::blockchain::set_coinbase_binding(cb, store.chain_height(), tip);
+            ASSERT_TRUE(b.add_transaction(cb));
+            b.finalize();
+            BlockFrame f;
+            std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+            ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+            ASSERT_TRUE(store.append_block(f));
+            undo.apply_block(BlockView(f));
+            ASSERT_TRUE(ledger.apply_block(BlockView(f)).ok);
+        }
+        undo.commit_undo_point();
+    } // destructor commits: nothing new is durable-pending, so no duplicate
+
+    const U128 supply_two_blocks = ledger.total_supply();
+    const U128 issued_two_blocks = ledger.issued_supply();
+    const U128 two_rewards(2ULL * 10ULL * 100000000ULL);
+
+    {
+        // Reload: the byte format must parse back into real records and a
+        // rollback over them must restore the pre-block state exactly.
+        vx::state::UndoEngine undo(dir, store, ledger);
+        ASSERT_TRUE(undo.rollback_to_height(0)) << undo.last_error();
+        EXPECT_EQ(ledger.total_supply(), supply_two_blocks - two_rewards);
+        EXPECT_EQ(ledger.issued_supply(), issued_two_blocks - two_rewards)
+            << "the rollback must also reverse the issuance the blocks booked";
+        EXPECT_EQ(ledger.balance_of(recv_a), U128{});
+        EXPECT_EQ(ledger.balance_of(recv_b), U128{});
+    } // destructor commits: everything is durable — no re-append
+
+    {
+        // Reload again: no duplicate records — a second rollback finds
+        // nothing above the target and must not touch state a second time.
+        vx::state::UndoEngine undo(dir, store, ledger);
+        const U128 supply_after = ledger.total_supply();
+        ASSERT_TRUE(undo.rollback_to_height(0)) << undo.last_error();
+        EXPECT_EQ(ledger.total_supply(), supply_after)
+            << "a reloaded journal re-reverted state: records were duplicated";
+        EXPECT_EQ(ledger.issued_supply(), issued_two_blocks - two_rewards);
+    }
+
+    // The file carries the versioned magic header.
+    std::ifstream jf(dir + "/undo/undo.vxl", std::ios::binary);
+    char magic[8] = {};
+    jf.read(magic, 8);
+    EXPECT_EQ(std::string(magic, 8), "VXUNDOJL");
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── BACKLOG 0.11: a journal file that is not the current format is never
+// replayed — wrong magic, unknown version and mid-file corruption all
+// resolve to "discard and rebuild from live block application", a torn
+// tail is healed to the last complete record, and pointer-looking bytes
+// are never dereferenced (this is the rollback-over-poisoned-journal case
+// the ASan lane runs clean).
+TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
+    const std::string dir = temp_dir("vx_gap_undo_bad");
+    vx::storage::BlockStore store(dir + "/undo_bad.vxb", "genesis.bin", 8);
+    vx::state::LedgerState ledger;
+    const std::string jpath = dir + "/undo/undo.vxl";
+    std::filesystem::create_directories(dir + "/undo");
+    auto put_u64 = [](std::vector<uint8_t>& v, uint64_t x) {
+        for (int i = 0; i < 8; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i)));
+    };
+    auto write_file = [&](const std::vector<uint8_t>& bytes) {
+        std::ofstream f(jpath, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+        ASSERT_TRUE(f.good());
+    };
+
+    // (a) Wrong magic + pointer-looking words: never replayed, file discarded.
+    {
+        std::vector<uint8_t> bytes(256, 0x00);
+        const uint64_t poison = 0x00005A5A5A5A5A5AULL; // heap-pointer shaped
+        for (size_t off = 0; off + 8 <= bytes.size(); off += 8) {
+            std::memcpy(bytes.data() + off, &poison, 8);
+        }
+        write_file(bytes);
+        vx::state::UndoEngine undo(dir, store, ledger);
+        EXPECT_FALSE(undo.rollback_to_height(0)); // nothing journaled, no crash
+        EXPECT_FALSE(std::filesystem::exists(jpath))
+            << "a foreign journal file survived open";
+    }
+
+    // (b) Right magic, unknown version: refused the same way.
+    {
+        std::vector<uint8_t> bytes;
+        bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
+        bytes.push_back(99); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.insert(bytes.end(), 64, 0xFF);
+        write_file(bytes);
+        vx::state::UndoEngine undo(dir, store, ledger);
+        EXPECT_FALSE(std::filesystem::exists(jpath));
+        EXPECT_FALSE(undo.rollback_to_height(0));
+    }
+
+    // (c) Valid header, mid-file corruption (at least one minimal record
+    // of garbage): discarded, never healed.
+    {
+        std::vector<uint8_t> bytes;
+        bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
+        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.insert(bytes.end(), 200, 0xFF);
+        write_file(bytes);
+        vx::state::UndoEngine undo(dir, store, ledger);
+        EXPECT_FALSE(std::filesystem::exists(jpath));
+        EXPECT_FALSE(undo.rollback_to_height(0));
+    }
+
+    // (c2) Valid header, a short garbage tail: fewer bytes than a minimal
+    // record could be a torn write of a valid record's first bytes, so it
+    // is healed (truncated to the header) rather than discarded — the
+    // journal rebuilds from live application either way.
+    {
+        std::vector<uint8_t> bytes;
+        bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
+        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.insert(bytes.end(), 5, 0xFF);
+        write_file(bytes);
+        vx::state::UndoEngine undo(dir, store, ledger);
+        ASSERT_TRUE(std::filesystem::exists(jpath));
+        EXPECT_EQ(std::filesystem::file_size(jpath), 12ULL)
+            << "a short tail must be healed to the bare header";
+        EXPECT_FALSE(undo.rollback_to_height(0)); // healed journal is empty
+    }
+
+    // (d) Torn tail after a valid record: the record survives, the tail is
+    // healed to the last complete record, and a rollback over the record
+    // works (the replay path runs clean under ASan here).
+    {
+        std::vector<uint8_t> bytes;
+        bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
+        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        put_u64(bytes, 1);                    // height 1
+        put_u64(bytes, 0);                    // timestamp
+        bytes.insert(bytes.end(), 32, 0x00);  // prev tip hash
+        put_u64(bytes, 0); put_u64(bytes, 0); // prev supply
+        put_u64(bytes, 0);                    // prev accounts count
+        put_u64(bytes, 0);                    // tx_count = 0
+        bytes.insert(bytes.end(), 10, 0xAB);  // torn tail
+        write_file(bytes);
+        vx::state::UndoEngine undo(dir, store, ledger);
+        ASSERT_TRUE(std::filesystem::exists(jpath));
+        EXPECT_EQ(std::filesystem::file_size(jpath), 12ULL + 80ULL)
+            << "the torn tail was not healed to the last complete record";
+        EXPECT_TRUE(undo.rollback_to_height(0)) << undo.last_error();
+    }
+    EXPECT_FALSE(std::filesystem::exists(jpath))
+        << "a rollback that empties the journal must remove the file";
+
+    std::filesystem::remove_all(dir);
 }
 
 // ── Regression (round 4, fixed): the genesis-v1 tx shape (fee=0 and

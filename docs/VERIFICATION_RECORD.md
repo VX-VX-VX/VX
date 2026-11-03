@@ -33,10 +33,9 @@ Everything cited below was produced by commands a reader can re-run:
 
 - **Test suite:** 17/17 gtest tests pass (`ctest`, GCC and Clang in CI,
   plus an ASan+UBSan lane and CodeQL on every push).
-- **Fuzzing:** three libFuzzer targets in CI (`fuzz_block_frame` 100k,
-  `fuzz_pq_witness` 20k, `fuzz_wire` 200k execs, fixed seeds); the JSON RPC
-  surface got its own target (`fuzz_rpc`, 200k in CI) in the same pass that
-  produced this record.
+- **Fuzzing:** five libFuzzer targets in CI (`fuzz_block_frame` 100k,
+  `fuzz_pq_witness` 20k, `fuzz_wire` 200k, `fuzz_rpc` 200k and
+  `fuzz_undo_journal` 200k execs, fixed seeds).
 - **Live multi-node:** `scripts/multi_node_test.sh` — a real 3-node VX60
   testnet, 10 checks (propagation convergence, garbage resistance,
   split-brain reorg), all green; 9 additional hand-run scenarios are
@@ -517,10 +516,14 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     reorg undo correctness 0.12, GQC checkpoint durability 0.13, mempool
     ordering/races 0.14 — none of them pinned as expect-success tests
     yet; pinning them is part of their fix cycle.)
-  - *Undo journal serialization*: `UndoRecord` holds `std::string` /
-    `std::vector` / `time_point` and is written with a raw
-    `write(fd, &record, sizeof(record))` — heap pointers serialized as
-    payload (BACKLOG 0.11).
+  - *Undo journal serialization* (CLOSED 2026-11-03, BACKLOG 0.11):
+    `UndoRecord` holds `std::string` / `std::vector` / `time_point` and
+    was written with a raw `write(fd, &record, sizeof(record))` — heap
+    pointers serialized as payload. The journal is now a versioned byte
+    format (`VXUNDOJL`, fixed-width little-endian records, reject-or-
+    migrate on open, torn-tail healing); see the Evidence changelog and
+    regressions `UndoJournalByteFormatRoundTrip` /
+    `UndoJournalRejectsHostileFiles`.
   - *Reorg undo defects*: `rollback_to_height` journals the displaced
     block read from the wrong side of the truncation, and
     `UndoTransaction` restores balances but not sender nonces (BACKLOG
