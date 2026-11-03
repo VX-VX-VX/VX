@@ -1,7 +1,9 @@
 #pragma once
 
 #include "vx/blockchain/block.hpp"
+#include <array>
 #include <string>
+#include <vector>
 
 namespace vx::blockchain {
 
@@ -27,5 +29,36 @@ bool ensure_genesis_file(const std::string& path);
 
 /// The NFA address of the genesis coinbase receiver (deterministic).
 std::string genesis_coinbase_receiver();
+
+// ── PQ seed bindings (BACKLOG 0.7) ───────────────────────────────────────────
+
+/// A protocol-level binding of a genesis-era address to the XMSS root of
+/// the post-quantum key authorized to spend from it.
+struct PqSeedBinding {
+    Address addr{};
+    std::array<uint8_t, 32> root{};
+};
+
+/// The deterministic binding table every node computes identically at boot:
+///   - the genesis receiver is bound to an OFFLINE key: its root is a
+///     protocol constant derived from a public tag ("VX_PQ_GENESIS_OFFLINE_
+///     ROOT_V1"); the corresponding secret key is held offline by the
+///     operator and is NOT in this repository — the 2.54M VX faucet is
+///     effectively locked until the operator moves it with a real witness;
+///   - the demo spender address (Address #2 of the canonical demo run) is
+///     bound to the PUBLIC demo spender key ("VX_DEMO_SPENDER_SK_V1") — a
+///     documented testnet test key, so the PQ authorization path is
+///     exercised end-to-end by the demo and the cookbook;
+///   - the demo receiver address is bound to its own offline root.
+/// Every OTHER user address must be a self-certifying PQ address (payload
+/// "PQA..." derived from its own key root) to spend at all.
+const std::vector<PqSeedBinding>& pq_seed_bindings();
+
+/// Canonical demo seeds/addresses (previously local to the demo binary, now
+/// protocol constants so every node binds the same demo economy):
+const std::string& demo_spender_seed_hex();   // Address #2 (spender)
+const std::string& demo_receiver_seed_hex();  // Address #3 (target)
+std::string demo_spender_address_nfa();       // "NFA_V6_..." (deterministic)
+std::string demo_receiver_address_nfa();      // "NFA_V6_..." (deterministic)
 
 } // namespace vx::blockchain

@@ -2,7 +2,9 @@
 
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/blockchain/genesis.hpp"
 #include "vx/core/u128.hpp"
+#include "vx/crypto/pq_signature.hpp"
 
 #include <array>
 #include <cstdint>
@@ -48,6 +50,33 @@ struct ApplyResult {
  */
 class LedgerState {
 public:
+    LedgerState() {
+        // PQ seed bindings (BACKLOG 0.7): the protocol-level binding table
+        // is part of consensus state, computed identically on every node.
+        for (const auto& b : blockchain::pq_seed_bindings()) {
+            pq_roots_[b.addr] = b.root;
+        }
+    }
+
+    /// Binds an address to the XMSS root of the key authorized to spend
+    /// from it. Idempotent for the same root; a DIFFERENT root for an
+    /// already-bound address is refused (root rotation is BACKLOG 0.8
+    /// follow-up and must itself be witness-authorized when it ships).
+    bool bind_pq_sender(const Address& a, const std::array<uint8_t, 32>& root) {
+        auto it = pq_roots_.find(a);
+        if (it != pq_roots_.end()) return it->second == root;
+        pq_roots_[a] = root;
+        return true;
+    }
+
+    /// The bound root for an address, if any.
+    bool pq_root_of(const Address& a, std::array<uint8_t, 32>& out) const {
+        auto it = pq_roots_.find(a);
+        if (it == pq_roots_.end()) return false;
+        out = it->second;
+        return true;
+    }
+
     /// Applies all transactions of a block. Rejects blocks whose height does
     /// not match the expected next height (state must track the chain tip).
     ApplyResult apply_block(const BlockView& block) {
@@ -83,21 +112,20 @@ public:
  // verify every sender has sufficient funds + nonce.
         // Track expected nonce per sender within this block (for intra-block sequential nonce)
         std::unordered_map<Address, uint32_t, AddressHash> expected_nonces_;
+        // Self-certifying bindings produced by this block's pre-check loop;
+        // applied only after every transaction validated (see round-7 note).
+        std::vector<std::pair<Address, std::array<uint8_t, 32>>> new_bindings_;
 
         // Legacy Genesis v1 exemption (fee=0/nonce=0 skips nonce accounting)
         // is scoped to the actual genesis replay window. Unscoped, ANY user
         // transaction with fee=0/nonce=0 would bypass nonce checks forever
         // (external review P0: unbounded nonce-0 replay).
         const bool legacy_window = (next_height_ <= 1);
+        // At most one GENESIS_2 mint per height-1 block (see check below).
+        bool genesis_mint_seen = false;
 
         for (uint32_t i = 0; i < n; ++i) {
             const Transaction& tx = block.tx(i);
-
-            // SECURITY: Structural and Cryptographic Validation of the Proof.
-            if (!blockchain::verify_transaction_proof(tx)) {
-                res.error = "tx " + std::to_string(i) + ": invalid cocoon_proof";
-                return res;
-            }
 
             Address sender = blockchain::tx_address(tx.sender_nfa);
             uint64_t amount = blockchain::tx_amount(tx);
@@ -112,6 +140,70 @@ public:
             bool is_genesis = (std::strncmp(s, "GENESIS", 7) == 0);
             bool is_miner   = (std::strncmp(s, "MINER_", 6) == 0);
 
+            // ── Authorization (BACKLOG 0.7, closed 2026-11-03): system
+            // senders keep the structural integrity digest; every USER
+            // sender requires a post-quantum witness. The keyless Tier-2
+            // digest check authorizes anyone (the digest needs no key —
+            // the reviewer moved 1 VX out of the genesis receiver with it),
+            // so it no longer accepts anything on the consensus path.
+            if (is_genesis || is_miner) {
+                if (is_miner) {
+                    // BACKLOG 0.6 remainder closed (2026-11-03): the coinbase
+                    // is bound to the chain position - receiver + height +
+                    // previous tip hash. The keyless digest no longer
+                    // authorizes emissions, and a coinbase copied from one
+                    // fork cannot be replayed on a competing fork at the
+                    // same height (its tag commits the OTHER fork's tip).
+                    uint8_t expect_tag[12];
+                    blockchain::coinbase_binding(expect_tag,
+                                                 blockchain::tx_address(tx.receiver_nfa),
+                                                 block.header().block_height,
+                                                 block.header().prev_block_hash);
+                    if (std::memcmp(tx.cocoon_proof, expect_tag, 12) != 0) {
+                        res.error = "tx " + std::to_string(i) +
+                                    ": coinbase is not bound to this chain position";
+                        return res;
+                    }
+                } else if (!blockchain::verify_transaction_proof(tx)) {
+                    res.error = "tx " + std::to_string(i) + ": invalid cocoon_proof";
+                    return res;
+                }
+            } else {
+                vx::crypto::pq::PqSignatureWitness w;
+                std::string pq_err;
+                if (!blockchain::verify_pq_witness(tx, nullptr, &w, &pq_err)) {
+                    res.error = "tx " + std::to_string(i) + ": " + pq_err;
+                    return res;
+                }
+                std::array<uint8_t, 32> bound{};
+                if (pq_root_of(sender, bound)) {
+                    if (std::memcmp(bound.data(), w.pq_pubkey_root.data(), 32) != 0) {
+                        res.error = "tx " + std::to_string(i) +
+                                    ": PQ witness root does not match the sender's bound key";
+                        return res;
+                    }
+                } else if (blockchain::is_pq_address(sender)) {
+                    // Self-certifying binding: the address commits its own
+                    // key root, so the first witnessed spend binds it.
+                    Address chk{};
+                    blockchain::derive_pq_address(w.pq_pubkey_root.data(), chk.data());
+                    if (chk != sender) {
+                        res.error = "tx " + std::to_string(i) +
+                                    ": PQ witness root does not derive the sender address";
+                        return res;
+                    }
+                    // Round-7 hardening: bindings collected, applied only
+                    // after the WHOLE block validates - a rejected block
+                    // must not mutate consensus state.
+                    new_bindings_.emplace_back(sender, w.pq_pubkey_root);
+                } else {
+                    res.error = "tx " + std::to_string(i) +
+                                ": sender address is not PQ-bound; keyless transfers are"
+                                " rejected (BACKLOG 0.7)";
+                    return res;
+                }
+            }
+
             // Allow zero amount for MINER_ coinbase (actual reward computed from fees)
             if (amount == 0 && !is_miner) {
                 res.error = "tx " + std::to_string(i) + ": zero transfer";
@@ -125,6 +217,20 @@ public:
                         !tracked_addresses_containing(blockchain::tx_address(tx.receiver_nfa)))) {
                         res.error = "tx " + std::to_string(i) + ": GENESIS mint unauthorized at height " + std::to_string(next_height_);
                         return res;
+                    }
+                    // The untracked-receiver check above reads committed
+                    // balances_, and balances_ only changes in the commit
+                    // loop AFTER this pre-check - so within one block every
+                    // further mint also saw its receiver as "untracked" and
+                    // a single height-1 block could mint unlimited GENESIS_2
+                    // supply (N x 100k VX). Enforce one mint per block.
+                    if (next_height_ == 1) {
+                        if (genesis_mint_seen) {
+                            res.error = "tx " + std::to_string(i) +
+                                        ": second GENESIS mint in one block";
+                            return res;
+                        }
+                        genesis_mint_seen = true;
                     }
                 }
                 if (is_miner) {
@@ -201,6 +307,16 @@ public:
                 expected_nonces_[sender] = expected_nonces_[sender] + 1;
             }
         }
+
+        // Round-7 hardening: every transaction in the block validated, so
+        // the self-certifying bindings collected during the pre-check are
+        // safe to commit now. A block rejected anywhere above leaves
+        // pq_roots_ untouched (the old code bound the sender mid-loop,
+        // before later transactions could still refuse the block).
+        for (const auto& [addr, root] : new_bindings_) {
+            bind_pq_sender(addr, root);
+        }
+        new_bindings_.clear();
 
  // commit with TDI fee burn (50% burned, 50% to miner)
         U128 total_fees{0};
@@ -322,6 +438,7 @@ public:
 private:
     std::unordered_map<Address, U128, AddressHash> balances_;
     std::unordered_map<Address, uint32_t, AddressHash> nonces_;
+    std::unordered_map<Address, std::array<uint8_t, 32>, AddressHash> pq_roots_;
     U128 burned_supply_{0};
     uint64_t next_height_ = 0;
 };

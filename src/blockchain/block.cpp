@@ -90,6 +90,24 @@ bool validate_block(const RawBlock& raw, const BlockIntakeContext& ctx,
     return true;
 }
 
+// ── Coinbase chain-position binding (BACKLOG 0.6 remainder, closed) ─────────
+
+void coinbase_binding(uint8_t out[12], const Address& receiver, uint64_t height,
+                      const uint8_t prev_tip_hash[32]) noexcept {
+    uint8_t buf[42 + 8 + 32];
+    std::memcpy(buf, receiver.data(), 42);
+    for (int i = 0; i < 8; ++i) buf[42 + i] = static_cast<uint8_t>((height >> (i * 8)) & 0xFF);
+    std::memcpy(buf + 50, prev_tip_hash, 32);
+    uint8_t full[32];
+    VortexSponge256::compute(buf, sizeof(buf), full);
+    std::memcpy(out, full, 12);
+}
+
+void set_coinbase_binding(Transaction& tx, uint64_t height,
+                          const uint8_t prev_tip_hash[32]) noexcept {
+    coinbase_binding(tx.cocoon_proof, tx_address(tx.receiver_nfa), height, prev_tip_hash);
+}
+
 // ── Merkle root logic using Sponge ──────────────────────────────────────────
 
 void hash_tx(const Transaction& tx, uint8_t out[32]) noexcept {
@@ -187,7 +205,14 @@ bool verify_transaction_proof(const Transaction& tx) noexcept {
         return vx::crypto::pq::pq_verify_transaction(tx, w);
     }
 
-    // ── Tier 2: legacy keyless integrity check (unregistered test senders).
+    // ── Tier 2: legacy keyless integrity check — SYSTEM SENDERS ONLY.
+    // External review demonstrated that this check authorizes anyone (the
+    // digest requires no key), so consensus no longer accepts it for user
+    // addresses: LedgerState::apply_block routes user senders through
+    // verify_pq_witness() and rejects every unbound sender. This path
+    // remains only for the protocol's own senders (GENESIS mints, MINER_
+    // coinbases) whose guards live in the ledger rules, and for admission
+    // pre-filtering outside consensus.
     uint8_t preimage[108];
     build_tx_preimage(tx, preimage);
 
@@ -195,6 +220,66 @@ bool verify_transaction_proof(const Transaction& tx) noexcept {
     VortexSponge256::compute(preimage, 108, digest);
 
     return std::memcmp(tx.cocoon_proof, digest, 12) == 0;
+}
+
+// ── PQ-bound addresses + strict PQ authorization (BACKLOG 0.7) ───────────────
+
+bool is_pq_address(const Address& a) noexcept {
+    return std::memcmp(a.data(), "PQA", 3) == 0;
+}
+
+void derive_pq_address(const uint8_t root[32], uint8_t out_addr[42]) noexcept {
+    // Address payload = "PQA" + 39 base64url chars of
+    // Sponge("VXPQADDRV1" || root). 39 chars x 6 bits = 234 bits of the
+    // 256-bit digest (the truncation is one-way input, not a security
+    // boundary — the root itself is fully committed by the witness).
+    std::memcpy(out_addr, "PQA", 3);
+    uint8_t buf[42];
+    std::memcpy(buf, "VXPQADDRV1", 10);
+    std::memcpy(buf + 10, root, 32);
+    uint8_t d[32];
+    VortexSponge256::compute(buf, sizeof(buf), d);
+
+    static constexpr char kAlpha[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t oi = 3;
+    for (size_t i = 0; i < sizeof(d) && oi < 42; ++i) {
+        acc = (acc << 8) | d[i];
+        bits += 8;
+        while (bits >= 6 && oi < 42) {
+            bits -= 6;
+            out_addr[oi++] = static_cast<uint8_t>(kAlpha[(acc >> bits) & 0x3F]);
+        }
+    }
+    while (oi < 42) out_addr[oi++] = static_cast<uint8_t>(kAlpha[0]);
+}
+
+bool verify_pq_witness(const Transaction& tx,
+                       const std::array<uint8_t, 32>* expected_root,
+                       vx::crypto::pq::PqSignatureWitness* out_witness,
+                       std::string* error) noexcept {
+    auto fail = [&](const char* why) {
+        if (error) *error = why;
+        return false;
+    };
+
+    // Round-7 hardening: the registry is a cache, not an authority. A
+    // digest may hold several candidates (an attacker can register a
+    // cryptographically valid signature for a digest they predict); the
+    // consensus lookup returns only a candidate that passes the FULL
+    // WOTS+/XMSS + anchor verification against THIS transaction.
+    vx::crypto::pq::PqSignatureWitness w;
+    if (!vx::crypto::pq::PqWitnessRegistry::instance().lookup_verifying(tx, w))
+        return fail("no PQ witness registered for this transaction");
+
+    if (expected_root && std::memcmp(w.pq_pubkey_root.data(), expected_root->data(), 32) != 0)
+        return fail("PQ witness root does not match the sender's bound key");
+
+    if (out_witness) *out_witness = w;
+    if (error) error->clear();
+    return true;
 }
 
 } // namespace vx::blockchain

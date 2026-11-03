@@ -125,38 +125,105 @@ wire frames (`apply_remote_frame` → `append_block` → gate). The
 - Acceptance: met — `NoWorkBlockAccepted` flipped to EXPECT_FALSE, a
   crafted tip-extending frame without valid PoGW is rejected before
   touching the ledger (`PogwGateAcceptsSealedWorkAndBindsTheNonce`).
+- [x] Coinbase emission binding (closed 2026-11-03): the `MINER_` coinbase
+  is bound to its chain position — its `cocoon_proof` must equal
+  `trunc12(Sponge("VX_COINBASE_BIND_V1" || receiver || height ||
+  prev_tip_hash))`, checked in `apply_block`. The keyless digest no longer
+  authorizes emissions, and a coinbase copied from one fork cannot be
+  replayed on a competing fork at the same height. Emission is now bounded
+  by: one coinbase per block (index 0), the 1000 VX reward cap, real PoGW
+  work on the block, and the chain-position binding. Pin flipped:
+  `MinerEmissionForgeable` -> `CoinbaseReplayRejected`. What remains is
+  permissionless by design: the block producer names the reward address.
 - Remaining: validator-authenticated PoGW/attractor commitment
   (BACKLOG 0.4/2.4), dynamic retarget in the gate (see 0.9).
 
 ### 0.7 Transaction authorization (keyless tier must go)
 
-Pinned reproducibly by `VortexDocumentedGapsTest.KeylessTheftReproducible`
-(expect: the theft SUCCEEDS today). `verify_transaction_proof` accepts a
-plain sponge digest for any sender not registered as a PQ sender — and a
-digest requires no key, so an attacker holding nothing can move funds
-from any non-PQ-bound address (external review demonstrated 1 VX out of
-the genesis receiver; re-confirmed at current main).
+CLOSED 2026-11-03. Addresses are now bound to post-quantum keys and the
+keyless Tier-2 digest is removed from consensus acceptance. The pin test
+is flipped and renamed: `KeylessTheftRejected` (was
+`KeylessTheftReproducible`) — the reviewer's theft PoC (1 VX out of the
+genesis receiver, zero secrets) no longer moves anything.
 
-- [ ] Bind addresses to PQ public keys in consensus state (genesis
-  allocation + on-chain registration path).
-- [ ] Reject any non-PQ-bound sender's transfer on the consensus path
-  (remove the keyless Tier 2 fallback from acceptance).
-- [ ] The demo RPC must not sign on the user's behalf.
-- Acceptance: the pin test flips to EXPECT_FALSE; a forged transfer is
-  rejected by ledger rules with a specific error.
+Binding model — two sources, no trusted registration table:
+
+1. **Self-certifying addresses** (`blockchain::derive_pq_address`): a
+   user address payload is `"PQA"` + 39 base64url characters of
+   `Sponge("VXPQADDRV1" || pq_pubkey_root)`. Holding the XMSS key IS
+   holding the address; the first witnessed spend binds the address to
+   the key in ledger state, and every later spend is checked against
+   that binding (`SelfCertifyingAddressAutoBinds`).
+2. **Protocol seed table** (`genesis.hpp pq_seed_bindings()`): genesis-era
+   allocations are bound at ledger construction — the canonical genesis
+   receiver to an OFFLINE root (`"VX_PQ_GENESIS_OFFLINE_ROOT_V1"`; the
+   secret is not in the repo, the faucet is locked), and the two demo
+   addresses (spender → the public documented demo key
+   `"VX_DEMO_SPENDER_SK_V1"`; receiver → an offline root). Genesis frame
+   and hash are UNCHANGED — bindings are state-seed constants.
+
+Enforcement (`LedgerState::apply_block`): system senders (`GENESIS*`,
+`MINER_`) keep the structural integrity digest guarded by the mint /
+coinbase rules; every USER sender must carry a valid `PqSignatureWitness`
+(lookup by `tx_msg_digest`, root binding check, full WOTS+/XMSS +
+SegPQ-anchor verification). Unbound senders, wrong-key witnesses and
+non-self-certifying addresses are refused with specific errors
+(`KeylessTheftRejected`, `UnboundSenderRejected`,
+`WitnessRootMismatchRejected`).
+
+The demo RPC no longer signs on the user's behalf: `/transfer` requires
+`witness_b64` (the 2376-byte witness, base64), `fee_atoms` and `nonce`
+from the client; the server rebuilds the tx anchor from the witness
+(`pq_set_transaction_anchor`) and stamps nothing into the signed
+material.
+
+- [x] Bind addresses to PQ public keys in consensus state (self-
+  certifying addresses + protocol seed table; no on-chain registration
+  tx needed).
+- [x] Reject any non-PQ-bound sender's transfer on the consensus path
+  (keyless Tier 2 removed from acceptance; kept as admission pre-filter
+  only, and for the guarded system senders).
+- [x] The demo RPC must not sign on the user's behalf.
+- Acceptance: met — the pin test flipped; forged transfers are rejected
+  with specific errors before any balance is touched.
+- Remaining (documented, not hidden): root rotation (rebinding an
+  address to a new key) is refused for now — a stolen root cannot be
+  rotated away yet; the 16-leaf XMSS tree per key means a key is
+  exhausted after 16 spends (rollover = new self-certifying address);
+  the mempool still admits by the legacy pre-filter (the ledger stays
+  the consensus authority; admission divergence is pre-filtered, not
+  consensus-visible).
 
 ### 0.8 PQ witness on the wire (consensus-visible signatures)
 
-`PqSignatureWitness` (2376 B) lives only in the in-process
-`PqWitnessRegistry`: another node — or the same node after a restart —
-cannot verify a PQ-signed transaction (external review, confirmed).
+CLOSED 2026-11-03. The 2376-byte `PqSignatureWitness` now travels between
+nodes and persists across restarts; the XMSS root is committed by the
+witness itself and checked against the sender's binding.
 
-- [ ] Canonical wire/storage encoding for the witness; block or tx
-  carries the witness its verification needs.
-- [ ] Sender's XMSS root committed in block data; rules for accepting a
-  new sender key.
-- Acceptance: node A verifies node B's PQ-signed tx without shared
-  process state; restart does not orphan a witnessed chain.
+- **Wire**: `WireMsgType::PQ_WITNESS` (0x09), payload = msg_digest(32) +
+  sender(42) + witness(2376) = 2450 B. Witnesses are broadcast BEFORE the
+  block that carries their transactions (`broadcast_witnesses_for`, called
+  ahead of `broadcast_frame` on both the transfer/mine path and P2P
+  relay) — a peer that receives a block without its witnesses could not
+  authorize the transactions. Receivers register into
+  `PqWitnessRegistry::register_witness_bytes`. The 64 KiB frame itself is
+  untouched (it has no free bytes — witnesses never travel inside it).
+- **Storage**: durable sidecar `<ledger>.pqw` — append-only records
+  `"VXPQWT1"` + digest(32) + sender(42) + witness(2376) = 2458 B, written
+  and fsync'd on every registration; `attach_durable_log` replays full
+  records on startup and stops at the first short/corrupt record
+  (fail-closed). `WitnessDurableLogSurvivesRestart` pins the round-trip.
+- **Key acceptance rule**: a new sender key is accepted only through a
+  self-certifying address — the witness root must DERIVE the sender
+  address (`Sponge("VXPQADDRV1" || root)` committed by the address
+  itself), after which the binding is enforced in ledger state.
+- Acceptance: met — node A verifies node B's PQ-signed tx from the wire
+  (digest-keyed registry filled by the PQ_WITNESS messages that precede
+  the block); restart does not orphan a witnessed chain.
+- Remaining: witness GC (the registry and sidecar grow with every
+  registration; pruning policy is future work); no replay-window
+  commitment yet — an old witness re-registered for a nonce that was
+  already consumed is rejected by the nonce rule, not by the registry.
 
 ### 0.9 Central block validation (single intake gate)
 
@@ -194,8 +261,14 @@ comparator) — 190k+ runs clean.
 External review (confirmed): `INADDR_ANY` listener, thread-per-connection
 (detached), single 8 KiB `recv()` per request, no auth.
 
+- [x] Complete request reads (loop until full header/body or cap).
+  DONE 2026-11-03 (round 8, self-review): `parse_request` now reads until
+  the declared Content-Length is satisfied (64 KiB request cap) — a
+  ~3.2 KB witness body arriving split across TCP segments is no longer
+  truncated; the JSON field scanner tolerates whitespace after `:`, so
+  standard serializers no longer get a misleading "witness required"
+  error. Still open below: pool/cap, timeouts, auth, tracked threads.
 - [ ] Bounded thread pool or connection cap; per-connection timeouts.
-- [ ] Complete request reads (loop until full header/body or cap).
 - [ ] Auth for state-changing endpoints (loopback default; token opt-in).
 - [ ] Thread lifecycle: detached HTTP/SSE workers are not tracked or
   joined by `stop()`; a server teardown can race live workers. Replace

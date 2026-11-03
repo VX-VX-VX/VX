@@ -37,6 +37,13 @@ public:
     /// O(1) append (single pwrite + fsync).
     bool append_block(const blockchain::BlockFrame& frame);
 
+    /// Removes the last appended frame from the ledger file (ftruncate back
+    /// to the previous tip). Safety net for the rare case where a block the
+    /// gate accepted is refused by the state layer afterwards: the store and
+    /// the ledger must never disagree about the tip. The genesis frame is
+    /// never rolled back.
+    bool rollback_last_append() noexcept;
+
     /// Reason of the most recent append_block rejection (empty after a
     /// success). Diagnostics only — the bool return is the contract.
     const std::string& last_error() const noexcept { return last_error_; }

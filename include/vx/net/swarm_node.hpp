@@ -47,6 +47,7 @@ enum class WireMsgType : uint8_t {
     PING           = 0x06,
     PONG           = 0x07,
     GQC_VOTE       = 0x08,
+    PQ_WITNESS     = 0x09,  // BACKLOG 0.8: consensus-visible PQ signature
 };
 
 // Wire flags
@@ -191,6 +192,13 @@ public:
 
     // Thread-safe broadcast of a 64KB frame to all peers
     void broadcast_frame(const std::span<const uint8_t, 65536>& frame);
+
+    // BACKLOG 0.8: consensus-visible PQ witnesses. Broadcasts a PQ_WITNESS
+    // record for every user transaction of the frame that has a witness in
+    // the registry — call this BEFORE broadcast_frame so receiving nodes
+    // can verify the block's transactions on arrival. System senders
+    // (GENESIS*/MINER_) need no witness.
+    void broadcast_witnesses_for(const std::span<const uint8_t, 65536>& frame);
 
     // Simulate split-brain fork - create alternative history on peer partition
     void simulate_fork();

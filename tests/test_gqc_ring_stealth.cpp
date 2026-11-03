@@ -47,7 +47,7 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
         vx::blockchain::set_nfa_field(mint.receiver_nfa, "GQC_TEST_RECV_0000000000000000000000000000");
         vx::blockchain::tx_set_amount(mint, 1'000'000);
         vx::blockchain::tx_set_fee(mint, 100);
-        vx::blockchain::sign_transaction(mint);
+        vx::blockchain::set_coinbase_binding(mint, store.chain_height(), tip0);
         builder.add_transaction(mint);
         builder.finalize();
         vx::blockchain::BlockFrame frame;

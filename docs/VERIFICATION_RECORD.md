@@ -59,8 +59,8 @@ machine), which makes the reproduction independent of our test harness.
 | Round | Independently replicated by the reviewer | Where the fix is pinned |
 |---|---|---|
 | 1-2 | RPC surface defects, including the two number-parsing crashes | `fuzz_rpc` battery + RPC hardening (§16) |
-| 3 | Intra-block double spend minting phantom supply; mempool TOCTOU; phantom fsync acknowledgment | `DoubleSpendInBlockRejected`; single-critical-section mempool; append rollback (§6) |
-| 4 | Genesis-v1 nonce replay; `tx_count` poisoning; unverified merkle field; miner draining mempool on a rejected block; RPC-controlled fee/nonce | `NonceZeroReplayRejected`, `OversizedTxCountRejected`, `TamperedMerkleRejected`; miner commit checks; node-stamped fee/nonce (§6) |
+| 3 | Intra-block double spend minting phantom supply; mempool TOCTOU; phantom fsync acknowledgment; keyless theft of 1 VX from the genesis receiver | `DoubleSpendInBlockRejected`; single-critical-section mempool; append rollback. Keyless theft CLOSED 2026-11-03 (round 7): `KeylessTheftRejected` flipped to EXPECT_FALSE plus `UnboundSenderRejected`, `WitnessRootMismatchRejected`, `SelfCertifyingAddressAutoBinds`, `WitnessDurableLogSurvivesRestart` (§6) |
+| 4 | Genesis-v1 nonce replay; `tx_count` poisoning; unverified merkle field; miner draining mempool on a rejected block; RPC-controlled fee/nonce | `NonceZeroReplayRejected`, `OversizedTxCountRejected`, `TamperedMerkleRejected`; miner commit checks; node-stamped fee/nonce. The `MinerEmissionForgeable` pin (emission without mining work or identity) was FLIPPED 2026-11-03 (round 7): `CoinbaseReplayRejected` (§6) |
 | 5 | Vault RPC plaintext exposure; HTLC VM-branch mismatch; GQC tail-stamp overlap; vault page clobber; 32-bit vault token digest; block id ignoring the tail; SSE descriptor leak; demo keys in fixtures; MemoryCore 4×32-bit digest | `HtlcVmFailureForcesLocked`, `VaultTokenDigestFullyChecked`, `VaultPoolFullNotClobber`, `TailMetadataCommitted`, sidecar GQC stamp (§5, §13, §16); WOTS+ leaf reuse was reported stale — already fixed by the durable leaf ledger |
 | 6 (2026-11-03) | No-work blocks accepted on every intake path (the round-4 forged-merkle PoC now belongs to the same gate) | `NoWorkBlockAccepted` (flipped to EXPECT_FALSE), `PogwGateAcceptsSealedWorkAndBindsTheNonce`, `RecoveryRejectsCorruptedLedgerFrame` (§4, §6) |
 
@@ -133,8 +133,14 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   2. H=4 gives 16 one-time leaves — a deliberate test parameter, not a
      production configuration. The capacity question (how many signatures
      an account may emit per tree, and tree rollover) is designed but not
-     implemented or justified numerically.
-  3. No 1M-sample randomized positive/negative verification battery yet;
+     implemented or justified numerically. Since round 7 this also bounds
+     authorization: a key that has consumed all 16 leaves cannot witness
+     further spends; rollover means moving to a new self-certifying
+     address.
+  3. Root rotation is not implemented: an address bound to a PQ root
+     cannot be rebound to a new key (a stolen key cannot be rotated away
+     yet; see BACKLOG 0.7 remainders).
+  4. No 1M-sample randomized positive/negative verification battery yet;
      the negative matrix is structured, not sampled.
 - **Reproducibility.** `cd build && ctest`; the live suite is
   `curl -X POST localhost:PORT/api/crypto/pq_verify -d '{}'`.
@@ -271,7 +277,7 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   under the model's assumptions") needs a written model first — BACKLOG
   2.4 (validator-set design) and the security-model write-up.
 
-### 6. Blockchain state & transactions — **Tested** (external-review P0s fixed across rounds 3-4; authorization and emission still NOT claimed)
+### 6. Blockchain state & transactions — **Tested** (external-review P0s fixed across rounds 3-7; transaction authorization and emission bounds CLAIMED since round 7)
 
 - **Implementation.** `src/state/ledger_state.cpp` (deterministic
   `apply_block`), undo journal for O(1) rollback, `src/state/mempool.cpp`
@@ -308,8 +314,14 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     miner now checks both results and keeps sealed transactions on
     failure.
   - *RPC transfer auto-fields*: `handle_transfer` left fee/nonce to the
-    (attacker-controlled) request body; the node now stamps fee and the
-    ledger's next nonce itself.
+    (attacker-controlled) request body; the node stamped fee and the
+    ledger's next nonce itself. SUPERSEDED in round 7 (BACKLOG 0.7): the
+    server no longer signs or stamps anything into the signed material —
+    the client supplies `fee_atoms`/`nonce` (both inside the PQ-signed
+    preimage, the nonce validated against the ledger's expectation) plus
+    the witness; a zero fee + zero nonce can no longer smuggle the
+    genesis-v1 shape through, because user senders must carry a PQ
+    witness regardless of shape.
 - **Fixed in external-review round 6 (2026-11-03, BACKLOG 0.9 + 0.6).**
   - *Single intake gate*: `append_block` used to enforce only
     magic/height/prev + tx_count/merkle; a tip-extending frame carrying
@@ -324,21 +336,187 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     `RecoveryRejectsCorruptedLedgerFrame`. The RPC transfer path and the
     demo now seal their frames (`seal_pogw_nonce`) instead of appending
     unworked ones; `fuzz_block_frame` drives the gate surface.
+- **Fixed in round 7 (2026-11-03, BACKLOG 0.7 + 0.8).**
+  - *Keyless transaction authorization (the reviewer's round-3 theft
+    PoC)*: CLOSED. Addresses are bound to post-quantum keys through two
+    sources — self-certifying addresses (`"PQA"` + base64url of
+    `Sponge("VXPQADDRV1" || pq_pubkey_root)`: holding the key IS holding
+    the address) and a protocol seed table for genesis-era allocations
+    (genesis receiver -> an OFFLINE root whose secret is not in the repo;
+    demo addresses documented). The ledger refuses every user sender
+    without a valid `PqSignatureWitness` (lookup by `tx_msg_digest`,
+    root-binding check, full WOTS+/XMSS + anchor verification); the
+    keyless Tier-2 digest survives ONLY as an admission pre-filter and
+    for the guarded system senders (`GENESIS*`, `MINER_`). The demo RPC
+    no longer signs on the user's behalf: `/transfer` requires
+    `witness_b64` + `fee_atoms` + `nonce` from the client. Regressions:
+    `KeylessTheftRejected` (the flipped pin — the forged transfer is
+    refused with "no PQ witness registered" and nothing moves),
+    `UnboundSenderRejected` (a valid witness from a key the sender does
+    not own spends nothing), `WitnessRootMismatchRejected`
+    (protocol-bound address, wrong key), `SelfCertifyingAddressAutoBinds`
+    (first witnessed spend binds the address; a foreign key is refused
+    afterwards, the owner keeps spending).
+  - *PQ witness on the wire + durable storage (BACKLOG 0.8)*: CLOSED.
+    `WireMsgType::PQ_WITNESS` (0x09) carries digest(32) + sender(42) +
+    witness(2376); witnesses are broadcast BEFORE the block that carries
+    their transactions (a peer without the witnesses cannot authorize the
+    block). The durable sidecar `<ledger>.pqw` fsyncs a `VXPQWT1` record
+    (2458 B) per registration and is replayed fail-closed on attach —
+    a restart no longer orphans witnessed transactions. Regression:
+    `WitnessDurableLogSurvivesRestart`. The 64 KiB frame itself stays
+    byte-identical to the published spec (it has no free bytes).
+  - *Coinbase emission binding (BACKLOG 0.6 remainder)*: CLOSED. The
+    `MINER_` coinbase no longer authorizes itself with the keyless
+    digest: its `cocoon_proof` must equal
+    `trunc12(Sponge("VX_COINBASE_BIND_V1" || receiver || height ||
+    prev_tip_hash))`, verified against the frame's own header in
+    `apply_block`. A coinbase copied from one fork cannot be replayed on
+    a competing fork at the same height (its tag commits the OTHER
+    fork's tip), and the miner's coinbase builder now emits the binding.
+    Emission is bounded by four rules: one coinbase per block (index 0),
+    the 1000 VX reward cap, real PoGW work on the block (round 6), and
+    the chain-position binding. Pin flipped: `MinerEmissionForgeable` ->
+    `CoinbaseReplayRejected`. What remains is permissionless by design:
+    whoever produces a valid block names the reward address — no miner
+    identity exists to forge.
+- **Fixed in round 8 (2026-11-03, adversarial self-review — internal,
+    not external replication).** Immediately after round 7 landed, the
+    just-written authorization code was audited as an attacker would read
+    it. The audit found two P0s, one P1 cluster and two P2s in the round-7
+    code itself; all are fixed and covered by the existing suite plus the
+    live-node checks below. This round is labeled self-review because the
+    defects were found (and fixed) by the project's own adversarial pass,
+    not reproduced independently by the external reviewer.
+  - *P0 — the wire gate dead-coded the witness channel*: the VX60 header
+    plausibility gate still accepted types 0x01..0x08, so every incoming
+    `PQ_WITNESS` (0x09) frame was dropped (and the connection closed) —
+    the broadcast added in round 7 could never reach a peer. Fixed: the
+    gate accepts 0x01..0x09.
+  - *P0 — register-before-verify + append-before-apply*: the RPC
+    transfer path published an unverified witness into the shared
+    registry and, if the ledger refused the block afterwards, left the
+    block store one block ahead of the ledger state — every later block
+    would then fail the height gate and the node wedges. Fixed on three
+    axes: the endpoint verifies the full WOTS+/XMSS + anchor chain BEFORE
+    registering; `BlockStore::rollback_last_append()` (ftruncate back to
+    the previous tip) is called by the RPC path, the remote-frame path
+    and the miner whenever a gate-passed block is refused by the state
+    layer; and the miner no longer applies a frame that failed to append.
+    A store/ledger tip divergence can no longer persist.
+  - *P1 — the witness registry was an authority-shaped cache*: first
+    candidate won regardless of validity, duplicates were stored, caps
+    were absent (remote flooding filled the map), and the durable log
+    could be appended by a second node process without any lock. Fixed:
+    nothing enters the registry unverified (`register_witness` runs the
+    full tx verification, `register_witness_bytes` verifies the
+    commitment and the chain against the claimed digest); byte-exact
+    dedup; caps of 8 candidates per digest and 50000 digests; the
+    sidecar is opened O_APPEND 0600 under an exclusive `flock` with a
+    memory-only fallback; the replay honors the caps and never feeds the
+    sender-root table. Consensus lookup switched to
+    `lookup_verifying()`: a digest may hold several candidates (an
+    attacker can register a cryptographically valid signature for a
+    digest they predict), and the lookup returns only a candidate that
+    passes full verification against THIS transaction.
+  - *P2 — non-transactional self-certifying bindings*: a sender address
+    was bound to its PQ root mid-loop, before later transactions of the
+    same block could still refuse the block — a rejected block mutated
+    consensus state. Fixed: bindings are collected during validation and
+    applied only after every transaction in the block validated.
+  - *P2 — HTTP parsing fragility (found live)*: the JSON field scanner
+    matched only the compact form (`"key":"v"`), so any standard
+    serializer emitting `"key": "v"` made the endpoint report a missing
+    witness instead of the real validation error; and `parse_request`
+    treated one `recv()` as one request, truncating a ~3.2 KB witness
+    body that arrived split across TCP segments. Fixed: whitespace-
+    tolerant field scan; the request is read until the declared
+    Content-Length is satisfied (64 KiB cap bounds a flood).
+  - Verified live after the fixes: a full-size garbage witness is refused
+    with "witness failed WOTS+/XMSS verification" and does not enter the
+    registry; a wrong nonce is refused with the nonce diagnostic; failed
+    transfers leave every balance byte-identical; both compact and
+    standard JSON produce identical results.
+- **Fixed in round 9 (2026-11-03, delegated adversarial audit — internal,
+  three hunt-fix-re-hunt cycles).** A full-codebase adversarial pass over
+  the round-7/8 code found six more defects, each proven with an
+  executable exploit BEFORE the fix (exploit programs run against the
+  built library from a scratch directory; the repository carries the
+  regression where a gtest can express the invariant).
+  - *P0 — health-loop self-deadlock (remotely triggerable)*: the DoS
+    score path called `disconnect_from_peer` while holding the peer-table
+    mutex, which locks the same non-recursive mutex — one CRC-valid frame
+    with a bad magic from any local process deadlocked the whole node
+    (broadcasts, peer listing, new connections) at the next health tick.
+    Fixed: the ban path collects the affected descriptors under the lock
+    and acts on them after unlocking.
+  - *P0 — unbounded GENESIS minting inside one height-1 block*: the
+    legacy-window mint authorization read COMMITTED balances, so every
+    mint in the same block saw its receiver as still untracked and all
+    of them applied (N x 100 000 VX of supply created in one block at
+    the only window that accepts the mint sender). Fixed: one GENESIS
+    mint per block in the legacy window — the second is refused with
+    "second GENESIS mint in one block". Regression:
+    `SecondGenesisMintInBlockRejected` (the rejected block credits
+    nothing and leaves supply byte-identical).
+  - *P1 — unbounded blocking sends*: broadcast paths sent from threads
+    holding the state or peer mutex; a peer that stopped reading (full
+    TCP window) could freeze the chain tip indefinitely. Fixed: a 5 s
+    send timeout on every dialed and accepted socket.
+  - *P1 — double-close / fd-reuse race on banned peers*: the ban path
+    (and teardown) closed a descriptor the peer's own thread also closed;
+    a recycled fd number would kill an unrelated live connection. Fixed:
+    shutdown-only outside the owning thread, single close by the owner.
+    Proven with an LD_PRELOAD close-generation tracker: 41 double-close
+    events before, 0 after.
+  - *P1 — unbounded remote memory growth via /api/state/prove*: the
+    handler inserted the caller-supplied key into the persistent trie
+    (about 32 arena nodes per request, never erased, unauthenticated
+    listener) — remote OOM at ~3 KB of attacker input per node. Fixed:
+    the demo proof runs on a throwaway per-request trie; the persistent
+    trie stays read-only (it had no other writer anywhere).
+  - *P2 — UB float-to-integer casts on RPC input*: NaN/negative/overflow
+    JSON numbers reached `static_cast<uint64_t>` (UB under
+    float-cast-overflow) instead of a clean refusal. Fixed: finite/range
+    guards before both casts.
+  - Report-only (verified, deliberately not fixed, with reasons): the
+    background miner's append/apply is unsynchronized but the miner is
+    dormant (no caller routes it yet); the mempool races sit behind a
+    submit path with zero callers; the undo journal's raw-struct writes
+    are BACKLOG 0.11 (a real fix changes the on-disk format); broadcast
+    snapshots can send to a concurrently-closed fd (receiver fails
+    closed via the plausibility gate + CRC — liveness only); the RPC
+    binds 0.0.0.0 (deployment decision, documented).
+- **Round 9 tooling and happy-path closure (same wave).**
+  - The multi-node harness now drives a REAL PQ-witnessed transfer: the
+    demo signer names the transaction (sender/receiver/fee/nonce +
+    `demo_key:"spender"`, the public protocol key) and posts the full
+    2376-byte witness to `/api/transfer` — the scenario "transfer mined
+    on A propagates over VX60 and converges on B and C" passes 10/10
+    with post-quantum authorization on every node (previously the script
+    still used the removed keyless shape and could not exercise the
+    transfer at all).
+  - The demo signer endpoint returns `witness_b64` for the transaction
+    it just signed (not the registry's first candidate for the digest —
+    with several candidates per digest, a lookup can name another key's
+    signature) and accepts an optional sender/receiver override. Still
+    demo-only key material (BACKLOG 0.10).
+  - `pq_sign_transaction` gained an out-parameter returning the witness
+    THIS call produced (the registry may hold several valid candidates
+    for the same digest; a caller must not go back through it).
+  - The `fuzz_pq_witness` harness was deepened: it now signs one real
+    message at startup and treats the input as a targeted XOR mutation
+    of that structurally valid witness (offset + mask, witness or
+    message), so every run walks all 67 WOTS+ chains and the XMSS
+    auth-path recomputation instead of bouncing off the first
+    commitment check (coverage counters 2 -> 25 in a 100k run; ~280M
+    random-input runs and ~245k mutation runs clean).
 - **Still open, pinned honestly (expect-success tests).**
-  - *Keyless authorization*: `verify_transaction_proof` accepts a plain
-    sponge digest for any sender not registered as a PQ sender — a
-    digest anyone can compute, so an attacker with NO key moved 1 VX
-    from the genesis receiver (`KeylessTheftReproducible` — the theft
-    SUCCEEDS today). TX AUTH IS NOT CLAIMED until BACKLOG 0.7/0.8 ship
-    (addresses bound to PQ keys in state; witness on the wire).
-  - *MINER_ emission*: a coinbase needs only the `MINER_` sender prefix,
-    index 0 and an amount at or below the 1000 VX limit — no identity, no
-    binding to the block's actual mining work — so anyone still mints the
-    maximum reward per block (`MinerEmissionForgeable` — the mint
-    SUCCEEDS today). The PoGW work gate (round 6) no longer accepts
-    no-work BLOCKS, but the coinbase transaction itself is still not
-    bound to the mined nonce or a miner identity. EMISSION INTEGRITY IS
-    NOT CLAIMED until that binding ships (BACKLOG 0.6 remainder).
+  - (None in this section. The remaining consensus gaps are tracked as
+    BACKLOG items with design notes: undo journal serialization 0.11,
+    reorg undo correctness 0.12, GQC checkpoint durability 0.13, mempool
+    ordering/races 0.14 — none of them pinned as expect-success tests
+    yet; pinning them is part of their fix cycle.)
   - *Undo journal serialization*: `UndoRecord` holds `std::string` /
     `std::vector` / `time_point` and is written with a raw
     `write(fd, &record, sizeof(record))` — heap pointers serialized as

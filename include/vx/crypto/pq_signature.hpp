@@ -19,6 +19,7 @@
 
 #include <array>
 #include <bitset>
+#include <vector>
 #include <cstdint>
 #include <cstddef>
 #include <mutex>
@@ -94,6 +95,12 @@ std::array<uint8_t, 32> xmss_node_hash(uint8_t level, uint16_t node_idx,
 std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
                                   const std::array<uint8_t, 32>& pub_seed) noexcept;
 
+/// The public mask seed for a master secret key, derived exactly as
+/// pq_sign_transaction derives it internally ("VX_PQ_PUBSEED_V1" || sk).
+/// Exposed so protocol code can compute an account's XMSS root (its
+/// PQ binding) without signing anything.
+std::array<uint8_t, 32> pub_seed_from_sk(const std::array<uint8_t, 32>& sk) noexcept;
+
 // ── Sign / verify ────────────────────────────────────────────────────────────
 // Signs `msg` with leaf `leaf_idx` of subtree 0's tree shape; fills the whole
 // witness including pq_pubkey_root and witness_digest.
@@ -121,6 +128,14 @@ std::array<uint8_t, 32> witness_commitment(const PqSignatureWitness& w) noexcept
 
 // Full SegPQ verification: WOTS+/XMSS + the 256-bit anchor check against
 // tx.cocoon_proof (trunc12 of the VX_SEGPQ_ANCHOR_V1 binding).
+/// Rebuilds the SegPQ anchor (tx.cocoon_proof) for a transaction from its
+/// witness: trunc12(Sponge("VX_SEGPQ_ANCHOR_V1" || msg || root ||
+/// witness_digest)). Used when a node reconstructs a client-supplied
+/// transaction — the anchor is derived from the witness, never trusted from
+/// the wire.
+void pq_set_transaction_anchor(blockchain::Transaction& tx,
+                               const PqSignatureWitness& w) noexcept;
+
 bool pq_verify_transaction(const blockchain::Transaction& tx,
                            const PqSignatureWitness& w) noexcept;
 
@@ -160,7 +175,8 @@ struct PqSignTimings {
 bool pq_sign_transaction(blockchain::Transaction& tx,
                          const std::array<uint8_t, 32>& master_sk,
                          PqSignTimings* timings = nullptr,
-                         class PqLeafLedger* leaf_ledger = nullptr) noexcept;
+                         class PqLeafLedger* leaf_ledger = nullptr,
+                         PqSignatureWitness* out_witness = nullptr) noexcept;
 
 // ── PqLeafLedger (one-time-leaf lifecycle) ───────────────────────────────────
 
@@ -235,17 +251,52 @@ class PqWitnessRegistry {
 public:
     static PqWitnessRegistry& instance() noexcept;
 
+    // Hardening (external round-7 review): the registry is a CACHE, never an
+    // authority - nothing enters it unverified, duplicates are not stored
+    // twice, and a digest may hold several candidates so an attacker cannot
+    // occupy a slot and censor the honest witness.
+    static constexpr size_t kMaxWitnessesPerDigest = 8;
+    static constexpr size_t kMaxDigestEntries = 50000;
+
     // Binds a freshly signed witness to its message digest and sender.
-    void register_witness(const blockchain::Transaction& tx,
+    // Verifies the FULL WOTS+/XMSS + anchor chain against the tx first;
+    // returns false (and registers nothing) when the witness is invalid.
+    bool register_witness(const blockchain::Transaction& tx,
                           const PqSignatureWitness& w);
+
+    // Registers a witness that arrived WITHOUT its transaction (wire
+    // WITNESS records, peer relay): the sender and the message digest are
+    // carried explicitly. Also used by the durable-log replay. Verifies the
+    // witness commitment and the WOTS+/XMSS chain against the CLAIMED
+    // digest before storing; returns false otherwise.
+    bool register_witness_bytes(const std::array<uint8_t, 32>& msg_digest,
+                                const uint8_t sender_nfa[42],
+                                const PqSignatureWitness& w);
+
+    // Durable witness sidecar (BACKLOG 0.8): <ledger>.pqw holds
+    // "VXPQWT1" + digest(32) + sender(42) + witness(2376) records, appended
+    // and fsync'd on every registration. attach_durable_log(path) replays
+    // the existing log into memory first; a short or corrupt trailing
+    // record stops the replay (fail-closed: partial witnesses are not
+    // trusted). Registration without an attached log stays memory-only
+    // (tests, one-shot tools).
+    void attach_durable_log(const std::string& path);
 
     // Is this sender backed by a post-quantum key?
     bool is_pq_sender(const uint8_t sender_nfa[42]) const;
 
-    // Witness lookup by canonical message digest; optionally returns the
-    // root that was registered together with it.
+    // Witness lookup by canonical message digest (first candidate —
+    // compatibility/diagnostics use).
     bool lookup(const std::array<uint8_t, 32>& msg_digest,
                 PqSignatureWitness& out) const;
+
+    // Consensus lookup: returns the first candidate for this transaction's
+    // digest that passes the FULL WOTS+/XMSS + SegPQ-anchor verification
+    // against THIS tx. A digest may hold several candidates (an attacker
+    // can register a cryptographically valid signature for a digest they
+    // predict - it just will not verify against the honest transaction).
+    bool lookup_verifying(const blockchain::Transaction& tx,
+                          PqSignatureWitness& out) const;
 
     // Last signed transaction + witness (RPC demo state).
     void set_last(const blockchain::Transaction& tx, const PqSignatureWitness& w);
@@ -258,12 +309,19 @@ private:
         PqSignatureWitness witness;
         std::array<uint8_t, 42> sender{};
     };
+    bool append_durable_locked(const std::array<uint8_t, 32>& digest,
+                               const std::array<uint8_t, 42>& sender,
+                               const PqSignatureWitness& w);
+
     mutable std::mutex mutex_;
-    std::unordered_map<std::array<uint8_t, 32>, Entry, PqArrayHash> by_digest_;
+    std::unordered_map<std::array<uint8_t, 32>, std::vector<Entry>, PqArrayHash> by_digest_;
     std::unordered_map<std::array<uint8_t, 42>, std::array<uint8_t, 32>, PqArrayHash> sender_roots_;
     blockchain::Transaction last_tx_{};
     PqSignatureWitness last_witness_{};
     bool has_last_ = false;
+    int durable_fd_ = -1;
+    std::string durable_path_;
+    bool durable_locked_ = false; // flock held on the sidecar
 };
 
 } // namespace vx::crypto::pq

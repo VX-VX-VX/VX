@@ -7,6 +7,8 @@
 #include <span>
 #include <string>
 
+namespace vx::crypto::pq { struct PqSignatureWitness; } // forward decl (pq_signature.hpp)
+
 namespace vx::blockchain {
 
 // ── fixed-field tag copy ─────────────────────────────────────────────────────
@@ -179,6 +181,39 @@ bool verify_block_merkle(const RawBlock& raw) noexcept;
 using BlockFrame = std::array<uint8_t, BLOCK_SIZE_BYTES>; // raw on-disk 64 KB frame
 using Address    = std::array<uint8_t, 42>;               // NFA payload without prefix
 
+// ── PQ-bound addresses (BACKLOG 0.7) ─────────────────────────────────────────
+
+/**
+ * @brief A user address is spendable only when bound to a post-quantum key.
+ * Two binding sources exist:
+ *   1. Self-certifying: the address itself commits a PQ root — the payload
+ *      is "PQA" followed by 39 base64url characters of
+ *      Sponge("VXPQADDRV1" || root), so holding the key IS holding the
+ *      address; no registration transaction or trusted table is needed.
+ *   2. Protocol seed table: genesis-era allocations (the canonical genesis
+ *      receiver, the demo addresses) are bound in ledger state to fixed
+ *      roots — see genesis.hpp pq_seed_bindings().
+ * Any other user address is rejected by the ledger's apply rules: the
+ * keyless Tier-2 fallback is removed from consensus acceptance.
+ */
+bool is_pq_address(const Address& a) noexcept;
+void derive_pq_address(const uint8_t root[32], uint8_t out_addr[42]) noexcept;
+
+/**
+ * @brief Strict PQ authorization check for one transaction (the only
+ * acceptance path for user senders since the keyless tier was removed).
+ * Looks up the witness by canonical message digest, optionally compares the
+ * witness's committed XMSS root against the sender's bound root (the caller
+ * passes nullptr for a self-certifying address — the caller then re-derives
+ * the address from the returned witness's root itself), and runs the full
+ * WOTS+/XMSS + anchor verification. Every rejection reason is written to
+ * *error when non-null.
+ */
+bool verify_pq_witness(const Transaction& tx,
+                       const std::array<uint8_t, 32>* expected_root,
+                       vx::crypto::pq::PqSignatureWitness* out_witness,
+                       std::string* error = nullptr) noexcept;
+
 inline Address tx_address(const uint8_t raw[42]) noexcept {
     Address a;
     std::memcpy(a.data(), raw, 42);
@@ -253,6 +288,22 @@ struct BlockIntakeContext {
  */
 bool validate_block(const RawBlock& raw, const BlockIntakeContext& ctx,
                     std::string* error = nullptr) noexcept;
+
+// ── Coinbase chain-position binding (BACKLOG 0.6 remainder, closed) ─────────
+
+/**
+ * @brief The ONLY valid cocoon_proof for a MINER_ coinbase:
+ *        trunc12(Sponge("VX_COINBASE_BIND_V1" || receiver[42] || height(8 LE)
+ *        || prev_tip_hash[32])).
+ * The binding commits the emission to the exact chain position: a coinbase
+ * copied from one fork cannot be replayed on a competing fork at the same
+ * height (different prev tip) or shifted to another height. The keyless
+ * Tier-2 digest no longer authorizes coinbases.
+ */
+void coinbase_binding(uint8_t out[12], const Address& receiver, uint64_t height,
+                      const uint8_t prev_tip_hash[32]) noexcept;
+void set_coinbase_binding(Transaction& tx, uint64_t height,
+                          const uint8_t prev_tip_hash[32]) noexcept;
 
 // ── Block View (zero-copy over mmap'd or in-memory buffer) ──────────────────
 

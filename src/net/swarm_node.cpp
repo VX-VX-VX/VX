@@ -1,9 +1,11 @@
 #include "vx/net/swarm_node.hpp"
+#include <vector>
 
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/genesis.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/crypto/simd_accel.hpp"
+#include "vx/crypto/pq_signature.hpp"
 #include "vx/core/hw_intrinsics.hpp"
 #include "vx/core/u128.hpp"
 #include "vx/state/ledger_state.hpp"
@@ -46,7 +48,7 @@ bool wire_header_plausible(const WireHeader& h) noexcept {
     if (h.reserved != 0) return false;
     if (h.payload_len > 65536) return false;
     const uint8_t t = h.msg_type;
-    return t >= 0x01 && t <= 0x08;
+    return t >= 0x01 && t <= 0x09; // 0x09 = PQ_WITNESS (BACKLOG 0.8)
 }
 
 WireHeader SwarmNode::make_header(WireMsgType type, uint32_t payload_len,
@@ -143,7 +145,11 @@ void SwarmNode::emergency_stop() {
 void SwarmNode::close_all_peers() {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     for (auto& [addr, fd] : peer_fds_) {
-        if (fd >= 0) { ::shutdown(fd, SHUT_RDWR); ::close(fd); }
+        // shutdown only: the owning reader/serve thread observes the
+        // shutdown, exits and closes the fd itself. Closing here too would
+        // double-close before the owner's close, and a recycled fd number
+        // in between would make the owner kill an unrelated connection.
+        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
     }
     peer_fds_.clear();
 }
@@ -166,6 +172,12 @@ bool SwarmNode::connect_peer_tcp(const std::string& host, uint16_t port) {
 
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    // Bound blocking sends: broadcast paths call ::send from the RPC/state
+    // threads (handle_transfer, apply_remote_frame hold state_mutex_ across
+    // the broadcast), so a stalled peer with a full TCP window must fail
+    // after seconds instead of freezing the whole chain tip indefinitely.
+    struct timeval snd_tv{5, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
     // Handshake: announce ourselves so the remote listener promotes this
     // connection into its peer table (and can broadcast back over it).
@@ -199,6 +211,16 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
             handle_incoming_frame(label,
                 std::span<const uint8_t, 65536>(payload.data(), payload.size()));
+            continue;
+        }
+        if (type == WireMsgType::PQ_WITNESS &&
+            payload.size() == 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)) {
+            vx::crypto::pq::PqSignatureWitness w;
+            std::memcpy(&w, payload.data() + 74, sizeof(w));
+            std::array<uint8_t, 32> digest{};
+            std::memcpy(digest.data(), payload.data(), 32);
+            vx::crypto::pq::PqWitnessRegistry::instance().register_witness_bytes(
+                digest, payload.data() + 32, w);
             continue;
         }
         break; // unexpected message type: drop the connection
@@ -389,10 +411,75 @@ bool SwarmNode::send_frame_to_peer(int fd, const std::span<const uint8_t, 65536>
 }
 
 void SwarmNode::broadcast_frame(const std::span<const uint8_t, 65536>& frame) {
-    std::lock_guard<std::mutex> lock(peers_mutex_);
-    for (const auto& [addr, fd] : peer_fds_) {
-        (void)addr;
-        send_frame_to_peer(fd, frame);
+    // Snapshot the peer fds under the lock, send OUTSIDE it: a blocking
+    // ::send to a stalled peer (full TCP window) must never hold
+    // peers_mutex_ - that would freeze health_loop, disconnect_from_peer
+    // and emergency_stop behind one slow socket.
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        fds.reserve(peer_fds_.size());
+        for (const auto& [addr, fd] : peer_fds_) {
+            (void)addr;
+            fds.push_back(fd);
+        }
+    }
+    for (int fd : fds) send_frame_to_peer(fd, frame);
+}
+
+// BACKLOG 0.8: witnesses travel as their own wire message so a receiving
+// node can verify the block's user transactions on arrival (the 64 KiB
+// frame has no spare bytes — the witness rides beside the frame, never
+// inside it).
+void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536>& frame) {
+    auto* raw = reinterpret_cast<const blockchain::RawBlock*>(frame.data());
+    const uint32_t count = raw->header.tx_count > blockchain::MAX_TX_PER_BLOCK
+                               ? 0u : raw->header.tx_count;
+    std::vector<std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)>> payloads;
+    for (uint32_t i = 0; i < count; ++i) {
+        const blockchain::Transaction& tx = raw->transactions[i];
+        const char* s = reinterpret_cast<const char*>(tx.sender_nfa);
+        if (std::strncmp(s, "GENESIS", 7) == 0 || std::strncmp(s, "MINER_", 6) == 0)
+            continue; // system senders carry no witness
+        const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+        vx::crypto::pq::PqSignatureWitness w;
+        if (!vx::crypto::pq::PqWitnessRegistry::instance().lookup(digest, w))
+            continue; // nothing to relay for this tx
+        std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)> payload{};
+        std::memcpy(payload.data(), digest.data(), 32);
+        std::memcpy(payload.data() + 32, tx.sender_nfa, 42);
+        std::memcpy(payload.data() + 74, &w, sizeof(w));
+        payloads.push_back(payload);
+    }
+    // Snapshot + send outside the lock (same reasoning as broadcast_frame);
+    // a short header send desyncs the peer's stream, so it is fatal there.
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        fds.reserve(peer_fds_.size());
+        for (const auto& [addr, fd] : peer_fds_) {
+            (void)addr;
+            fds.push_back(fd);
+        }
+    }
+    for (int fd : fds) {
+        for (const auto& payload : payloads) {
+            WireHeader hdr = make_header(WireMsgType::PQ_WITNESS,
+                                         static_cast<uint32_t>(payload.size()),
+                                         session_nonce_.fetch_add(1));
+            hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
+            ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
+            if (n != static_cast<ssize_t>(sizeof(hdr))) break;
+            size_t off = 0;
+            while (off < payload.size()) {
+                n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
+                if (n <= 0) {
+                    if (n < 0 && errno == EINTR) continue;
+                    break;
+                }
+                off += static_cast<size_t>(n);
+            }
+        }
     }
 }
 
@@ -515,6 +602,10 @@ void SwarmNode::listener_loop() {
 void SwarmNode::serve_connection(int c) {
     int one = 1;
     ::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    // Same send bound as connect_peer_tcp: an accepted peer that stops
+    // reading must not block a broadcast (and with it state_mutex_) forever.
+    struct timeval snd_tv{5, 0};
+    ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
     // Serve one connection until EOF: PING -> PONG, RAW_BLOCK_64K ->
     // handle_incoming_frame (CRC32C already verified inside recv_packet).
@@ -566,6 +657,17 @@ void SwarmNode::serve_connection(int c) {
                 std::span<const uint8_t, 65536>(payload.data(), payload.size()));
             continue;
         }
+        if (type == WireMsgType::PQ_WITNESS &&
+            payload.size() == 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)) {
+            promote();
+            vx::crypto::pq::PqSignatureWitness w;
+            std::memcpy(&w, payload.data() + 74, sizeof(w));
+            std::array<uint8_t, 32> digest{};
+            std::memcpy(digest.data(), payload.data(), 32);
+            vx::crypto::pq::PqWitnessRegistry::instance().register_witness_bytes(
+                digest, payload.data() + 32, w);
+            continue;
+        }
         break;
     }
     if (registered) {
@@ -592,19 +694,43 @@ void SwarmNode::gossip_loop() {
 
 void SwarmNode::health_loop() {
     while (!emergency_stop_requested_.load()) {
+        std::vector<int> banned_fds;
         {
             std::lock_guard<std::mutex> lock(peers_mutex_);
             for (auto it = peer_table_.begin(); it != peer_table_.end();) {
                 PeerInfo peer = *it;
                 if (peer.dos_score >= 100) {
                     peer.is_banned = true;
-                    disconnect_from_peer(peer);
+                    // disconnect_from_peer() locks peers_mutex_ itself, so it
+                    // must NOT be called while this thread holds the lock:
+                    // a non-recursive mutex would self-deadlock health_loop
+                    // WITH the lock held, wedging every later peers_mutex_
+                    // consumer (frame broadcasts, /api/swarm/peers, new
+                    // peer connections). Act on the socket after unlocking.
+                    //
+                    // Every peer_fds_ entry has exactly one owner thread (the
+                    // dialed reader or the accepted serve loop) that closes
+                    // the fd on exit. shutdown() here wakes that owner, which
+                    // then performs the single close; closing it here as well
+                    // would be a double close, and if the fd number was
+                    // recycled in between, the owner's close would kill an
+                    // unrelated live connection.
+                    auto fd_it = peer_fds_.find(peer.address);
+                    if (fd_it != peer_fds_.end()) {
+                        banned_fds.push_back(fd_it->second);
+                        peer_fds_.erase(fd_it);
+                    }
                     it = peer_table_.erase(it);
                 } else {
                     peer.last_seen = std::chrono::system_clock::now();
                     ++it;
                 }
             }
+        }
+        for (int fd : banned_fds) {
+            // shutdown only: the owning reader/serve thread wakes, tears down
+            // its state and closes the fd exactly once (see comment above).
+            if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
         }
         for (int i = 0; i < 50 && !emergency_stop_requested_.load(); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -688,7 +814,7 @@ struct SimNode {
             vx::blockchain::set_nfa_field(cb.receiver_nfa, "MINER_REWARD_ADDR_SPLIT_BRAIN_SIM");
             for (size_t k = 35; k < 42; ++k) cb.receiver_nfa[k] = '0';
             blockchain::tx_set_amount(cb, 1'000'000ULL * (h + 1)); // distinct per height
-            blockchain::sign_transaction(cb);
+            blockchain::set_coinbase_binding(cb, h, tip); // chain-position binding
 
             BlockBuilder b;
             b.set_height(h);

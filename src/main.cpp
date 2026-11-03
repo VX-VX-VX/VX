@@ -5,6 +5,8 @@
 #include "vx/math/tdi_filter.hpp"
 #include "vx/wif/wif_matrix.hpp"
 #include "vx/blockchain/block.hpp"
+#include "vx/blockchain/genesis.hpp"
+#include "vx/crypto/pq_signature.hpp"
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
 #include "vx/rpc/http_server.hpp"
@@ -73,25 +75,11 @@ void run_demo_script(vx::storage::BlockStore& store,
     // ── 1. Derive Coordinates & Addresses for Seed #2 and Seed #3 ────────────
     std::cout << "[DEMO] Computing 1000-round Attractor for Seed #2 and Seed #3...\n";
 
-    std::string seed2 =
-        "e76a1d401b5c3b803d9e909a1c7d7b5893f89e991160bfea87d56b9292a9eca5"
-        "a3656ecc660111b16d81d181f69f307b864a76d5411051863d74c41f1c9b8d60"
-        "dd667f204e057ede165edc4dfdfd3ad5d31330f35667412f0a6ff87b16d55256"
-        "0a500902dda48ed0d69b37f28d4f9601a5f10b28ea08510137ccfe6a6b4c96d2"
-        "e99756a88b7b8b2d19253166515de608fb5c75fc44e016aa1b93b2d3fae46985"
-        "fcbc581bebc4292ec095a0a2d7867a14f0554636a3176bcd2e1aa0cb7cdf5490"
-        "7f87113a69b32bfd4e3ab74897dc1af388e09bd6e1dfbd83b1ba63b514fc28b8"
-        "2ac7fcf56593a9078dfec7a09b53ca5db9239cdd03ab9aa1b38d2d721ce5f195";
-
-    std::string seed3 =
-        "aa0e37b14c1157a6cfeea4036e82f03958b6be4754e88d7c4817c98933cbb5eb"
-        "39f34b1493cbad810a7275f9f2a3cc36069c725ad8e20b8e031c00faa6e58984"
-        "34cac3a2ab04af9acce52a3e0ee119f78ac2aaf0229955b441296b1bf225e30b"
-        "b32bbe6904952ea8e99a38ec07aeda17a5a203aae0a7f0b56e9946fe28f8ccc7"
-        "21f6104d749ec1c2f55a8851215942d611d952153fb0e1b2e04e93a89aafc423"
-        "2f2971ea1d90abe00e5b86b61561a8adbcb0b6909f4686c033cd7fd73c3eb085"
-        "3131f6c100c7d1820ec87bb05ff14b10058ca58df5ed05fb927ce3af5adc23f6"
-        "1fae0a4a6065aae3d0e56ec008860385b12423b5938c31d84c5399131b6273aa";
+    // Canonical demo seeds are protocol constants (genesis.hpp): the demo
+    // spender address is bound to the public demo PQ key on EVERY node, so
+    // the demo exercises the real authorization path.
+    std::string seed2 = vx::blockchain::demo_spender_seed_hex();
+    std::string seed3 = vx::blockchain::demo_receiver_seed_hex();
 
     auto res2 = vx::math::VortexAttractor::run(seed2, 1000, true);
     auto res3 = vx::math::VortexAttractor::run(seed3, 1000, true);
@@ -160,7 +148,17 @@ void run_demo_script(vx::storage::BlockStore& store,
 
         uint64_t amt2 = 25'000ULL * 100'000'000ULL; // 25k VX
         std::memcpy(tx2.amount, &amt2, 8);
-        vx::blockchain::sign_transaction(tx2);
+        // PQ authorization (BACKLOG 0.7): Address #2 is bound to the public
+        // demo spender key on every node; the transfer carries a real
+        // WOTS+/XMSS witness instead of the keyless digest.
+        vx::blockchain::tx_set_fee(tx2, 100);
+        vx::blockchain::tx_set_nonce(tx2, state.get_next_nonce(addr2_payload));
+        std::array<uint8_t, 32> demo_sk{};
+        vx::blockchain::VortexSponge256::compute(
+            reinterpret_cast<const uint8_t*>("VX_DEMO_SPENDER_SK_V1"), 21, demo_sk.data());
+        if (!vx::crypto::pq::pq_sign_transaction(tx2, demo_sk)) {
+            throw std::runtime_error("demo: PQ signing failed (no free leaf)");
+        }
     }
     builder.add_transaction(tx2);
 
@@ -283,6 +281,9 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[NODE] Opening " << ledger_path << " (auto-init from genesis.bin if empty)...\n";
     vx::storage::BlockStore store(ledger_path, genesis_path);
+    // BACKLOG 0.8: durable PQ witness sidecar — every witnessed transaction
+    // is fsync'd beside the ledger and replayed on restart.
+    vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(ledger_path + ".pqw");
     uint64_t current_height = store.chain_height();
     std::cout << "      ✓ Chain height: " << current_height << " blocks (tip = #" << (current_height - 1) << ")\n\n";
 

@@ -49,6 +49,9 @@ HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, u
       data_dir_(data_dir), undo_engine_(std::make_unique<vx::state::UndoEngine>(data_dir_, store, ledger)),
       gqc_finality_(std::make_unique<vx::consensus::GqcFinality>(*undo_engine_, store)),
       vault_core_(), lock_step_(), zk_matrix_(), tensor_v6_(), virtual_tensor_() {
+    // BACKLOG 0.8: durable PQ witness sidecar (<ledger>.pqw) — a restart
+    // reloads every witnessed transaction instead of orphaning them.
+    vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(store.path() + ".pqw");
     // Initialize swarm node
     swarm_node_ = std::make_unique<vx::net::SwarmNode>();
     // Seed the vault memory core with a deterministic master key so the
@@ -172,10 +175,17 @@ bool HttpServer::apply_remote_frame(const void* frame) {
     vx::blockchain::BlockView applied{std::span<const uint8_t, 65536>(
         reinterpret_cast<const uint8_t*>(raw), 65536)};
     auto res = ledger_.apply_block(applied);
-    if (!res.ok) return false;
+    if (!res.ok) {
+        // Round-7 hardening (P0-2): a gate-passed block the state layer
+        // refuses is removed from the ledger file before returning - the
+        // next remote frame must find the store still at the old tip.
+        store_.rollback_last_append();
+        return false;
+    }
 
     // Gossip one hop past the origin; peers that already have it will drop
-    // the duplicate at the height check above.
+    // the duplicate at the height check above. Witnesses first (BACKLOG 0.8).
+    swarm_node_->broadcast_witnesses_for(std::span<const uint8_t, 65536>(bytes, 65536));
     swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(bytes, 65536));
     return true;
 }
@@ -183,11 +193,43 @@ bool HttpServer::apply_remote_frame(const void* frame) {
 HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
     HttpRequest req;
     ok = false;
+    // Round-7 hardening: one recv() is one TCP segment, not one request. A
+    // /api/transfer body carries a ~3.2 KB base64 witness and legitimately
+    // arrives split - the old code truncated such bodies mid-field. Read
+    // until the declared Content-Length is satisfied (64 KiB cap: every
+    // legitimate request fits far below it, and the cap bounds a flood).
+    static constexpr size_t kMaxRequestBytes = 64 * 1024;
+    std::string raw;
+    raw.reserve(8192);
     char buf[8192];
-    ssize_t n = ::recv(client_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) return req;
-    buf[n] = '\0';
-    std::string raw(buf);
+    size_t header_end = std::string::npos;
+    size_t content_length = 0;
+    while (raw.size() < kMaxRequestBytes) {
+        ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        raw.append(buf, static_cast<size_t>(n));
+
+        if (header_end == std::string::npos) {
+            header_end = raw.find("\r\n\r\n");
+            if (header_end != std::string::npos) {
+                // Content-Length from the header block (case-insensitive name).
+                std::string lower;
+                lower.reserve(header_end);
+                for (size_t i = 0; i < header_end; ++i)
+                    lower.push_back(static_cast<char>(::tolower(raw[i])));
+                size_t cl = lower.find("content-length:");
+                if (cl != std::string::npos) {
+                    content_length =
+                        static_cast<size_t>(std::strtoull(raw.c_str() + cl + 15, nullptr, 10));
+                }
+            }
+        }
+        if (header_end != std::string::npos) {
+            const size_t body_start = header_end + 4;
+            if (raw.size() >= body_start + content_length) break;
+        }
+    }
+    if (raw.empty()) return req;
     size_t line_end = raw.find("\r\n");
     if (line_end == std::string::npos) return req;
     std::string line = raw.substr(0, line_end);
@@ -516,7 +558,8 @@ HttpResponse HttpServer::handle_accounts(const HttpRequest&) {
             << "\"payload_42\":\"" << json_escape(payload) << "\","
             << "\"label\":\"" << label << "\","
             << "\"balance_atomics\":\"" << bal_str << "\","
-            << "\"balance_vx\":\"" << format_vx(bal.lo) << "\""
+            << "\"balance_vx\":\"" << format_vx(bal.lo) << "\","
+            << "\"next_nonce_atomics\":" << ledger_.get_next_nonce(addr)
             << "}";
     }
     oss << "]}";
@@ -528,11 +571,22 @@ HttpResponse HttpServer::handle_accounts(const HttpRequest&) {
 HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     // Simple JSON parse helpers
     auto extract = [](const std::string& body, const std::string& key) -> std::string {
-        std::string pat = "\"" + key + "\":\"";
+        // Tolerant field scan: "key" then optional whitespace, ':', optional
+        // whitespace, then the quoted string. Standard JSON serializers emit
+        // spaces after ':'; the old fixed pattern silently missed them and
+        // reported a missing field instead of the real validation error.
+        std::string pat = "\"" + key + "\"";
         size_t pos = body.find(pat);
         if (pos == std::string::npos) return "";
         pos += pat.size();
+        while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) ++pos;
+        if (pos >= body.size() || body[pos] != ':') return "";
+        ++pos;
+        while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) ++pos;
+        if (pos >= body.size() || body[pos] != '"') return "";
+        ++pos;
         size_t end = body.find('"', pos);
+        if (end == std::string::npos) return "";
         return body.substr(pos, end - pos);
     };
     auto extract_num = [&extract, &req](const std::string& key) -> double {
@@ -551,6 +605,27 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     std::string sender = extract(req.body, "sender");
     std::string receiver = extract(req.body, "receiver");
     double amount_vx = extract_num("amount_vx");
+    // Guard the atomics conversion below: amount_vx comes straight from JSON
+    // text, and a NaN / negative / overflowing value would make
+    // (amount_vx * 1e8 -> uint64_t) an out-of-range floating-point cast
+    // (undefined behavior - UBSan float-cast-overflow) instead of a clean
+    // rejection.
+    if (!(amount_vx >= 0.0) || amount_vx > 1.8e11) {
+        return HttpResponse::error(403, "amount_vx must be a finite non-negative number");
+    }
+    const std::string witness_b64 = extract(req.body, "witness_b64");
+    const double fee_atoms = extract_num("fee_atoms");
+    const double nonce_in = extract_num("nonce");
+
+    // BACKLOG 0.7 (closed 2026-11-03): the demo RPC no longer signs on the
+    // user's behalf. A transfer must carry a post-quantum witness produced
+    // by the sender's key; the server rebuilds the tx anchor from the
+    // witness and never trusts a transported cocoon_proof.
+    if (witness_b64.empty()) {
+        return HttpResponse::error(403,
+            "PQ witness required: keyless transfers are not accepted"
+            " (send witness_b64 with a 2376-byte base64 PqSignatureWitness)");
+    }
 
     auto tdi = vx::math::TdiFilter::evaluate(112, amount_vx);
     if (tdi.isAnnihilated) {
@@ -607,17 +682,79 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     to_le128(attr.finalZ, coords + 256);
     builder.set_attractor_coords(coords);
 
+    // Decode the client's witness (base64, exactly one PqSignatureWitness).
+    vx::crypto::pq::PqSignatureWitness w{};
+    {
+        static constexpr char kB64[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        auto nib = [](char c) -> int {
+            for (int i = 0; i < 64; ++i) if (kB64[i] == c) return i;
+            if (c == '-') return 62; if (c == '_') return 63; // url-safe too
+            return -1;
+        };
+        std::string clean;
+        clean.reserve(witness_b64.size());
+        for (char c : witness_b64) {
+            if (c == '\n' || c == '\r' || c == ' ') continue;
+            if (c == '=') break;
+            clean.push_back(c);
+        }
+        const size_t need = sizeof(vx::crypto::pq::PqSignatureWitness);
+        if (clean.size() % 4 != 0 || clean.size() / 4 * 3 != need) {
+            return HttpResponse::error(403,
+                "witness_b64 must decode to exactly 2376 bytes (PqSignatureWitness)");
+        }
+        uint8_t* out = reinterpret_cast<uint8_t*>(&w);
+        size_t oi = 0;
+        uint32_t acc = 0;
+        int bits = 0;
+        for (char c : clean) {
+            const int v = nib(c);
+            if (v < 0) return HttpResponse::error(403, "witness_b64: invalid base64 character");
+            acc = (acc << 6) | static_cast<uint32_t>(v);
+            bits += 6;
+            if (bits >= 8) {
+                bits -= 8;
+                out[oi++] = static_cast<uint8_t>((acc >> bits) & 0xFF);
+            }
+        }
+    }
+
+    // Fee and nonce come from the client (they are inside the signed
+    // preimage) and are validated against ledger expectations: a zero fee
+    // AND zero nonce would shape the tx as "Genesis v1" — external review
+    // P0. The server stamps nothing into the signed material.
+    if (!(fee_atoms > 0.0) || fee_atoms > 4'000'000'000.0) {
+        return HttpResponse::error(403, "fee_atoms must be a positive integer");
+    }
+    const uint32_t fee = static_cast<uint32_t>(fee_atoms);
+    // Same out-of-range-cast guard for the nonce (NaN would be UB too).
+    if (!(nonce_in >= 0.0) || nonce_in > 4294967295.0) {
+        return HttpResponse::error(403, "nonce must be an integer in [0, 2^32)");
+    }
+    const uint32_t nonce = static_cast<uint32_t>(nonce_in);
+    if (nonce != ledger_.get_next_nonce(sender_addr)) {
+        return HttpResponse::error(403, "nonce mismatch: use the sender's next expected nonce");
+    }
+
     vx::blockchain::Transaction tx{};
     std::memcpy(tx.sender_nfa, sender_addr.data(), 42);
     std::memcpy(tx.receiver_nfa, recv_addr.data(), 42);
     std::memcpy(tx.amount, &amount_atomics, 8);
-    // A zero fee AND zero nonce would shape the tx as "Genesis v1" (legacy
-    // exemption shape) — external review P0: that bypassed nonce accounting
-    // entirely. The demo transfer path now pays a real fee and takes the
-    // sender's next expected nonce from the ledger.
-    vx::blockchain::tx_set_fee(tx, 100);
-    vx::blockchain::tx_set_nonce(tx, ledger_.get_next_nonce(sender_addr));
-    vx::blockchain::sign_transaction(tx);
+    vx::blockchain::tx_set_fee(tx, fee);
+    vx::blockchain::tx_set_nonce(tx, nonce);
+    // Anchor from the witness. Round-7 hardening (P0-2): verify BEFORE
+    // registering - the RPC endpoint must not publish an invalid witness
+    // into the shared registry (a failed tx would still poison the digest
+    // slot for the honest signer). register_witness re-verifies and returns
+    // false on an invalid witness; both gates refuse the transfer.
+    vx::crypto::pq::pq_set_transaction_anchor(tx, w);
+    if (!vx::crypto::pq::pq_verify_transaction(tx, w)) {
+        return HttpResponse::error(403, "witness failed WOTS+/XMSS verification for this transaction");
+    }
+    if (!vx::crypto::pq::PqWitnessRegistry::instance().register_witness(tx, w)) {
+        return HttpResponse::error(403, "witness rejected by the registry (invalid or duplicate)");
+    }
     builder.add_transaction(tx);
     builder.finalize();
 
@@ -638,10 +775,18 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
         reinterpret_cast<const uint8_t*>(new_raw), 65536)};
     auto res = ledger_.apply_block(newv);
     if (!res.ok) {
+        // Round-7 hardening (P0-2): the store must never keep a block the
+        // ledger refused - store and ledger would disagree about the tip
+        // and every later block would fail the height gate.
+        store_.rollback_last_append();
         return HttpResponse::error(500, res.error);
     }
 
-    // Gossip the freshly mined block to every connected VX60 peer.
+    // Gossip the freshly mined block to every connected VX60 peer. The
+    // PQ witnesses of its user transactions travel FIRST (BACKLOG 0.8):
+    // a peer that receives a block without its witnesses cannot authorize
+    // the txs and would drop the block.
+    swarm_node_->broadcast_witnesses_for(std::span<const uint8_t, 65536>(frame.data(), 65536));
     swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(frame.data(), 65536));
 
     uint8_t bh[32];
@@ -1648,11 +1793,19 @@ HttpResponse HttpServer::handle_state_prove(const HttpRequest& req) {
     hex_to_bytes(val_hex, val.data());
 
     std::lock_guard<std::mutex> lock(state_mutex_);
-    const auto root_before = trie_->root_hash();
-    trie_->put(key.data(), val.data());
-    const auto root_after = trie_->root_hash();
+    // Demo proof on a throwaway trie. Putting the caller-supplied key into
+    // the persistent trie_ grew its node arena without bound (one HTTP
+    // request per distinct key, up to SGMT_DEPTH new arena nodes each), so a
+    // remote client looping this unauthenticated endpoint could exhaust
+    // memory. trie_ is never seeded from chain state and nothing erases from
+    // it, so persisting the demo insert had no reader: the proof below is
+    // self-contained against root_after.
+    vx::state::GaloisTrie demo_trie;
+    const auto root_before = demo_trie.root_hash();
+    demo_trie.put(key.data(), val.data());
+    const auto root_after = demo_trie.root_hash();
 
-    const auto proof = trie_->generate_proof(key.data());
+    const auto proof = demo_trie.generate_proof(key.data());
     const bool verified = vx::state::GaloisTrie::verify_proof(
         root_after.data(), key.data(), val.data(), proof);
     // Negative control: flip one bit in the value -> verification MUST fail.
@@ -2204,19 +2357,34 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
     bc::VortexSponge256::compute(reinterpret_cast<const uint8_t*>("VX_PQ_RPC_DEMO_SK_V1"), 19,
                                  master_sk.data());
     if (!req.body.empty()) {
-        const auto find_str = [&](const char* key) -> std::string {
-            const std::string pat = "\"" + std::string(key) + "\":\"";
-            const auto p = req.body.find(pat);
+        // Whitespace-tolerant field scan (round 8): standard JSON
+        // serializers emit spaces after ':', and the fixed patterns above
+        // silently missed every field in such a body.
+        auto find_str = [&](const char* key) -> std::string {
+            std::string pat = "\"" + std::string(key) + "\"";
+            size_t p = req.body.find(pat);
             if (p == std::string::npos) return "";
-            const auto start = p + pat.size();
-            const auto end = req.body.find('"', start);
-            return req.body.substr(start, end - start);
+            p += pat.size();
+            while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t')) ++p;
+            if (p >= req.body.size() || req.body[p] != ':') return "";
+            ++p;
+            while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t')) ++p;
+            if (p >= req.body.size() || req.body[p] != '"') return "";
+            ++p;
+            const auto end = req.body.find('"', p);
+            if (end == std::string::npos) return "";
+            return req.body.substr(p, end - p);
         };
         const auto find_num = [&](const char* key, uint64_t dflt) -> uint64_t {
-            const std::string pat = "\"" + std::string(key) + "\":";
-            const auto p = req.body.find(pat);
+            std::string pat = "\"" + std::string(key) + "\"";
+            size_t p = req.body.find(pat);
             if (p == std::string::npos) return dflt;
-            return std::strtoull(req.body.c_str() + p + pat.size(), nullptr, 10);
+            p += pat.size();
+            while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t')) ++p;
+            if (p >= req.body.size() || req.body[p] != ':') return dflt;
+            ++p;
+            while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t')) ++p;
+            return std::strtoull(req.body.c_str() + p, nullptr, 10);
         };
         amount = find_num("amount_vx", 250) * 100000000ull; // VX → atomics
         fee = static_cast<uint32_t>(find_num("fee", 1500));
@@ -2228,17 +2396,75 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
                     std::strtoul(seed_hex.substr(i * 2, 2).c_str(), nullptr, 16));
             }
         }
+        // "demo_key":"spender" selects the PROTOCOL demo spender key — the
+        // public constant Sponge("VX_DEMO_SPENDER_SK_V1") that genesis.hpp
+        // binds to the demo spender address on every node. This is what lets
+        // the multi-node harness drive a real /transfer happy path: the
+        // address is already PQ-bound to exactly this key. Still demo-only
+        // signing of a PUBLIC key (BACKLOG 0.10: compile demo signers out of
+        // production builds); no user key material ever flows here.
+        if (find_str("demo_key") == "spender") {
+            bc::VortexSponge256::compute(
+                reinterpret_cast<const uint8_t*>("VX_DEMO_SPENDER_SK_V1"), 21, master_sk.data());
+        }
     }
 
+    // Optional sender/receiver override (42-byte address payloads, with or
+    // without the "NFA_V6_" display prefix). The endpoint signs ONLY with
+    // key material the caller posts (seed_hex or the default demo seed) —
+    // this remains the demo signer (BACKLOG 0.10: compile demo signers out
+    // of production builds); it just names the transaction the caller
+    // wants, so a test harness can drive the full /transfer happy path.
+    auto find_str_top = [&req](const char* key) -> std::string {
+        // Whitespace-tolerant, same contract as the parse helper below.
+        std::string pat = "\"" + std::string(key) + "\"";
+        size_t p = req.body.find(pat);
+        if (p == std::string::npos) return "";
+        p += pat.size();
+        while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t')) ++p;
+        if (p >= req.body.size() || req.body[p] != ':') return "";
+        ++p;
+        while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t')) ++p;
+        if (p >= req.body.size() || req.body[p] != '"') return "";
+        ++p;
+        const auto end = req.body.find('"', p);
+        if (end == std::string::npos) return "";
+        return req.body.substr(p, end - p);
+    };
+    auto addr_field = [&](const char* key, uint8_t out[42]) -> bool {
+        std::string v = find_str_top(key);
+        if (v.empty()) return false;
+        const std::string prefix = "NFA_V6_";
+        if (v.size() >= prefix.size() && v.compare(0, prefix.size(), prefix) == 0)
+            v = v.substr(prefix.size());
+        if (v.size() > 42) v = v.substr(v.size() - 42);
+        if (v.size() != 42) return false;
+        std::memset(out, 0, 42);
+        std::memcpy(out, v.data(), 42);
+        return true;
+    };
+    uint8_t sender_override[42]{}, receiver_override[42]{};
+    const bool have_sender = addr_field("sender", sender_override);
+    const bool have_receiver = addr_field("receiver", receiver_override);
+
     bc::Transaction tx{};
-    vx::blockchain::set_nfa_field(tx.sender_nfa, "PQ_RPC_DEMO_SENDER_00000000000000000000000");
-    vx::blockchain::set_nfa_field(tx.receiver_nfa, "PQ_RPC_DEMO_RECV_0000000000000000000000000");
+    if (have_sender) {
+        std::memcpy(tx.sender_nfa, sender_override, 42);
+    } else {
+        vx::blockchain::set_nfa_field(tx.sender_nfa, "PQ_RPC_DEMO_SENDER_00000000000000000000000");
+    }
+    if (have_receiver) {
+        std::memcpy(tx.receiver_nfa, receiver_override, 42);
+    } else {
+        vx::blockchain::set_nfa_field(tx.receiver_nfa, "PQ_RPC_DEMO_RECV_0000000000000000000000000");
+    }
     bc::tx_set_amount(tx, amount);
     bc::tx_set_fee(tx, fee);
     bc::tx_set_nonce(tx, nonce);
 
     pq::PqSignTimings t{};
-    if (!pq::pq_sign_transaction(tx, master_sk, &t, pq_leaf_ledger_.get())) {
+    pq::PqSignatureWitness this_witness{};
+    if (!pq::pq_sign_transaction(tx, master_sk, &t, pq_leaf_ledger_.get(), &this_witness)) {
         return HttpResponse::error(
             409, "pq leaf exhausted for this key (16 one-time leaves consumed)");
     }
@@ -2247,12 +2473,14 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
     const auto wall1 = std::chrono::steady_clock::now();
     t.verify_us = std::chrono::duration<double, std::micro>(wall1 - wall0).count();
 
-    // Report THIS request's witness: look it up by its own message digest.
-    // get_last() would race under concurrent signs (it names whichever
-    // request registered last, not the caller's).
+    // Report THIS request's witness, not the registry's first candidate:
+    // the registry may hold several valid candidates for the same digest
+    // (a predictable message can be signed by anyone holding any key), and
+    // lookup() returns whichever registered first — not necessarily this
+    // call's signature.
     const auto msg = pq::tx_msg_digest(tx);
-    pq::PqSignatureWitness w{};
-    const bool have_last = pq::PqWitnessRegistry::instance().lookup(msg, w);
+    pq::PqSignatureWitness w = this_witness;
+    const bool have_last = true;
 
     std::ostringstream oss;
     oss << "{\"ok\":true,"
@@ -2279,7 +2507,35 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
         << "\"sign_cycles\":" << t.sign_cycles << ","
         << "\"sign_us\":" << std::fixed << std::setprecision(2) << t.sign_us << ","
         << "\"verify_us\":" << std::fixed << std::setprecision(2) << t.verify_us << ","
-        << "\"vault_burn_verified\":" << (t.vault_burn_verified ? "true" : "false") << "}";
+        << "\"vault_burn_verified\":" << (t.vault_burn_verified ? "true" : "false");
+    if (have_last) {
+        // The witness bytes themselves (standard base64, 3168 chars) so the
+        // caller can hand the SAME signature to /api/transfer — the transfer
+        // rebuilds the transaction from its own fields and the SegPQ anchor
+        // recomputes to the same value when every field matches.
+        static const char kB64[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string b64;
+        b64.reserve(3168);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&w);
+        for (size_t i = 0; i < sizeof(w); i += 3) {
+            uint32_t v = static_cast<uint32_t>(bytes[i]) << 16;
+            if (i + 1 < sizeof(w)) v |= static_cast<uint32_t>(bytes[i + 1]) << 8;
+            if (i + 2 < sizeof(w)) v |= static_cast<uint32_t>(bytes[i + 2]);
+            b64.push_back(kB64[(v >> 18) & 0x3F]);
+            b64.push_back(kB64[(v >> 12) & 0x3F]);
+            b64.push_back(i + 1 < sizeof(w) ? kB64[(v >> 6) & 0x3F] : '=');
+            b64.push_back(i + 2 < sizeof(w) ? kB64[v & 0x3F] : '=');
+        }
+        oss << ",\"witness_b64\":\"" << b64 << "\"";
+        oss << ",\"sender_payload\":\"" << json_escape(
+            std::string(reinterpret_cast<const char*>(tx.sender_nfa), 42)) << "\"";
+        oss << ",\"receiver_payload\":\"" << json_escape(
+            std::string(reinterpret_cast<const char*>(tx.receiver_nfa), 42)) << "\"";
+        oss << ",\"fee\":" << fee << ",\"nonce\":" << nonce
+            << ",\"amount_atomics\":" << amount;
+    }
+    oss << "}";
     return HttpResponse::json(200, oss.str());
 }
 

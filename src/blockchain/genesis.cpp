@@ -4,6 +4,7 @@
 
 #include "vx/blockchain/genesis.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/crypto/pq_signature.hpp"
 #include "vx/math/galois_attractor.hpp"
 
 #include <cstring>
@@ -115,6 +116,108 @@ bool ensure_genesis_file(const std::string& path) {
     if (std::filesystem::exists(path, ec)) return true;
     write_genesis_file(path);
     return true;
+}
+
+// ── PQ seed bindings (BACKLOG 0.7) ───────────────────────────────────────────
+//
+// PUBLIC DEMO SEEDS — published test vectors for the canonical demo run
+// (Address #2 spender, Address #3 receiver), previously local to the demo
+// binary and now protocol constants so every node binds the same demo
+// economy. NEVER use for live keys.
+namespace {
+const std::string& demo_spender_seed() {
+    static const std::string seed =
+        "e76a1d401b5c3b803d9e909a1c7d7b5893f89e991160bfea87d56b9292a9eca5"
+        "a3656ecc660111b16d81d181f69f307b864a76d5411051863d74c41f1c9b8d60"
+        "dd667f204e057ede165edc4dfdfd3ad5d31330f35667412f0a6ff87b16d55256"
+        "0a500902dda48ed0d69b37f28d4f9601a5f10b28ea08510137ccfe6a6b4c96d2"
+        "e99756a88b7b8b2d19253166515de608fb5c75fc44e016aa1b93b2d3fae46985"
+        "fcbc581bebc4292ec095a0a2d7867a14f0554636a3176bcd2e1aa0cb7cdf5490"
+        "7f87113a69b32bfd4e3ab74897dc1af388e09bd6e1dfbd83b1ba63b514fc28b8"
+        "2ac7fcf56593a9078dfec7a09b53ca5db9239cdd03ab9aa1b38d2d721ce5f195";
+    return seed;
+}
+const std::string& demo_receiver_seed() {
+    static const std::string seed =
+        "aa0e37b14c1157a6cfeea4036e82f03958b6be4754e88d7c4817c98933cbb5eb"
+        "39f34b1493cbad810a7275f9f2a3cc36069c725ad8e20b8e031c00faa6e58984"
+        "34cac3a2ab04af9acce52a3e0ee119f78ac2aaf0229955b441296b1bf225e30b"
+        "b32bbe6904952ea8e99a38ec07aeda17a5a203aae0a7f0b56e9946fe28f8ccc7"
+        "21f6104d749ec1c2f55a8851215942d611d952153fb0e1b2e04e93a89aafc423"
+        "2f2971ea1d90abe00e5b86b61561a8adbcb0b6909f4686c033cd7fd73c3eb085"
+        "3131f6c100c7d1820ec87bb05ff14b10058ca58df5ed05fb927ce3af5adc23f6"
+        "1fae0a4a6065aae3d0e56ec008860385b12423b5938c31d84c5399131b6273aa";
+    return seed;
+}
+
+Address address_payload_from_seed(const std::string& seed_hex) {
+    const auto attractor = vx::math::VortexAttractor::run(seed_hex, 1000, true);
+    Address a{};
+    std::memcpy(a.data(), attractor.addressNFA.data() + 7, 42);
+    return a;
+}
+
+std::array<uint8_t, 32> tag_root(const char* tag, size_t len) {
+    std::array<uint8_t, 32> root{};
+    VortexSponge256::compute(reinterpret_cast<const uint8_t*>(tag), len, root.data());
+    return root;
+}
+} // namespace
+
+const std::string& demo_spender_seed_hex() { return demo_spender_seed(); }
+const std::string& demo_receiver_seed_hex() { return demo_receiver_seed(); }
+
+std::string demo_spender_address_nfa() {
+    static const std::string nfa = [] {
+        return vx::math::VortexAttractor::run(demo_spender_seed(), 1000, true).addressNFA;
+    }();
+    return nfa;
+}
+
+std::string demo_receiver_address_nfa() {
+    static const std::string nfa = [] {
+        return vx::math::VortexAttractor::run(demo_receiver_seed(), 1000, true).addressNFA;
+    }();
+    return nfa;
+}
+
+const std::vector<PqSeedBinding>& pq_seed_bindings() {
+    static const std::vector<PqSeedBinding> table = [] {
+        std::vector<PqSeedBinding> v;
+
+        // 1. Genesis receiver: OFFLINE operator key. The root is a protocol
+        // constant derived from a public tag; the secret key is NOT in this
+        // repository. The 2.54M VX faucet stays locked until the operator
+        // spends from it with a real WOTS+/XMSS witness.
+        PqSeedBinding genesis_bind{};
+        genesis_bind.root = tag_root("VX_PQ_GENESIS_OFFLINE_ROOT_V1", 30);
+        const std::string gen_nfa = genesis_coinbase_receiver();
+        std::memcpy(genesis_bind.addr.data(), gen_nfa.data() + 7, 42);
+        v.push_back(genesis_bind);
+
+        // 2. Demo spender (Address #2): bound to the PUBLIC demo spender
+        // key. The demo/testnet key is published test data (the demo signs
+        // with it); the binding exists so the PQ authorization path is
+        // exercised end-to-end by the demo, the RPC and the cookbook.
+        std::array<uint8_t, 32> demo_sk{};
+        VortexSponge256::compute(reinterpret_cast<const uint8_t*>("VX_DEMO_SPENDER_SK_V1"), 21,
+                                 demo_sk.data());
+        PqSeedBinding demo_bind{};
+        demo_bind.root = vx::crypto::pq::xmss_root(demo_sk, vx::crypto::pq::pub_seed_from_sk(demo_sk));
+        demo_bind.addr = address_payload_from_seed(demo_spender_seed());
+        v.push_back(demo_bind);
+
+        // 3. Demo receiver (Address #3): receives only in the demo; bound
+        // to its own offline root so it cannot be spent with the spender's
+        // key.
+        PqSeedBinding recv_bind{};
+        recv_bind.root = tag_root("VX_DEMO_RECEIVER_OFFLINE_ROOT_V1", 31);
+        recv_bind.addr = address_payload_from_seed(demo_receiver_seed());
+        v.push_back(recv_bind);
+
+        return v;
+    }();
+    return table;
 }
 
 } // namespace vx::blockchain

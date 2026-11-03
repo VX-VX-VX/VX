@@ -126,7 +126,7 @@ Total Test time (real) = 4.49 sec
 ```
 
 Structure: **16 test binaries** - 12 gtest-structured suites carrying
-**56 named test cases** (enumerated in 3.3), plus 4 scenario-style mains
+**75 named test cases** (enumerated in 3.3), plus 4 scenario-style mains
 carrying **27 numbered test blocks** (enumerated in 3.4). Total: 83
 discrete test blocks.
 
@@ -151,7 +151,7 @@ discrete test blocks.
 16/16 VortexPqSignatureTest     Passed   3.27 sec
 ```
 
-### 3.3 The 56 named gtest cases (complete enumeration)
+### 3.3 The 75 named gtest cases (complete enumeration)
 
 **VortexSwarmP2PTest** (tests/test_swarm_p2p.cpp, 6 cases)
 
@@ -225,10 +225,11 @@ discrete test blocks.
 | `DandelionTdiSpamAnnihilated` | TDI-rejected spam is annihilated, not relayed |
 | `HamiltonianNeutralizesSandwich` | the Hamiltonian priority penalty makes a sandwich non-profitable in the model |
 
-**VortexGqcRingStealthTest** (tests/test_gqc_ring_stealth.cpp, 5 cases)
+**VortexGqcRingStealthTest** (tests/test_gqc_ring_stealth.cpp, 6 cases)
 
 | Case | Property proven |
 |---|---|
+| `GqcFinalizedReorgBlocked` | a reorg across a GQC-finalized height is refused - finality is durable, not advisory |
 | `GqcFinalizedReorgBlocked` | a finalized checkpoint cannot be reorganized past |
 | `GqcAggregationDeterministic` | GQC vote aggregation is deterministic |
 | `RingPipelineThroughputNoAllocs` | the ring pipeline sustains throughput with zero hot-path allocations |
@@ -268,6 +269,28 @@ discrete test blocks.
 | `VmInfiniteLoopBounded` | a hostile infinite-loop program is bounded by the step limit |
 | `SgmtProofForgeryZeroFalsePositives` | forged SGMT proofs have zero false accepts |
 | `FullChaosRoundInvariants` | a full chaos round keeps every documented invariant |
+
+**VortexDocumentedGapsTest** (tests/test_documented_gaps.cpp, 17 cases)
+
+| Case | Property proven |
+|---|---|
+| `NoWorkBlockAccepted` | FLIPPED to EXPECT_FALSE (BACKLOG 0.9): a structurally valid frame with zero PoGW work is refused by the intake gate |
+| `KeylessTheftRejected` | FLIPPED (BACKLOG 0.7): the reviewer's theft PoC no longer moves anything - the ledger refuses the unwitnessed transfer, nothing is credited |
+| `DoubleSpendInBlockRejected` | two spends by one sender in one block fail with `insufficient funds`, no U128 underflow, no phantom supply |
+| `CoinbaseReplayRejected` | FLIPPED (BACKLOG 0.6 remainder closed): the coinbase tag commits receiver + height + prev tip; the same coinbase bytes in a competing fork frame are refused, the honest coinbase pays the producer |
+| `NonceZeroReplayRejected` | a fee=0/nonce=0 replay outside the genesis window fails with `nonce mismatch` |
+| `OversizedTxCountRejected` | a tx_count=581 frame is refused before anything reads past the frame |
+| `TamperedMerkleRejected` | a forged merkle root is refused by recomputation at the store |
+| `HtlcVmFailureForcesLocked` | HTLC bytecode corrupted after the shape check settles LOCKED, never CLAIMED |
+| `VaultTokenDigestFullyChecked` | a vault token with 28 mutated tail bytes is rejected (full 32-byte digest) |
+| `VaultPoolFullNotClobber` | a full vault pool raises instead of zeroing a live LOCKED page |
+| `TailMetadataCommitted` | the block commitment covers header AND tail - a mutated PoGW nonce changes the hash |
+| `PogwGateAcceptsSealedWorkAndBindsTheNonce` | the gate accepts real sealed work and rejects a one-off nonce mutation of the same frame |
+| `RecoveryRejectsCorruptedLedgerFrame` | a ledger file whose stored frame lost its merkle commitment throws on reopen (fail-closed recovery) |
+| `UnboundSenderRejected` | a valid witness from a key the sender does not own spends nothing - the unbound sender is refused (BACKLOG 0.7) |
+| `WitnessRootMismatchRejected` | a witness whose XMSS root differs from the sender's bound key is refused before any balance check |
+| `SelfCertifyingAddressAutoBinds` | a "PQA" address binds to its key on the first witnessed spend; a foreign key is refused afterwards, the owner keeps spending |
+| `WitnessDurableLogSurvivesRestart` | the `<ledger>.pqw` sidecar fsyncs a VXPQWT1 record per registration and replays it on attach (BACKLOG 0.8) |
 
 ### 3.4 The 27 numbered blocks in the scenario-style mains (complete enumeration)
 **VortexMathTest** (tests/test_vortex.cpp, 6 blocks)
@@ -317,70 +340,281 @@ discrete test blocks.
 | 4 | Frequency (NIST-style) | 100 folded 256-bit digests (25,600 bits): ones 12,828 / zeros 12,772, S_obs 0.350, **p-value 0.726** (alpha 0.01) |
 | 5 | All suites | all 5 cryptographic suites passed |
 
-### 3.5 Real per-case timings (all 56 gtest cases, captured output)
+### 3.5 Real per-case timings (all 75 gtest cases, captured output)
 
 Reproduce: `cd build && for b in test_mempool test_galois_trie
 test_swarm_p2p test_reorg test_vault_memory test_vault_htlc test_vm
 test_landauer_vm_mev test_gqc_ring_stealth test_tensor_v6 test_zk_matrix
-test_chaos_fuzzer; do ./$b; done`
+test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 
 ```
+[==========] Running 2 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 2 tests from VortexMempoolTest
+[ RUN      ] VortexMempoolTest.StaticAssertGeometry
 [       OK ] VortexMempoolTest.StaticAssertGeometry (0 ms)
-[       OK ] VortexMempoolTest.MempoolConstruction (1 ms)
-[       OK ] VortexGaloisTrieTest.Insert100KeysDeterministicRoot (6 ms)
+[ RUN      ] VortexMempoolTest.MempoolConstruction
+[       OK ] VortexMempoolTest.MempoolConstruction (0 ms)
+[----------] 2 tests from VortexMempoolTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 2 tests from 1 test suite ran. (0 ms total)
+[  PASSED  ] 2 tests.
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from VortexGaloisTrieTest
+[ RUN      ] VortexGaloisTrieTest.Insert100KeysDeterministicRoot
+[       OK ] VortexGaloisTrieTest.Insert100KeysDeterministicRoot (7 ms)
+[ RUN      ] VortexGaloisTrieTest.GetRoundTripAndAbsentKeys
 [       OK ] VortexGaloisTrieTest.GetRoundTripAndAbsentKeys (0 ms)
+[ RUN      ] VortexGaloisTrieTest.ProofGenerateVerifyUnder2048Bytes
 [       OK ] VortexGaloisTrieTest.ProofGenerateVerifyUnder2048Bytes (2 ms)
-[       OK ] VortexGaloisTrieTest.TamperedProofOrValueFailsVerification (1 ms)
+[ RUN      ] VortexGaloisTrieTest.TamperedProofOrValueFailsVerification
+[       OK ] VortexGaloisTrieTest.TamperedProofOrValueFailsVerification (0 ms)
+[----------] 4 tests from VortexGaloisTrieTest (10 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 1 test suite ran. (10 ms total)
+[  PASSED  ] 4 tests.
+[==========] Running 6 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 6 tests from VortexSwarmP2PTest
+[ RUN      ] VortexSwarmP2PTest.WireHeaderIsExactly24Bytes
 [       OK ] VortexSwarmP2PTest.WireHeaderIsExactly24Bytes (0 ms)
+[ RUN      ] VortexSwarmP2PTest.CorruptedPacketDroppedByCrc32c
 [       OK ] VortexSwarmP2PTest.CorruptedPacketDroppedByCrc32c (0 ms)
+[ RUN      ] VortexSwarmP2PTest.RecvPacketRejectsSingleBitFlip
 [       OK ] VortexSwarmP2PTest.RecvPacketRejectsSingleBitFlip (0 ms)
+[ RUN      ] VortexSwarmP2PTest.FullBlockRoundTripOverTcp
 [       OK ] VortexSwarmP2PTest.FullBlockRoundTripOverTcp (0 ms)
-[       OK ] VortexSwarmP2PTest.SplitBrainReorgConverges (81 ms)
+[ RUN      ] VortexSwarmP2PTest.SplitBrainReorgConverges
+[       OK ] VortexSwarmP2PTest.SplitBrainReorgConverges (103 ms)
+[ RUN      ] VortexSwarmP2PTest.ListenerRelaysVerifiedFrameToHook
 [       OK ] VortexSwarmP2PTest.ListenerRelaysVerifiedFrameToHook (100 ms)
+[----------] 6 tests from VortexSwarmP2PTest (204 ms total)
+
+[----------] Global test environment tear-down
+[==========] 6 tests from 1 test suite ran. (204 ms total)
+[  PASSED  ] 6 tests.
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from VortexChainReorgTest
+[ RUN      ] VortexChainReorgTest.EmergencyStop
 [       OK ] VortexChainReorgTest.EmergencyStop (0 ms)
-[       OK ] VortexVaultMemoryTest.PageStateTransitionsAndBurning (4 ms)
+[----------] 1 test from VortexChainReorgTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 1 test.
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from VortexVaultMemoryTest
+[ RUN      ] VortexVaultMemoryTest.PageStateTransitionsAndBurning
+[       OK ] VortexVaultMemoryTest.PageStateTransitionsAndBurning (3 ms)
+[ RUN      ] VortexVaultMemoryTest.HardwareUuidBindingSeed
 [       OK ] VortexVaultMemoryTest.HardwareUuidBindingSeed (0 ms)
-[       OK ] VortexVaultMemoryTest.EmergencyBurnAll (3 ms)
+[ RUN      ] VortexVaultMemoryTest.EmergencyBurnAll
+[       OK ] VortexVaultMemoryTest.EmergencyBurnAll (2 ms)
+[ RUN      ] VortexVaultMemoryTest.RegisterScrubbing
 [       OK ] VortexVaultMemoryTest.RegisterScrubbing (0 ms)
+[----------] 4 tests from VortexVaultMemoryTest (6 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 1 test suite ran. (6 ms total)
+[  PASSED  ] 4 tests.
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from VortexVaultHtlcTest
+[ RUN      ] VortexVaultHtlcTest.EphemeralSignBurnsPage
 [       OK ] VortexVaultHtlcTest.EphemeralSignBurnsPage (2 ms)
+[ RUN      ] VortexVaultHtlcTest.HtlcClaimBeforeTimelock
 [       OK ] VortexVaultHtlcTest.HtlcClaimBeforeTimelock (0 ms)
+[ RUN      ] VortexVaultHtlcTest.HtlcRefundAfterTimelock
 [       OK ] VortexVaultHtlcTest.HtlcRefundAfterTimelock (0 ms)
+[ RUN      ] VortexVaultHtlcTest.HtlcLockedOnWrongPreimage
 [       OK ] VortexVaultHtlcTest.HtlcLockedOnWrongPreimage (0 ms)
+[----------] 4 tests from VortexVaultHtlcTest (2 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 1 test suite ran. (2 ms total)
+[  PASSED  ] 4 tests.
+[==========] Running 5 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 5 tests from VortexVMTest
+[ RUN      ] VortexVMTest.AssembleDisassembleLimits
 [       OK ] VortexVMTest.AssembleDisassembleLimits (0 ms)
+[ RUN      ] VortexVMTest.BasicArithmeticOps
 [       OK ] VortexVMTest.BasicArithmeticOps (0 ms)
+[ RUN      ] VortexVMTest.LogicalOps
 [       OK ] VortexVMTest.LogicalOps (0 ms)
+[ RUN      ] VortexVMTest.CryptoOps
 [       OK ] VortexVMTest.CryptoOps (0 ms)
+[ RUN      ] VortexVMTest.StateRootGeneration
 [       OK ] VortexVMTest.StateRootGeneration (0 ms)
+[----------] 5 tests from VortexVMTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 5 tests from 1 test suite ran. (0 ms total)
+[  PASSED  ] 5 tests.
+[==========] Running 6 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 6 tests from VortexLandauerMevTest
+[ RUN      ] VortexLandauerMevTest.AssembleWithLabelsTwoPass
 [       OK ] VortexLandauerMevTest.AssembleWithLabelsTwoPass (0 ms)
+[ RUN      ] VortexLandauerMevTest.LandauerFormulaExactness
 [       OK ] VortexLandauerMevTest.LandauerFormulaExactness (0 ms)
+[ RUN      ] VortexLandauerMevTest.NewOpcodesGaloisMulSolinasStackOps
 [       OK ] VortexLandauerMevTest.NewOpcodesGaloisMulSolinasStackOps (0 ms)
+[ RUN      ] VortexLandauerMevTest.DandelionStemToFluffCycle
 [       OK ] VortexLandauerMevTest.DandelionStemToFluffCycle (0 ms)
+[ RUN      ] VortexLandauerMevTest.DandelionTdiSpamAnnihilated
 [       OK ] VortexLandauerMevTest.DandelionTdiSpamAnnihilated (0 ms)
+[ RUN      ] VortexLandauerMevTest.HamiltonianNeutralizesSandwich
 [       OK ] VortexLandauerMevTest.HamiltonianNeutralizesSandwich (0 ms)
-[       OK ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked (0 ms)
+[----------] 6 tests from VortexLandauerMevTest (1 ms total)
+
+[----------] Global test environment tear-down
+[==========] 6 tests from 1 test suite ran. (1 ms total)
+[  PASSED  ] 6 tests.
+[==========] Running 6 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 6 tests from VortexGqcRingStealthTest
+[ RUN      ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked
+[       OK ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked (19 ms)
+[ RUN      ] VortexGqcRingStealthTest.GqcQuorumForgeableFromPublicDataOnly
+  [documented gap] GQC quorum forged from public data only: 9/9 shares, zero secrets used. Validator authentication is a BACKLOG 0.4/2.4 item; until then cryptographic finality is NOT claimed.
+[       OK ] VortexGqcRingStealthTest.GqcQuorumForgeableFromPublicDataOnly (0 ms)
+[ RUN      ] VortexGqcRingStealthTest.GqcAggregationDeterministic
 [       OK ] VortexGqcRingStealthTest.GqcAggregationDeterministic (0 ms)
-[       OK ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs (2 ms)
+[ RUN      ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs
+[       OK ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs (3 ms)
+[ RUN      ] VortexGqcRingStealthTest.RingPipelineWrapAround
 [       OK ] VortexGqcRingStealthTest.RingPipelineWrapAround (2 ms)
+[ RUN      ] VortexGqcRingStealthTest.StealthEnvelopeOneOfSixteen
 [       OK ] VortexGqcRingStealthTest.StealthEnvelopeOneOfSixteen (0 ms)
-[       OK ] VortexTensorV6Test.FastReducerAndSacEvaluation (4 ms)
+[----------] 6 tests from VortexGqcRingStealthTest (24 ms total)
+
+[----------] Global test environment tear-down
+[==========] 6 tests from 1 test suite ran. (24 ms total)
+[  PASSED  ] 6 tests.
+[==========] Running 4 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 4 tests from VortexTensorV6Test
+[ RUN      ] VortexTensorV6Test.FastReducerAndSacEvaluation
+[       OK ] VortexTensorV6Test.FastReducerAndSacEvaluation (3 ms)
+[ RUN      ] VortexTensorV6Test.MultiTensorV6Pipeline
 [       OK ] VortexTensorV6Test.MultiTensorV6Pipeline (0 ms)
+[ RUN      ] VortexTensorV6Test.TensorNoZeroCollapse
 [       OK ] VortexTensorV6Test.TensorNoZeroCollapse (0 ms)
+[ RUN      ] VortexTensorV6Test.VirtualTensorEvolution
 [       OK ] VortexTensorV6Test.VirtualTensorEvolution (0 ms)
+[----------] 4 tests from VortexTensorV6Test (3 ms total)
+
+[----------] Global test environment tear-down
+[==========] 4 tests from 1 test suite ran. (3 ms total)
+[  PASSED  ] 4 tests.
+[==========] Running 9 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 9 tests from VortexZkKeyMatrixTest
+[ RUN      ] VortexZkKeyMatrixTest.DeriveAll7KeyTiers
 [       OK ] VortexZkKeyMatrixTest.DeriveAll7KeyTiers (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.All7KeysArePairwiseDistinct
 [       OK ] VortexZkKeyMatrixTest.All7KeysArePairwiseDistinct (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.ShamirSecretSharingRecovery
 [       OK ] VortexZkKeyMatrixTest.ShamirSecretSharingRecovery (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.ShamirAll32BytesComputed
 [       OK ] VortexZkKeyMatrixTest.ShamirAll32BytesComputed (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.ProofOfLifeAndAuditView
 [       OK ] VortexZkKeyMatrixTest.ProofOfLifeAndAuditView (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.ForgedProofHashReturnsFalse
 [       OK ] VortexZkKeyMatrixTest.ForgedProofHashReturnsFalse (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.AuditViewRejectsZeroKey
 [       OK ] VortexZkKeyMatrixTest.AuditViewRejectsZeroKey (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.ProofOfLifeTimeWindow
 [       OK ] VortexZkKeyMatrixTest.ProofOfLifeTimeWindow (0 ms)
+[ RUN      ] VortexZkKeyMatrixTest.ShamirThreshold3
 [       OK ] VortexZkKeyMatrixTest.ShamirThreshold3 (0 ms)
-[       OK ] VortexChaosFuzzerTest.WireHeaderChaos10k (276 ms)
-[       OK ] VortexChaosFuzzerTest.FrameTxChaos10k (275 ms)
-[       OK ] VortexChaosFuzzerTest.VmBytecodeChaos10k (271 ms)
+[----------] 9 tests from VortexZkKeyMatrixTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 9 tests from 1 test suite ran. (0 ms total)
+[  PASSED  ] 9 tests.
+[==========] Running 6 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 6 tests from VortexChaosFuzzerTest
+[ RUN      ] VortexChaosFuzzerTest.WireHeaderChaos10k
+[       OK ] VortexChaosFuzzerTest.WireHeaderChaos10k (297 ms)
+[ RUN      ] VortexChaosFuzzerTest.FrameTxChaos10k
+[       OK ] VortexChaosFuzzerTest.FrameTxChaos10k (296 ms)
+[ RUN      ] VortexChaosFuzzerTest.VmBytecodeChaos10k
+[       OK ] VortexChaosFuzzerTest.VmBytecodeChaos10k (292 ms)
+[ RUN      ] VortexChaosFuzzerTest.VmInfiniteLoopBounded
 [       OK ] VortexChaosFuzzerTest.VmInfiniteLoopBounded (2 ms)
-[       OK ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives (271 ms)
-[       OK ] VortexChaosFuzzerTest.FullChaosRoundInvariants (274 ms)
+[ RUN      ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives
+[       OK ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives (293 ms)
+[ RUN      ] VortexChaosFuzzerTest.FullChaosRoundInvariants
+[       OK ] VortexChaosFuzzerTest.FullChaosRoundInvariants (290 ms)
+[----------] 6 tests from VortexChaosFuzzerTest (1472 ms total)
+
+[----------] Global test environment tear-down
+[==========] 6 tests from 1 test suite ran. (1472 ms total)
+[  PASSED  ] 6 tests.
+[==========] Running 18 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 18 tests from VortexDocumentedGapsTest
+[ RUN      ] VortexDocumentedGapsTest.NoWorkBlockAccepted
+[       OK ] VortexDocumentedGapsTest.NoWorkBlockAccepted (18 ms)
+[ RUN      ] VortexDocumentedGapsTest.KeylessTheftRejected
+  [closed] keyless theft rejected: the genesis receiver is PQ-bound to an OFFLINE key (secret not in the repo) and no witness exists for the forged transfer (BACKLOG 0.7).
+[       OK ] VortexDocumentedGapsTest.KeylessTheftRejected (30 ms)
+[ RUN      ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected
+  [fixed] intra-block double spend rejected with 'insufficient funds'; no U128 underflow, no phantom balance.
+[       OK ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected (167 ms)
+[ RUN      ] VortexDocumentedGapsTest.CoinbaseReplayRejected
+  [closed] coinbase bound to the chain position: replaying the tag on a competing fork is refused; the honest coinbase pays the producer (BACKLOG 0.6 remainder).
+[       OK ] VortexDocumentedGapsTest.CoinbaseReplayRejected (75 ms)
+[ RUN      ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected
+  [closed] one GENESIS mint per block in the legacy window: the second mint is refused and the block applies nothing.
+[       OK ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected (18 ms)
+[ RUN      ] VortexDocumentedGapsTest.NonceZeroReplayRejected
+  [fixed] fee=0/nonce=0 replay at height 3 rejected with 'nonce mismatch' - the legacy exemption is scoped to the genesis window.
+[       OK ] VortexDocumentedGapsTest.NonceZeroReplayRejected (160 ms)
+[ RUN      ] VortexDocumentedGapsTest.OversizedTxCountRejected
+[       OK ] VortexDocumentedGapsTest.OversizedTxCountRejected (14 ms)
+[ RUN      ] VortexDocumentedGapsTest.TamperedMerkleRejected
+[       OK ] VortexDocumentedGapsTest.TamperedMerkleRejected (38 ms)
+[ RUN      ] VortexDocumentedGapsTest.HtlcVmFailureForcesLocked
+  [fixed] HTLC with a runtime-corrupted opcode settles LOCKED; the VM verdict gates the contract outcome.
+[       OK ] VortexDocumentedGapsTest.HtlcVmFailureForcesLocked (0 ms)
+[ RUN      ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked
+  [fixed] vault token with 28 mutated tail bytes is rejected; the full 32-byte digest is checked.
+[       OK ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked (2 ms)
+[ RUN      ] VortexDocumentedGapsTest.VaultPoolFullNotClobber
+  [fixed] full vault pool refuses instead of zeroing a live LOCKED page; both tokens survive.
+[       OK ] VortexDocumentedGapsTest.VaultPoolFullNotClobber (0 ms)
+[ RUN      ] VortexDocumentedGapsTest.TailMetadataCommitted
+[       OK ] VortexDocumentedGapsTest.TailMetadataCommitted (0 ms)
+[ RUN      ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce
+[       OK ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce (315 ms)
+[ RUN      ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame
+[       OK ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame (23 ms)
+[ RUN      ] VortexDocumentedGapsTest.UnboundSenderRejected
+  [closed] a valid witness from an UNBOUND key spends nothing: the sender address commits no PQ root (BACKLOG 0.7).
+[       OK ] VortexDocumentedGapsTest.UnboundSenderRejected (42 ms)
+[ RUN      ] VortexDocumentedGapsTest.WitnessRootMismatchRejected
+  [closed] a witness whose XMSS root differs from the sender's bound key is refused before any balance check (BACKLOG 0.7).
+[       OK ] VortexDocumentedGapsTest.WitnessRootMismatchRejected (50 ms)
+[ RUN      ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds
+  [closed] self-certifying address: first witnessed spend binds it to its key; a foreign key is refused, the owner keeps spending (BACKLOG 0.7).
+[       OK ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds (265 ms)
+[ RUN      ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart
+  [closed] durable witness sidecar: registration fsyncs a VXPQWT1 record and a restart replays it (BACKLOG 0.8).
+[       OK ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart (32 ms)
+[----------] 18 tests from VortexDocumentedGapsTest (1256 ms total)
+
+[----------] Global test environment tear-down
+[==========] 18 tests from 1 test suite ran. (1256 ms total)
+[  PASSED  ] 18 tests.
 ```
 
 Timing facts worth noting (not benchmark claims, just this CPU):
@@ -532,7 +766,10 @@ bodies, which is exactly what the findings table in 5.1 targeted.
 cmake --build build -j && scripts/multi_node_test.sh build
 ```
 
-Recorded output (2026-11-02, all three nodes real processes on one host):
+Recorded output (2026-11-03, round 9; all three nodes real processes on
+one host; the transfer is now PQ-witnessed end-to-end — the harness asks
+the demo signer for a witness bound to the public demo spender key and
+posts it to /api/transfer itself):
 
 ```
 [1/5] Minting the demo chain once, then snapshotting it to all nodes
@@ -540,11 +777,11 @@ Recorded output (2026-11-02, all three nodes real processes on one host):
   [PASS] RPC :18088 is up
   [PASS] RPC :18089 is up
   [PASS] RPC :18090 is up
-[3/5] Transfer on A must propagate over VX60 to B and C
+[3/5] PQ-witnessed transfer on A must propagate over VX60 to B and C
   [PASS] tip on A matches the transfer block
   [PASS] tip on B matches A
   [PASS] tip on C matches A
-  [PASS] sender balance on B is 74993 VX
+  [PASS] sender balance on B is 74992.99999800 VX
 [4/5] Garbage packets are counted as corrupted; the node stays alive
   [PASS] corruption counter rose (0 -> 10)
   [PASS] node A still serving after garbage
@@ -554,14 +791,22 @@ Recorded output (2026-11-02, all three nodes real processes on one host):
 === 10 passed, 0 failed ===
 ```
 
-What each PASS means in protocol terms: a transfer minted on the hub was
-relayed as a RAW_BLOCK_64K frame, CRC32C-verified, tip-extension-checked
-(height == chain_height && prev_block_hash == tip), applied through the
-same `apply_block` path local transfers use, re-broadcast one hop, and
-both spokes ended on the identical tip hash and balances. 10 deliberately
-malformed packets were counted (`corrupted_packets_dropped`) and the node
-kept serving. The reorg demo heals a partition through real VX60 loopback
-TCP with O(1) undo rollback.
+(The 2026-11-02 run of the same script passed 10/10 with the then-current
+keyless transfer shape; the round-7 authorization rewrite made that shape
+unacceptable, so the harness itself was migrated to the witnessed flow —
+the balance expectation moved by the two 100-atom fees the demo and the
+transfer now pay.)
+
+What each PASS means in protocol terms: a transfer signed with the demo
+spender's post-quantum key was relayed as a RAW_BLOCK_64K frame,
+CRC32C-verified, tip-extension-checked
+(height == chain_height && prev_block_hash == tip), authorized through
+the full WOTS+/XMSS witness path on every receiving node, applied through
+the same `apply_block` path local transfers use, re-broadcast one hop,
+and both spokes ended on the identical tip hash and balances. 10
+deliberately malformed packets were counted (`corrupted_packets_dropped`)
+and the node kept serving. The reorg demo heals a partition through real
+VX60 loopback TCP with O(1) undo rollback.
 
 Beyond the script, 9 hand-run scenarios are recorded with results in
 [MULTI_NODE_RUNBOOK.md](MULTI_NODE_RUNBOOK.md) (sequential-transfer
@@ -1088,10 +1333,15 @@ Notes on fidelity:
 | `c1d6230` | PqLeafLedger: durable one-time-leaf lifecycle, per-call leaf reporting, TEST 8 |
 | `f55fbd1` | External-review finding, fixed at HEAD: synthetic ring decoys read 35 bytes from a 32-byte buffer (3 trailing decoy bytes were adjacent stack garbage). Whole-repo `-Warray-bounds` scan after the fix: zero hits |
 | (review round 2) | Confirmed in code and closed honestly: **XMSS subtree guard** — nonces above 15 refused before any leaf burn (TEST 9: 0/15 verify, 16/17/255/2^32-1 refuse, exactly 2 leaves consumed); **GQC share forgery pinned** — new test `GqcQuorumForgeableFromPublicDataOnly` forges a 9/9 quorum with zero secrets and asserts the attack SUCCEEDS (documents the gap until validator auth, BACKLOG 0.4/2.4); **PoGW honestly renamed** — record and README now state the acceptance criterion is hash-based (leading zero bits) and difficulty is not anchor-based yet |
-| (review round 3) | The reviewer built and ran a node. **Fixed:** intra-block double spend minted a ~2^128 phantom balance (checked per-sender intra-block debits + commit-time underflow guard + checked `total_supply()`; regression `DoubleSpendInBlockRejected`); mempool validate-vs-reserve TOCTOU (one critical section); `append_block` now fails on `fsync` error; `MemoryCore` no longer throws on `mlock` failure (documented degradation, node launches in 8 MiB-RLIMIT containers). **Pinned as expect-success tests:** keyless transaction authorization (theft of 1 VX from the genesis receiver with zero secrets — `KeylessTheftReproducible`, BACKLOG 0.7/0.8) and no-work block acceptance (`NoWorkBlockAccepted`, BACKLOG 0.6/0.9). **Rejected as stale:** "P2P never starts" — true only in the reviewer's Nov-1 snapshot; current `http_server.cpp` binds and starts the swarm node (live 3-node testnet proves it) |
+| (review round 3) | The reviewer built and ran a node. **Fixed:** intra-block double spend minted a ~2^128 phantom balance (checked per-sender intra-block debits + commit-time underflow guard + checked `total_supply()`; regression `DoubleSpendInBlockRejected`); mempool validate-vs-reserve TOCTOU (one critical section); `append_block` now fails on `fsync` error; `MemoryCore` no longer throws on `mlock` failure (documented degradation, node launches in 8 MiB-RLIMIT containers). **Pinned as expect-success tests:** keyless transaction authorization (theft of 1 VX from the genesis receiver with zero secrets — `KeylessTheftReproducible`, BACKLOG 0.7/0.8; FLIPPED 2026-11-03, round 7 below) and no-work block acceptance (`NoWorkBlockAccepted`, BACKLOG 0.6/0.9; flipped 2026-11-03, round 6). **Rejected as stale:** "P2P never starts" — true only in the reviewer's Nov-1 snapshot; current `http_server.cpp` binds and starts the swarm node (live 3-node testnet proves it) |
 | (review round 4) | The reviewer's verdict: NOT READY FOR MAINNET; freeze features, security-fix stage. **Fixed:** genesis-v1 nonce bypass scoped to the genesis replay window (`next_height <= 1`; regression `NonceZeroReplayRejected` — a fee=0/nonce=0 replay at height 3 now fails with `nonce mismatch`); `append_block` gates tx_count past the structural capacity and re-verifies the merkle root (regressions `OversizedTxCountRejected`, `TamperedMerkleRejected` — a forged root or a 581-tx_count frame can no longer enter the ledger file); the miner checks append/apply results and keeps sealed transactions on rejection instead of draining the mempool; GQC share pools keyed by (height, block hash) so votes for different blocks at one height cannot mix, and a failed tail stamp now blocks certification (`stamp_gqc_into_tail` returns bool); the RPC transfer endpoint stamps fee/nonce server-side. **Pinned as expect-success tests:** MINER_ coinbase emission without mining work or identity (`MinerEmissionForgeable` — 1000 VX mint SUCCEEDS today; BACKLOG 0.6/0.9). **Pinned in BACKLOG as P0:** undo journal serializes heap pointers via raw `write(fd, &record, sizeof(record))` (0.11); reorg undo journals the displaced block from the wrong side of the truncation and never restores sender nonces (0.12); GQC finalized checkpoint is RAM-only and evaporates on restart (0.13); mempool global fee sort can invert per-sender nonce order and `count_` is published before the entry write (0.14). Test suite: 17/17 on both the GCC and the ASan+UBSan lanes |
 | (review round 5) | Ten more findings (10-19), verified against current main one by one. **Fixed:** (10, P0) `POST /api/vault/action` called `emergency_burn_all()` for BOTH `consume` and `emergency_burn` — any RPC client could wipe the whole vault; now `consume` burns exactly one page identified by its full capability token and `emergency_burn` answers 403 (admin-only, in-process); (11) the HTLC settle outcome was decided BEFORE the VM ran, so bytecode corrupted after the shape check still settled CLAIMED — the VM verdict (success, cycles, branch marker) now gates the outcome to LOCKED (regression `HtlcVmFailureForcesLocked`); (12) the GQC aggregate was stamped into frame bytes 65464..65495, physically overwriting `vm_gas_used`, `pogw_nonce` and half of `vm_bytecode` — the stamp moved to a versioned sidecar record (`<ledger>.gqc`, fail-closed reads), the certified frame stays byte-identical, and tail offsets are now static_asserted; (13) the vault ring cursor silently zeroed a still-LOCKED page on pool wrap — a full pool now raises instead of clobbering (`VaultPoolFullNotClobber`); (14) the vault capability token stored and compared only its first 4 bytes and was generated from CRC32C — now a full 32-byte VortexSponge256 digest, constant-time compared (`VaultTokenDigestFullyChecked`); (16) the block id committed only the 472-byte header, leaving vm_state_root/gas/PoGW nonce/bytecode outside the commitment — `hash_block` now commits header AND tail, `tip_hash` and the RPC block-hash fields use it, and the published genesis constant was recomputed (`ff327c33...` -> `485f5afa...`) across whitepaper/Challenge/cookbook/evidence; (17) SSE threads leaked forever (MSG_PEEK never consumed the request, EOF never surfaced) — handshake drained, poll-based wait. **Verified stale (already fixed in main before this round):** (15) WOTS+ one-time-leaf reuse — the reviewer's own suspicion was right: `PqLeafLedger::reserve` (commit c1d6230) already assigns the lowest free leaf, refuses reuse, survives restart and fails closed on a tampered log; TEST 8 covers exactly the regression battery they asked for. **Documented/pinned:** (18) demo fixture keys over RPC (`/api/crypto/canonical` private keys, `/api/crypto/pq_sign` demo seed) — BACKLOG 0.10, compile-demo-out plan; (19) src/core `MemoryCore` states its real guarantee (mlock = swap/core-dump hygiene, NOT anti-ptrace; `check_debugger` not yet wired) in the record. **Reviewer's meta-note accepted:** their snapshot lacked some test binaries, so their PoCs ran standalone against libvx_core.a — every confirmed PoC is now an automated ctest case that fails on the old code and passes on main. Suite: 17/17 on GCC and ASan+UBSan lanes |
 | (2026-11-03, round 6) | BACKLOG 0.9 + 0.6 closed: a single intake gate. `blockchain::validate_block()` (magic, height/prev binding, tx_count bound, merkle commitment recomputed from the body, timestamp monotonicity + 300 s future bound, PoGW full-frame work) now runs at the ONE chokepoint every producer appends through (`BlockStore::append_block`): the RPC transfer/mine path, P2P `apply_remote_frame` and the background miner. The work check is one shared comparator (`pogw_meets_target`) used by both the miner's search and the gate, so the definition of "enough work" cannot drift; producers outside the miner (RPC transfer, demo) seal via `seal_pogw_nonce` — the transfer endpoint now takes a few seconds at dev difficulty (16 leading zero bits, ~120 µs per 64 KiB hash). The miner aims at max(ASERT, gate) so its search can never sit below the gate. The restart/recovery path re-validates every stored frame (magic, height, tx_count, merkle) in `validate_region` and fails closed on a poisoned ledger file. Pin flipped: `NoWorkBlockAccepted` -> EXPECT_FALSE (an otherwise-valid frame with no PoGW nonce is rejected with "insufficient PoGW work for the current difficulty"; the chain height does not move). New regressions: `PogwGateAcceptsSealedWorkAndBindsTheNonce` (difficulty-12 store: sealed frame appended, one-off nonce mutation of the same frame rejected), `RecoveryRejectsCorruptedLedgerFrame` (a ledger whose stored frame lost its merkle commitment throws on reopen). `fuzz_block_frame` now drives the gate surface (mirrored height/prev, input-derived work target) — 188k runs clean in a 30 s smoke. Sim/testnet stores instantiate with the difficulty they simulate (1-8 bits); the swarm sim timestamps moved to >= the genesis timestamp for intake monotonicity. Suite: 17/17 on GCC and ASan+UBSan lanes |
+| (2026-11-03, round 7) | BACKLOG 0.7 + 0.8 closed: post-quantum transaction authorization. (1) Addresses are bound to PQ keys through two sources with no trusted registration table: self-certifying addresses — the payload is "PQA" + 39 base64url chars of Sponge("VXPQADDRV1" || pq_pubkey_root), so holding the XMSS key IS holding the address, and the first witnessed spend binds it in ledger state — and a protocol seed table (genesis.hpp pq_seed_bindings) for genesis-era allocations: the canonical genesis receiver is bound to an OFFLINE root whose secret is NOT in the repo (the reviewer's theft PoC target is now unspendable), the demo spender to the public documented demo key, the demo receiver to an offline root. Genesis frame and hash are unchanged. (2) The keyless Tier-2 digest is removed from consensus acceptance: the ledger refuses every user sender without a valid PqSignatureWitness (registry lookup by tx_msg_digest, root-binding check, full WOTS+/XMSS + SegPQ-anchor verification); the digest survives only as an admission pre-filter and for the guarded system senders (GENESIS*, MINER_). (3) The demo RPC no longer signs on the user's behalf: POST /transfer requires witness_b64 (2376-byte witness, base64), fee_atoms and nonce from the client; the server rebuilds the tx anchor from the witness (pq_set_transaction_anchor) and stamps nothing into the signed material. (4) Witnesses travel: WireMsgType::PQ_WITNESS (0x09) = digest(32)+sender(42)+witness(2376), broadcast BEFORE the block that carries the transactions (both the transfer/mine path and P2P relay), so a peer can authorize a block it receives; receivers register into PqWitnessRegistry. (5) Durable sidecar <ledger>.pqw: append-only VXPQWT1 records (8+32+42+2376 = 2458 B), fsync'd per registration, replayed fail-closed on attach — a restart no longer orphans witnessed transactions. Pin flipped: KeylessTheftReproducible -> KeylessTheftRejected (the forged transfer is refused with "no PQ witness registered"; the victim keeps every atom). New regressions: UnboundSenderRejected, WitnessRootMismatchRejected, SelfCertifyingAddressAutoBinds, WitnessDurableLogSurvivesRestart. Honest remainders (BACKLOG 0.7): root rotation not implemented; 16-leaf XMSS capacity bounds a key to 16 spends (rollover = new address); the mempool still admits by the legacy pre-filter — the ledger remains the consensus authority. Same wave, BACKLOG 0.6 remainder closed: the MINER_ coinbase is bound to its chain position — cocoon_proof must equal trunc12(Sponge("VX_COINBASE_BIND_V1" || receiver || height || prev_tip_hash)), verified against the frame's own header in apply_block; the keyless digest no longer authorizes emissions and a coinbase copied from one fork cannot be replayed on a competing fork at the same height. Emission is bounded by: one coinbase per block (index 0), the 1000 VX cap, real PoGW work on the block, the chain-position binding; pin MinerEmissionForgeable -> CoinbaseReplayRejected (the replay of the same coinbase bytes in a fork frame with a fabricated prev tip is refused with "coinbase is not bound to this chain position", the honest coinbase pays the producer; /api/accounts now exposes next_nonce_atomics so a client can build the signed preimage). Suite: 17/17 on GCC, ASan+UBSan and fuzz lanes; demo end-to-end passes with the PQ-signed transfer; fuzz smokes clean (120k block-frame, 60k PQ-witness, 30k RPC, 60k wire)
+
+| (2026-11-03, round 8, self-review) | Adversarial hardening of the round-7 code (internal pass — findings fixed by our own audit, not externally replicated; full narrative in VERIFICATION_RECORD §6, round 8). (1) P0: the VX60 plausibility gate still stopped at 0x08, dead-coding `PQ_WITNESS` (0x09) — witnesses could never arrive over the wire; gate widened to 0x01..0x09. (2) P0: the RPC transfer path registered an UNVERIFIED witness and left the block store one block ahead of the ledger whenever the state layer refused a gate-passed block (every later block then fails the height gate — a permanent wedge). Fixed: verify the full WOTS+/XMSS + anchor chain BEFORE registering; new `BlockStore::rollback_last_append()` (ftruncate to the previous tip) wired into the RPC path, the remote-frame path and the miner; the miner no longer applies a frame that failed to append. (3) P1: the witness registry hardened into a verified cache — nothing enters unverified, byte-exact dedup, caps 8 candidates/digest and 50000 digests, sidecar opened O_APPEND 0600 under exclusive flock with memory-only fallback, fail-closed replay honoring the caps, and consensus switched to `lookup_verifying()` (a digest may hold attacker candidates that simply do not verify against the honest transaction). (4) P2: self-certifying PQ bindings are now transactional — collected during validation, applied only after the whole block validates. (5) P2 (found live): the RPC JSON scanner matched only compact JSON, so standard serializers got a misleading "witness required" error, and one `recv()` was treated as one request, truncating split ~3.2 KB witness bodies; now whitespace-tolerant extraction + read-until-Content-Length (64 KiB cap). Live re-verified: garbage 2376-byte witness refused with the WOTS+/XMSS diagnostic and never registered; wrong-nonce diagnostic exact; failed transfers leave balances byte-identical; compact and spaced JSON behave identically. Suite: 17/17 on GCC, ASan+UBSan and fuzz lanes after every fix; fuzz smokes clean.
+
+| (2026-11-03, round 9, delegated audit) | Three hunt-fix-re-hunt cycles over the full tree; every finding proven with an executable exploit before the fix (record in VERIFICATION_RECORD §6, round 9). Fixed: health-loop self-deadlock on the DoS-ban path (one bad-magic frame from any local process froze the whole node — remotely triggerable P0); unbounded GENESIS minting inside one height-1 block (the legacy window read committed balances, so N mints in one block all applied — P0, regression `SecondGenesisMintInBlockRejected`); unbounded blocking sends under the state/peer locks (5 s SO_SNDTIMEO on every socket); double-close fd-reuse race on banned peers (proven with an LD_PRELOAD close-generation tracker: 41 double-closes before, 0 after); unbounded remote memory growth via /api/state/prove (persistent trie stayed read-only, ~32 arena nodes/request growth eliminated); UB float→integer casts on RPC numbers. Report-only with reasons: dormant miner's unsynchronized commit, mempool races behind a zero-caller submit, undo journal raw writes (BACKLOG 0.11), broadcast fd snapshots (receiver fails closed), 0.0.0.0 bind. Same wave: the multi-node harness now drives a real PQ-witnessed transfer through the demo signer (`demo_key:"spender"` + named tx fields + witness_b64) — 10/10 including tip and balance convergence on B and C with post-quantum authorization on every node; the demo signer returns the witness IT just signed (out-parameter on pq_sign_transaction — the registry may hold several valid candidates per digest); fuzz_pq_witness deepened to targeted mutations of a structurally valid witness (cov 2 -> 25, ~245k runs clean). Suite after every fix: 17/17 on GCC, ASan+UBSan and fuzz lanes.
 
 Every commit above is GPG-signed locally and **not pushed** at the time
 of signing this document; the push decision stays with the repository

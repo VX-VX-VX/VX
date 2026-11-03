@@ -69,7 +69,7 @@ void PoGWMiner::mine_one() {
 
     // Add coinbase as first transaction (index 0)
     blockchain::Transaction cb;
-    coinbase_tx(cb, height, miner_reward);
+    coinbase_tx(cb, height, miner_reward, tip);
 
     // Build block
     blockchain::BlockBuilder final_builder;
@@ -102,15 +102,25 @@ void PoGWMiner::mine_one() {
         if (match && (diff % 8 == 0 || (hash[diff/8] & (0xFF << (8 - diff % 8))) == 0)) {
             // Commit results are no longer ignored (external review): a
             // rejected block must not drain the mempool or report success.
+            // Round-7 hardening (P0-2): the state layer is only consulted
+            // about a block that actually entered the store, and a block the
+            // ledger refused is rolled back - a stuck "store ahead of
+            // ledger" tip would wedge the miner and the RPC forever.
             const bool appended = store_.append_block(frame);
-            const auto applied = ledger_.apply_block(
-                blockchain::BlockView(std::span<const uint8_t, 65536>(frame.data(), 65536)));
-            if (!appended || !applied.ok) {
-                std::cerr << "[MINER] Block #" << height << " REJECTED"
-                          << " (appended=" << appended
-                          << ", applied=" << applied.ok
-                          << (applied.error.empty() ? "" : (std::string(": ") + applied.error))
-                          << "); sealed transactions kept in mempool\n";
+            if (appended) {
+                const auto applied = ledger_.apply_block(
+                    blockchain::BlockView(std::span<const uint8_t, 65536>(frame.data(), 65536)));
+                if (!applied.ok) {
+                    store_.rollback_last_append();
+                    std::cerr << "[MINER] Block #" << height << " REJECTED"
+                              << " (applied=" << applied.ok
+                              << (applied.error.empty() ? "" : (std::string(": ") + applied.error))
+                              << "); sealed transactions kept in mempool\n";
+                    break;
+                }
+            } else {
+                std::cerr << "[MINER] Block #" << height << " REJECTED (append failed)"
+                          << "; sealed transactions kept in mempool\n";
                 break;
             }
 
@@ -155,7 +165,8 @@ uint64_t PoGWMiner::calculate_difficulty() const {
     return new_diff;
 }
 
-void PoGWMiner::coinbase_tx(blockchain::Transaction& tx, uint64_t height, const state::U128& miner_reward) {
+void PoGWMiner::coinbase_tx(blockchain::Transaction& tx, uint64_t height, const state::U128& miner_reward,
+                            const uint8_t prev_tip_hash[32]) {
     std::memset(&tx, 0, sizeof(tx));
     const char* tag = "MINER_";
     std::memcpy(tx.sender_nfa, tag, 6);
@@ -169,7 +180,9 @@ void PoGWMiner::coinbase_tx(blockchain::Transaction& tx, uint64_t height, const 
     blockchain::tx_set_amount(tx, miner_reward.lo);
     blockchain::tx_set_fee(tx, 0);
     blockchain::tx_set_nonce(tx, 0);
-    blockchain::sign_transaction(tx);
+    // BACKLOG 0.6 remainder closed: the coinbase commits its chain position
+    // (receiver + height + previous tip hash) instead of the keyless digest.
+    blockchain::set_coinbase_binding(tx, height, prev_tip_hash);
 }
 
 PoGWMiner::Status PoGWMiner::get_status() const {

@@ -66,12 +66,54 @@ for p in "$RPC_A" "$RPC_B" "$RPC_C"; do
     expect_eq "RPC :$p is up" "$(wait_up "$p" 5 && echo up)" up
 done
 
-echo "[3/5] Transfer on A must propagate over VX60 to B and C"
-TX=$(curl -s -X POST "localhost:$RPC_A/api/transfer" -d '{
-    "sender":"NFA_V6_CLIqoXuU6o9M9cAcFUGEWe7dsxsM8WqV0RwVQnukAA",
-    "receiver":"NFA_V6_iIgiAC7Bohg_wrdof8Vu1y7z0T3zHB3BMxERENEMAA",
-    "amount_vx":7}')
-TX_TIP=$(printf '%s' "$TX" | python3 -c 'import json,sys; print(json.load(sys.stdin)["block_hash_hex"])')
+echo "[3/5] PQ-witnessed transfer on A must propagate over VX60 to B and C"
+# Since BACKLOG 0.7 the transfer endpoint no longer signs for the client:
+# the harness asks the demo signer for a witness bound to the demo spender
+# key (the public protocol constant, bound to this address on every node)
+# and posts the full witness to /api/transfer itself.
+WIRE_JSON=$(python3 - "$RPC_A" <<'PYINNER'
+import json, sys, urllib.request
+
+rpc = "http://localhost:" + sys.argv[1]
+
+def call(path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(rpc + path, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+acc = call("/api/accounts")[1]["accounts"]
+# The demo spender: funded AND has already spent (nonce > 0) - the genesis
+# receiver is bound to an OFFLINE key and must never sign.
+spender = next(a for a in acc if float(a["balance_vx"]) > 1000
+               and a["next_nonce_atomics"] > 0)
+recv = next(a for a in acc if a["payload_42"] != spender["payload_42"]
+            and a["payload_42"].startswith("iIgi"))
+sp, rp = spender["payload_42"], recv["payload_42"]
+nonce = spender["next_nonce_atomics"]
+
+st, sig = call("/api/crypto/pq_sign", {"demo_key": "spender", "sender": sp,
+                                       "receiver": rp, "amount_vx": 7,
+                                       "fee": 100, "nonce": nonce})
+if st != 200 or not sig.get("witness_b64"):
+    print(json.dumps({"error": "pq_sign failed: %s %s" % (st, sig)}))
+    sys.exit(0)
+
+st, res = call("/api/transfer", {"sender": sp, "receiver": rp, "amount_vx": 7,
+                                 "witness_b64": sig["witness_b64"],
+                                 "fee_atoms": 100, "nonce": nonce})
+print(json.dumps(res))
+PYINNER
+)
+TX_TIP=$(printf '%s' "$WIRE_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("block_hash_hex",""))')
+if [ -z "$TX_TIP" ]; then
+    bad "transfer on A failed: $(printf '%s' "$WIRE_JSON" | head -c 200)"
+fi
 sleep 1
 
 TIP_A=$(curl -s "localhost:$RPC_A/api/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tip_hash_hex"])')
@@ -81,11 +123,13 @@ TIP_C=$(curl -s "localhost:$RPC_C/api/status" | python3 -c 'import json,sys; pri
 expect_eq "tip on A matches the transfer block" "$TIP_A" "$TX_TIP"
 expect_eq "tip on B matches A" "$TIP_B" "$TIP_A"
 expect_eq "tip on C matches A" "$TIP_C" "$TIP_A"
+# Demo chain snapshot: 75000 - 100 (demo tx2 fee) = 74999.99999900.
+# This transfer: -7 VX - 100 atoms fee -> 74992.99999800.
 BAL_B=$(curl -s "localhost:$RPC_B/api/accounts" | python3 -c '
 import json,sys
 for a in json.load(sys.stdin)["accounts"]:
-    if a["address"].startswith("NFA_V6_CLIqoXu"): print(a["balance_vx"]); break')
-expect_eq "sender balance on B is 74993 VX" "$BAL_B" "74993.00000000"
+    if a["payload_42"].startswith("CLIqoXu"): print(a["balance_vx"]); break')
+expect_eq "sender balance on B is 74992.99999800 VX" "$BAL_B" "74992.99999800"
 
 echo "[4/5] Garbage packets are counted as corrupted; the node stays alive"
 CORRUPT_BEFORE=$(curl -s "localhost:$RPC_A/api/swarm/peers" | python3 -c 'import json,sys; print(json.load(sys.stdin)["corrupted_packets_dropped"])')

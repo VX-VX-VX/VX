@@ -206,6 +206,15 @@ bool BlockStore::append_block(const BlockFrame& frame) {
     return ensure_mapping(count_ * BLOCK_SIZE_BYTES);
 }
 
+bool BlockStore::rollback_last_append() noexcept {
+    if (count_ <= 1) return false; // the genesis frame is never rolled back
+    const off_t offset = static_cast<off_t>((count_ - 1) * BLOCK_SIZE_BYTES);
+    if (::ftruncate(fd_, offset) != 0) return false;
+    --count_;
+    last_error_ = "last append rolled back";
+    return ensure_mapping(count_ * BLOCK_SIZE_BYTES);
+}
+
 const RawBlock* BlockStore::get_block(uint64_t height) const noexcept {
     if (height >= count_ || !mapped_) return nullptr;
     // O(1): pure pointer arithmetic, zero parsing.

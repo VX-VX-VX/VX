@@ -93,41 +93,73 @@ address; `address` is the same with the `NFA_V6_` prefix.
 
 ## Move value
 
-### POST /api/transfer — send VX
+### POST /api/transfer — send VX (post-quantum authorized)
+
+Since BACKLOG 0.7 (2026-11-03) a transfer carries a **post-quantum
+witness produced by the sender's key** — the server no longer signs on
+the user's behalf. The request must carry:
+
+- `sender`, `receiver` (with or without the `NFA_V6_` prefix — the
+  server strips it), `amount_vx` as before;
+- `witness_b64` — the 2376-byte `PqSignatureWitness`, base64-encoded;
+- `fee_atoms` — a positive fee in micro-VX atomic units;
+- `nonce` — the sender's next expected nonce (read it from
+  `GET /api/accounts` -> `next_nonce_atomics`).
 
 ```bash
 curl -s -X POST http://localhost:18099/api/transfer \
   -H 'Content-Type: application/json' \
   -d '{
-    "sender":   "NFA_V6_CLIqoXuU6o9M9cAcFUGEWe7dsxsM8WqV0RwVQnukAA",
-    "receiver": "NFA_V6_iIgiAC7Bohg_wrdof8Vu1y7z0T3zHB3BMxERENEMAA",
-    "amount_vx": 10
+    "sender":     "NFA_V6_CLIqoXuU6o9M9cAcFUGEWe7dsxsM8WqV0RwVQnukAA",
+    "receiver":   "NFA_V6_iIgiAC7Bohg_wrdof8Vu1y7z0T3zHB3BMxERENEMAA",
+    "amount_vx":  10,
+    "fee_atoms":  100,
+    "nonce":      0,
+    "witness_b64": "<2376-byte PqSignatureWitness, base64>"
   }'
 ```
 
-```json
-{
-    "status": "ok",
-    "block_height": 2,
-    "block_hash_hex": "ff575171...",
-    "transfers": 1,
-    "sender_balance_vx": "74990.00000000",
-    "receiver_balance_vx": "25010.00000000"
-}
+The server rebuilds the transaction, re-derives its SegPQ anchor FROM THE
+WITNESS (`pq_set_transaction_anchor` — the transported `cocoon_proof` is
+never trusted), registers the witness, seals the block with a real PoGW
+nonce (BACKLOG 0.9 — the request takes a few seconds at the dev-mode
+difficulty) and broadcasts the witnesses BEFORE the block (BACKLOG 0.8),
+so peers can authorize it.
+
+Error answers (all 403, nothing changes):
+
+- no `witness_b64`: `PQ witness required: keyless transfers are not
+  accepted`;
+- `witness_b64` that does not decode to exactly 2376 bytes;
+- `fee_atoms` <= 0;
+- `nonce` != the ledger's expected next nonce;
+- overspending still answers `{"error":"insufficient funds"}`.
+
+**Producing the witness (client side).** The witness signs the canonical
+transaction message
+
+```
+M = Sponge256("VX_PQ_TX_MSG_V1" || sender[42] || receiver[42] ||
+               amount[8] || fee[4] || nonce[4] || chain_id[4])
 ```
 
-Field notes:
+with WOTS+ (w=16, 67 chains) at XMSS leaf `nonce & 0xF` of the key's
+H=4 tree; the 2376-byte witness layout is documented in
+`include/vx/crypto/pq_signature.hpp`. The signing key's XMSS root must
+either derive the sender address (self-certifying `"PQA..."` addresses)
+or match the root the address is bound to in ledger state. **The server
+deliberately provides no signing endpoint for user keys** — a server
+that signs for you holds your key, which is the vulnerability BACKLOG
+0.7 removes. The `/api/crypto/pq_sign` demo endpoint signs with the
+public documented demo key only (BACKLOG 0.10 tracks compiling the demo
+fixtures out).
 
-- addresses may be passed with or without the `NFA_V6_` prefix — the
-  server strips it;
-- the transfer is applied to the ledger immediately (this is the demo/CLI
-  path, not the mempool path — there is no fee market on this endpoint);
-  since the single intake gate shipped (BACKLOG 0.9), the node seals the
-  block with a real PoGW nonce before appending, so the request takes a
-  few seconds at the dev-mode difficulty (leading 16 zero bits of the
-  full-frame hash) instead of returning instantly;
-- overspending answers `{"error":"insufficient funds"}` and changes
-  nothing.
+Address forms: a legacy-shaped address (`NFA_V6_...` that does not start
+with `PQA` after prefix stripping) commits no key root, so it can no
+longer SEND unless it is one of the genesis-era allocations bound in the
+protocol seed table (the canonical genesis receiver and the two demo
+addresses); it can always RECEIVE. New spendable addresses are
+self-certifying `PQA` addresses derived from the key root.
 
 ## Sign post-quantum
 

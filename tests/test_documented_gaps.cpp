@@ -40,6 +40,8 @@
 #include <gtest/gtest.h>
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/blockchain/genesis.hpp"
+#include "vx/crypto/pq_signature.hpp"
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
 #include "vx/core/memory_vault.hpp"
@@ -47,6 +49,8 @@
 
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <iterator>
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
@@ -70,6 +74,37 @@ Address addr_of(const std::string& s) {
     Address a{};
     std::memcpy(a.data(), s.data(), s.size() < 42 ? s.size() : 42);
     return a;
+}
+
+Address payload_of(const std::string& nfa) { // strips the "NFA_V6_" prefix
+    Address a{};
+    std::memcpy(a.data(), nfa.data() + 7, 42);
+    return a;
+}
+
+// A test account bound to a post-quantum WOTS+/XMSS key: the address is
+// SELF-CERTIFYING ("PQA" + base64url of Sponge("VXPQADDRV1" || root)), so
+// holding the key IS holding the address (BACKLOG 0.7).
+struct PqAccount {
+    std::array<uint8_t, 32> sk{};
+    std::array<uint8_t, 32> root{};
+    Address addr{};
+};
+
+PqAccount make_pq_account(const char* tag) {
+    PqAccount acc;
+    VortexSponge256::compute(reinterpret_cast<const uint8_t*>(tag),
+                             std::strlen(tag), acc.sk.data());
+    const auto pub_seed = vx::crypto::pq::pub_seed_from_sk(acc.sk);
+    acc.root = vx::crypto::pq::xmss_root(acc.sk, pub_seed);
+    derive_pq_address(acc.root.data(), acc.addr.data());
+    return acc;
+}
+
+// Signs a transaction with the account's PQ key (registers the witness in
+// the PqWitnessRegistry, exactly like a real client would).
+bool pq_sign(Transaction& tx, const PqAccount& acc) {
+    return vx::crypto::pq::pq_sign_transaction(tx, acc.sk);
 }
 
 Transaction make_tx(const Address& sender, const Address& receiver,
@@ -142,12 +177,16 @@ TEST(VortexDocumentedGapsTest, NoWorkBlockAccepted) {
     std::filesystem::remove_all(dir);
 }
 
-// ── Gap pin 2: keyless transaction authorization. For any sender not
-// registered as a PQ sender, verify_transaction_proof accepts a plain
-// sponge digest that ANYONE can compute (sign_transaction() uses no key).
-// An attacker holding no key for the victim forges a transfer from the
-// victim and the ledger credits the attacker (BACKLOG 0.7/0.8).
-TEST(VortexDocumentedGapsTest, KeylessTheftReproducible) {
+// ── Gap pin 2 (CLOSED 2026-11-03, BACKLOG 0.7): keyless transaction
+// authorization is removed from consensus acceptance. The keyless digest
+// (Tier 2) still verifies as an ADMISSION PRE-FILTER - it proves nothing
+// about origin and is no longer an authorization - but the ledger, the
+// consensus authority, refuses every user sender without a PQ witness
+// bound to its key. The reviewer's theft PoC (1 VX out of the genesis
+// receiver with zero secrets) no longer moves anything: the receiver is
+// protocol-bound to an OFFLINE key whose secret is not in the repo, so no
+// witness for the forged transfer can exist.
+TEST(VortexDocumentedGapsTest, KeylessTheftRejected) {
     const std::string dir = temp_dir("vx_gap_theft");
     vx::storage::BlockStore store(dir + "/theft.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
@@ -172,24 +211,35 @@ TEST(VortexDocumentedGapsTest, KeylessTheftReproducible) {
     // The forged transfer: sender = victim, attacker holds nothing.
     Transaction theft = make_tx(victim, attacker, 100000000, 0);
     sign_transaction(theft); // <-- keyless: computable by anyone
-    EXPECT_TRUE(verify_transaction_proof(theft))
-        << "gap closed? then flip this expectation to EXPECT_FALSE";
 
-    // Ship it as a normal block; the ledger must (and, today, does) accept.
+    // The pre-filter alone still passes - it is an integrity checksum, not
+    // an authorization. The consensus authority is the ledger.
+    EXPECT_TRUE(verify_transaction_proof(theft));
+
+    // Ship it as a normal block; the LEDGER must refuse it.
     BlockBuilder b = next_block(store, std::time(nullptr));
     ASSERT_TRUE(b.add_transaction(theft));
-    const bool applied = push_block(store, ledger, b);
-    EXPECT_TRUE(applied) << "theft block rejected - gap may be closing";
-    if (applied) {
-        const U128 stolen = ledger.balance_of(tx_address(theft.receiver_nfa));
-        EXPECT_EQ(stolen, U128(100000000u))
-            << "attacker credited 1 VX without any private key";
-        std::cout << "  [documented gap] keyless theft reproducible: 1 VX"
-                  << " moved from the genesis receiver with zero secrets"
-                  << " (Tier 2 keyless fallback). Transaction authorization"
-                  << " is BACKLOG 0.7/0.8; until it ships, TX AUTH IS NOT"
-                  << " CLAIMED.\n";
-    }
+    b.finalize();
+    BlockFrame f;
+    std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+    EXPECT_TRUE(store.append_block(f))
+        << "the store gate judges structure and work only; the authorization"
+        << " refusal must come from the ledger";
+    const auto res = ledger.apply_block(BlockView(f));
+    EXPECT_FALSE(res.ok) << "keyless theft accepted - authorization regression!";
+    EXPECT_NE(res.error.find("no PQ witness registered"), std::string::npos)
+        << "expected the missing-witness refusal, got: " << res.error;
+
+    // Nothing moved: the attacker was not credited, the victim keeps all.
+    EXPECT_EQ(ledger.balance_of(tx_address(theft.receiver_nfa)), U128{})
+        << "attacker must not be credited without a PQ witness";
+    EXPECT_GT(ledger.balance_of(victim), U128{})
+        << "the genesis receiver keeps its balance";
+
+    std::cout << "  [closed] keyless theft rejected: the genesis receiver is"
+              << " PQ-bound to an OFFLINE key (secret not in the repo) and no"
+              << " witness exists for the forged transfer (BACKLOG 0.7).\n";
 
     std::filesystem::remove_all(dir);
 }
@@ -211,7 +261,9 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // Height 1: fund the sender with exactly 10 VX via the GENESIS_2 mint.
-    const Address sender = addr_of("NFA_DSPEND_VICTIM_000000000000000000000000");
+    // The sender is a PQ account: spends require a WOTS+/XMSS witness now.
+    const PqAccount sender_acc = make_pq_account("VX_TEST_DSPEND_SK_V1");
+    const Address& sender = sender_acc.addr;
     const Address sink = addr_of("NFA_DSPEND_SINK_0000000000000000000000000000");
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
@@ -228,8 +280,8 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
         BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction s1 = make_tx(sender, sink, 600000000u, 0);
         Transaction s2 = make_tx(sender, sink, 600000000u, 1);
-        sign_transaction(s1);
-        sign_transaction(s2);
+        ASSERT_TRUE(pq_sign(s1, sender_acc));
+        ASSERT_TRUE(pq_sign(s2, sender_acc));
         EXPECT_TRUE(verify_transaction_proof(s1));
         EXPECT_TRUE(verify_transaction_proof(s2));
         ASSERT_TRUE(b.add_transaction(s1));
@@ -261,15 +313,18 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     std::filesystem::remove_all(dir);
 }
 
-// ── Gap pin 3: MINER_ coinbase emission has no identity or PoGW binding.
-// Any account that prefixes its sender with "MINER_" and places itself at
-// index 0 mints up to 1000 VX per block. The reward limit and index rule
-// are enforced, but WHO may mine is not - so emission is forgeable by
-// anyone until PoGW verification gates coinbase intake (BACKLOG 0.6/0.9,
-// which itself depends on the PoGW-verification design item 0.6).
-TEST(VortexDocumentedGapsTest, MinerEmissionForgeable) {
-    const std::string dir = temp_dir("vx_gap_miner");
-    vx::storage::BlockStore store(dir + "/miner.vxb", "genesis.bin", 8);
+// ── Gap pin 3 (CLOSED 2026-11-03, BACKLOG 0.6 remainder): the coinbase is
+// bound to its chain position. Emission integrity now rests on four rules:
+// exactly one coinbase per block (index 0), reward <= 1000 VX, the block
+// itself carries real PoGW work (BACKLOG 0.9), and the coinbase tag
+// commits receiver + height + previous tip hash - so a coinbase copied
+// from one fork cannot be replayed on a competing fork at the same height,
+// and the keyless digest no longer authorizes emissions. What remains is
+// permissionless by design: whoever produces the block names the reward
+// address (no miner identity exists to forge).
+TEST(VortexDocumentedGapsTest, CoinbaseReplayRejected) {
+    const std::string dir = temp_dir("vx_gap_cbreplay");
+    vx::storage::BlockStore store(dir + "/cbreplay.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
     const auto* g = store.get_block(0);
@@ -278,37 +333,107 @@ TEST(VortexDocumentedGapsTest, MinerEmissionForgeable) {
     std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    // A fake miner: no PoGW work, no identity, just the prefix.
-    const Address fake_miner_recv =
+    const Address miner_recv =
         addr_of("NFA_FAKE_MINER_EMISSION_00000000000000000000000");
+
+    // The honest block: coinbase bound to (receiver, height 1, current tip).
+    uint8_t tip[32];
+    store.tip_hash(tip);
+    BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction cb{};
     std::memcpy(cb.sender_nfa, "MINER_", 6);
     for (size_t i = 6; i < 42; ++i) cb.sender_nfa[i] = '0';
-    std::memcpy(cb.receiver_nfa, fake_miner_recv.data(), 42);
+    std::memcpy(cb.receiver_nfa, miner_recv.data(), 42);
     tx_set_amount(cb, 1000ULL * 100000000ULL); // exactly the reward limit
     tx_set_fee(cb, 0);
     tx_set_nonce(cb, 0);
-    sign_transaction(cb); // keyless, like the real coinbase path
-
-    BlockBuilder b = next_block(store, std::time(nullptr));
+    set_coinbase_binding(cb, 1, tip);
     ASSERT_TRUE(b.add_transaction(cb)); // index 0, as required
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
-    // Sealed so the emission pin is judged on its own, not masked by the
-    // new work gate.
     ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
-    EXPECT_TRUE(store.append_block(f))
-        << "gap closed? then flip this expectation to EXPECT_FALSE";
-    EXPECT_TRUE(ledger.apply_block(BlockView(f)).ok)
-        << "gap closed? then flip this expectation to EXPECT_FALSE";
-    EXPECT_EQ(ledger.balance_of(fake_miner_recv), U128(1000ULL * 100000000ULL))
-        << "a non-miner minted the maximum coinbase reward";
 
-    std::cout << "  [documented gap] fake MINER_ coinbase minted 1000 VX"
-              << " with no mining work or identity. Coinbase emission"
-              << " binding is BACKLOG 0.6/0.9; until it ships, EMISSION"
-              << " INTEGRITY IS NOT CLAIMED.\n";
+    // FIRST: the replay. The same coinbase bytes appear in a competing fork
+    // at the same height - the fork frame's prev_block_hash is a different
+    // (fabricated) tip, so the tag commits the OTHER chain position.
+    {
+        BlockFrame fork = f;
+        auto* fork_raw = reinterpret_cast<RawBlock*>(fork.data());
+        uint8_t fake_tip[32];
+        for (size_t i = 0; i < 32; ++i) fake_tip[i] = static_cast<uint8_t>(tip[i] ^ 0x5A);
+        std::memcpy(fork_raw->header.prev_block_hash, fake_tip, 32);
+        ASSERT_TRUE(seal_pogw_nonce(fork, store.required_pogw_bits()));
+        const auto res = ledger.apply_block(BlockView(fork));
+        EXPECT_FALSE(res.ok) << "a coinbase replayed across forks was accepted!";
+        EXPECT_NE(res.error.find("coinbase is not bound to this chain position"),
+                  std::string::npos)
+            << "expected the chain-position refusal, got: " << res.error;
+        EXPECT_EQ(ledger.balance_of(miner_recv), U128{})
+            << "the replayed coinbase must not mint";
+    }
+
+    // THEN: the honest block goes through and the producer is credited.
+    EXPECT_TRUE(store.append_block(f));
+    EXPECT_TRUE(ledger.apply_block(BlockView(f)).ok);
+    EXPECT_EQ(ledger.balance_of(miner_recv), U128(1000ULL * 100000000ULL))
+        << "the bound coinbase pays the block producer";
+
+    std::cout << "  [closed] coinbase bound to the chain position: replaying"
+              << " the tag on a competing fork is refused; the honest coinbase"
+              << " pays the producer (BACKLOG 0.6 remainder).\n";
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── Regression (round 9, delegated adversarial audit): the height-1
+// legacy window authorized every GENESIS mint against COMMITTED balances,
+// so N mints inside ONE block all saw their receivers as still untracked —
+// unbounded supply creation at the only window where the mint sender is
+// accepted. Now the second GENESIS mint in one block is refused.
+TEST(VortexDocumentedGapsTest, SecondGenesisMintInBlockRejected) {
+    const std::string dir = temp_dir("vx_gap_gen2x2");
+    vx::storage::BlockStore store(dir + "/gen2x2.vxb", "genesis.bin", 8);
+    vx::state::LedgerState ledger;
+
+    const auto* g = store.get_block(0);
+    ASSERT_NE(g, nullptr);
+    BlockFrame gf;
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+    const U128 supply_before = ledger.total_supply();
+
+    const Address r1 = addr_of("NFA_GEN2_MINT_TARGET_A_0000000000000000000");
+    const Address r2 = addr_of("NFA_GEN2_MINT_TARGET_B_0000000000000000000");
+    auto mint_tx = [](const Address& to) {
+        Transaction tx{};
+        std::memcpy(tx.sender_nfa, "GENESIS_2", 9);
+        for (size_t i = 9; i < 42; ++i) tx.sender_nfa[i] = '0';
+        std::memcpy(tx.receiver_nfa, to.data(), 42);
+        tx_set_amount(tx, 100000ULL * 100000000ULL); // 100k VX each
+        sign_transaction(tx);
+        return tx;
+    };
+
+    BlockBuilder b = next_block(store, std::time(nullptr));
+    ASSERT_TRUE(b.add_transaction(mint_tx(r1)));
+    ASSERT_TRUE(b.add_transaction(mint_tx(r2)));
+    b.finalize();
+    BlockFrame f;
+    std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+
+    const auto res = ledger.apply_block(BlockView(f));
+    EXPECT_FALSE(res.ok) << "two GENESIS mints in one block minted double!";
+    EXPECT_NE(res.error.find("second GENESIS mint in one block"), std::string::npos)
+        << "expected the double-mint refusal, got: " << res.error;
+    EXPECT_EQ(ledger.balance_of(r1), U128{})
+        << "a rejected block must not credit its first mint either";
+    EXPECT_EQ(ledger.total_supply(), supply_before)
+        << "supply must be untouched by the rejected block";
+
+    std::cout << "  [closed] one GENESIS mint per block in the legacy window:"
+              << " the second mint is refused and the block applies nothing.\n";
 
     std::filesystem::remove_all(dir);
 }
@@ -328,7 +453,8 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
     std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    const Address sender = addr_of("NFA_NONCE_VICTIM_00000000000000000000000");
+    const PqAccount sender_acc = make_pq_account("VX_TEST_NONCE_SK_V1");
+    const Address& sender = sender_acc.addr;
     const Address sink = addr_of("NFA_NONCE_SINK_00000000000000000000000000");
 
     // Height 1: fund the sender (GENESIS_2 mint, legacy window).
@@ -345,7 +471,7 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction spend = make_tx(sender, sink, 100000000u, 0);
-        sign_transaction(spend);
+        ASSERT_TRUE(pq_sign(spend, sender_acc));
         ASSERT_TRUE(b.add_transaction(spend));
         ASSERT_TRUE(push_block(store, ledger, b));
     }
@@ -357,7 +483,7 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
         BlockBuilder b = next_block(store, std::time(nullptr));
         Transaction replay = make_tx(sender, sink, 100000000u, 0);
         tx_set_fee(replay, 0); // shape: fee=0 + nonce=0 == genesis v1
-        sign_transaction(replay);
+        ASSERT_TRUE(pq_sign(replay, sender_acc));
         ASSERT_TRUE(verify_transaction_proof(replay));
         ASSERT_TRUE(b.add_transaction(replay));
         b.finalize();
@@ -676,6 +802,223 @@ TEST(VortexDocumentedGapsTest, RecoveryRejectsCorruptedLedgerFrame) {
 
     EXPECT_THROW({ vx::storage::BlockStore reopen(path, "genesis.bin", 8); },
                  std::runtime_error);
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── BACKLOG 0.7 (closed 2026-11-03): a user sender that is neither
+// PQ-bound nor self-certifying is refused outright, even when it carries a
+// cryptographically valid witness from a key the sender does not own. The
+// keyless tier no longer accepts anything on the consensus path.
+TEST(VortexDocumentedGapsTest, UnboundSenderRejected) {
+    const std::string dir = temp_dir("vx_gap_unbound");
+    vx::storage::BlockStore store(dir + "/unbound.vxb", "genesis.bin", 8);
+    vx::state::LedgerState ledger;
+
+    const auto* g = store.get_block(0);
+    ASSERT_NE(g, nullptr);
+    BlockFrame gf;
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+
+    // The attacker controls a real PQ key - just not one bound to the
+    // address it claims to spend from (a legacy-shaped NFA address that
+    // commits no key root at all).
+    const Address attacker = addr_of("NFA_NO_BINDING_AT_ALL_00000000000000000");
+    const Address sink = addr_of("NFA_UNBOUND_SINK_000000000000000000000000");
+    const PqAccount attacker_key = make_pq_account("VX_TEST_UNBOUND_SK_V1");
+
+    Transaction tx = make_tx(attacker, sink, 100, 0);
+    ASSERT_TRUE(pq_sign(tx, attacker_key)); // witness is internally valid
+
+    BlockBuilder b = next_block(store, std::time(nullptr));
+    ASSERT_TRUE(b.add_transaction(tx));
+    b.finalize();
+    BlockFrame f;
+    std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+    EXPECT_TRUE(store.append_block(f));
+    const auto res = ledger.apply_block(BlockView(f));
+    EXPECT_FALSE(res.ok) << "an unbound sender was accepted!";
+    EXPECT_NE(res.error.find("sender address is not PQ-bound"), std::string::npos)
+        << "expected the unbound-sender refusal, got: " << res.error;
+
+    std::cout << "  [closed] a valid witness from an UNBOUND key spends"
+              << " nothing: the sender address commits no PQ root"
+              << " (BACKLOG 0.7).\n";
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── BACKLOG 0.7: a witness from the WRONG key cannot spend a protocol-
+// bound address. The demo spender is bound at ledger construction
+// (genesis.hpp pq_seed_bindings) to a documented PUBLIC test key; a
+// different, internally valid witness is refused on the root comparison
+// before any balance is touched.
+TEST(VortexDocumentedGapsTest, WitnessRootMismatchRejected) {
+    const std::string dir = temp_dir("vx_gap_mismatch");
+    vx::storage::BlockStore store(dir + "/mismatch.vxb", "genesis.bin", 8);
+    vx::state::LedgerState ledger;
+
+    const auto* g = store.get_block(0);
+    ASSERT_NE(g, nullptr);
+    BlockFrame gf;
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+
+    const Address demo_spender = payload_of(vx::blockchain::demo_spender_address_nfa());
+    const Address sink = addr_of("NFA_MISMATCH_SINK_00000000000000000000000");
+    const PqAccount attacker = make_pq_account("VX_TEST_MISMATCH_SK_V1");
+
+    Transaction tx = make_tx(demo_spender, sink, 1, 0);
+    ASSERT_TRUE(pq_sign(tx, attacker)); // valid witness, wrong key
+
+    BlockBuilder b = next_block(store, std::time(nullptr));
+    ASSERT_TRUE(b.add_transaction(tx));
+    b.finalize();
+    BlockFrame f;
+    std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+    EXPECT_TRUE(store.append_block(f));
+    const auto res = ledger.apply_block(BlockView(f));
+    EXPECT_FALSE(res.ok) << "a mismatched-key witness was accepted!";
+    EXPECT_NE(res.error.find("PQ witness root does not match the sender's bound key"),
+              std::string::npos)
+        << "expected the root-mismatch refusal, got: " << res.error;
+
+    std::cout << "  [closed] a witness whose XMSS root differs from the"
+              << " sender's bound key is refused before any balance check"
+              << " (BACKLOG 0.7).\n";
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── BACKLOG 0.7: self-certifying addresses. A "PQA" address commits its
+// own key root, so the first witnessed spend binds it; after that, only
+// the bound key can spend it. No registration transaction, no trusted
+// table.
+TEST(VortexDocumentedGapsTest, SelfCertifyingAddressAutoBinds) {
+    const std::string dir = temp_dir("vx_gap_selfcert");
+    vx::storage::BlockStore store(dir + "/selfcert.vxb", "genesis.bin", 8);
+    vx::state::LedgerState ledger;
+
+    const auto* g = store.get_block(0);
+    ASSERT_NE(g, nullptr);
+    BlockFrame gf;
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+
+    // A fresh PQ account nobody has ever seen: the address IS the key
+    // commitment.
+    const PqAccount acc = make_pq_account("VX_TEST_SELFCERT_SK_V1");
+    const Address sink = addr_of("NFA_SELFCERT_SINK_00000000000000000000000");
+
+    // Height 1: the genesis mint funds it (mints may pay any receiver).
+    {
+        BlockBuilder b = next_block(store, std::time(nullptr));
+        Transaction mint = make_tx(addr_of("GENESIS_2"), acc.addr, 1000000000u, 0);
+        sign_transaction(mint); // system sender: structural digest only
+        ASSERT_TRUE(b.add_transaction(mint));
+        ASSERT_TRUE(push_block(store, ledger, b));
+    }
+    ASSERT_EQ(ledger.balance_of(acc.addr), U128(1000000000u));
+
+    // Height 2: the FIRST witnessed spend binds the address to its key.
+    {
+        BlockBuilder b = next_block(store, std::time(nullptr));
+        Transaction spend = make_tx(acc.addr, sink, 100000000u, 0);
+        ASSERT_TRUE(pq_sign(spend, acc));
+        ASSERT_TRUE(b.add_transaction(spend));
+        ASSERT_TRUE(push_block(store, ledger, b));
+    }
+    // 10 VX minted, 1 VX spent, 100-atom fee paid.
+    EXPECT_EQ(ledger.balance_of(sink), U128(100000000u));
+    EXPECT_EQ(ledger.balance_of(acc.addr), U128(899999900u));
+
+    // Height 3: a THIEF with a different real key cannot spend the now-
+    // bound address - the witness root fails the binding comparison. The
+    // frame is judged by the ledger DIRECTLY (never appended): a real node
+    // drops a rejected block before it reaches the store, and appending a
+    // ledger-rejected frame here would desync the store tip from state.
+    {
+        const PqAccount thief = make_pq_account("VX_TEST_SELFCERT_THIEF_SK_V1");
+        BlockBuilder b = next_block(store, std::time(nullptr));
+        Transaction steal = make_tx(acc.addr, sink, 900000000u, 1);
+        ASSERT_TRUE(pq_sign(steal, thief)); // internally valid witness
+        ASSERT_TRUE(b.add_transaction(steal));
+        b.finalize();
+        BlockFrame f;
+        std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+        ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
+        const auto res = ledger.apply_block(BlockView(f));
+        EXPECT_FALSE(res.ok) << "a foreign key spent a bound address!";
+        EXPECT_NE(res.error.find("PQ witness root does not match"), std::string::npos)
+            << "expected the binding refusal, got: " << res.error;
+        EXPECT_EQ(ledger.balance_of(acc.addr), U128(899999900u))
+            << "the theft attempt must not mutate state";
+    }
+
+    // Height 3 (retry): the legitimate key still spends freely.
+    {
+        BlockBuilder b = next_block(store, std::time(nullptr));
+        Transaction spend2 = make_tx(acc.addr, sink, 100000000u, 1);
+        ASSERT_TRUE(pq_sign(spend2, acc));
+        ASSERT_TRUE(b.add_transaction(spend2));
+        ASSERT_TRUE(push_block(store, ledger, b));
+    }
+    EXPECT_EQ(ledger.balance_of(acc.addr), U128(799999800u));
+
+    std::cout << "  [closed] self-certifying address: first witnessed spend"
+              << " binds it to its key; a foreign key is refused, the owner"
+              << " keeps spending (BACKLOG 0.7).\n";
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── BACKLOG 0.8: witnesses persist in a durable sidecar (<ledger>.pqw)
+// and are replayed into the registry on attach - a node restart no longer
+// orphans witnessed transactions.
+TEST(VortexDocumentedGapsTest, WitnessDurableLogSurvivesRestart) {
+    const std::string dir = temp_dir("vx_gap_pqw");
+    const std::string pqw = dir + "/witnesses.pqw";
+
+    const PqAccount acc = make_pq_account("VX_TEST_DURABLE_SK_V1");
+    Transaction tx = make_tx(acc.addr,
+                             addr_of("NFA_DURABLE_SINK_000000000000000000000"),
+                             1000, 0);
+
+    vx::crypto::pq::PqSignatureWitness w;
+    {
+        vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(pqw);
+        ASSERT_TRUE(pq_sign(tx, acc)); // registers + appends + fsyncs
+        ASSERT_TRUE(vx::crypto::pq::PqWitnessRegistry::instance().lookup(
+            vx::crypto::pq::tx_msg_digest(tx), w));
+    }
+
+    // The sidecar exists, is record-sized, and carries the record tag.
+    {
+        std::ifstream in(pqw, std::ios::binary);
+        ASSERT_TRUE(in.good()) << "durable witness log was not created";
+        std::string rec((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+        const size_t expect = 8 + 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness);
+        ASSERT_EQ(rec.size(), expect) << "exactly one 2458-byte record";
+        EXPECT_EQ(std::memcmp(rec.data(), "VXPQWT1", 8), 0) << "record tag";
+    }
+
+    // Simulated restart: re-attaching the same path replays the log into
+    // the registry and the witness is still there, byte-identical.
+    vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(pqw);
+    vx::crypto::pq::PqSignatureWitness w2;
+    ASSERT_TRUE(vx::crypto::pq::PqWitnessRegistry::instance().lookup(
+        vx::crypto::pq::tx_msg_digest(tx), w2))
+        << "witness lost across the restart";
+    EXPECT_EQ(w2.wots_sig, w.wots_sig);
+    EXPECT_EQ(w2.pq_pubkey_root, w.pq_pubkey_root);
+    EXPECT_EQ(w2.witness_digest, w.witness_digest);
+
+    std::cout << "  [closed] durable witness sidecar: registration fsyncs a"
+              << " VXPQWT1 record and a restart replays it (BACKLOG 0.8).\n";
 
     std::filesystem::remove_all(dir);
 }

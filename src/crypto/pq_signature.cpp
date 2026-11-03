@@ -162,6 +162,18 @@ std::array<uint8_t, 32> xmss_node_hash(uint8_t level, uint16_t node_idx,
     return out;
 }
 
+std::array<uint8_t, 32> pub_seed_from_sk(const std::array<uint8_t, 32>& sk) noexcept {
+    // MUST stay byte-identical with the derivation inside pq_sign_transaction
+    // (step 2): the account's XMSS root — and therefore its bound address —
+    // depends on this exact mask seed.
+    PreimageBuf ps;
+    ps.put_str("VX_PQ_PUBSEED_V1", 16);
+    ps.put(sk.data(), 32);
+    std::array<uint8_t, 32> pub_seed{};
+    sponge(ps.b.data(), ps.n, pub_seed.data());
+    return pub_seed;
+}
+
 std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
                                   const std::array<uint8_t, 32>& pub_seed) noexcept {
     std::array<std::array<uint8_t, 32>, XMSS_LEAVES> level{};
@@ -308,6 +320,19 @@ bool pq_verify_wots_xmss(const std::array<uint8_t, 32>& msg,
     return cur == w.pq_pubkey_root;
 }
 
+void pq_set_transaction_anchor(Transaction& tx, const PqSignatureWitness& w) noexcept {
+    const auto msg = tx_msg_digest(tx);
+    const std::array<uint8_t, 32> digest = compute_witness_digest(w);
+    PreimageBuf a;
+    a.put_str("VX_SEGPQ_ANCHOR_V1", 18);
+    a.put(msg.data(), 32);
+    a.put(w.pq_pubkey_root.data(), 32);
+    a.put(digest.data(), 32);
+    std::array<uint8_t, 32> full_tag{};
+    sponge(a.b.data(), a.n, full_tag.data());
+    std::memcpy(tx.cocoon_proof, full_tag.data(), 12);
+}
+
 bool pq_verify_transaction(const Transaction& tx, const PqSignatureWitness& w) noexcept {
     const auto msg = tx_msg_digest(tx);
     if (!pq_verify_wots_xmss(msg, w)) return false;
@@ -334,7 +359,8 @@ bool pq_verify_transaction(const Transaction& tx, const PqSignatureWitness& w) n
 // ── SegPQ signing with MemoryVault ─────────────────────────────────────────
 
 bool pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_sk,
-                         PqSignTimings* timings, PqLeafLedger* leaf_ledger) noexcept {
+                         PqSignTimings* timings, PqLeafLedger* leaf_ledger,
+                         PqSignatureWitness* out_witness) noexcept {
     namespace mc = vx::core;
     PqSignTimings local{};
     PqSignTimings& t = timings ? *timings : local;
@@ -426,6 +452,11 @@ bool pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_
     mc::MemoryCore::scrub_execution_state(sk.data(), 32);
     const auto stats = vault.get_stats();
     t.vault_burn_verified = stats.burned_pages > burned_before;
+    // Hand the caller the witness THIS call produced. The registry may hold
+    // several valid candidates for the same digest (different keys can all
+    // produce verifiable signatures for a predictable message), so a caller
+    // that needs ITS OWN signature must not go back through the registry.
+    if (out_witness) *out_witness = w;
     return true;
 }
 
@@ -569,16 +600,121 @@ PqWitnessRegistry& PqWitnessRegistry::instance() noexcept {
     return reg;
 }
 
-void PqWitnessRegistry::register_witness(const Transaction& tx, const PqSignatureWitness& w) {
+bool PqWitnessRegistry::register_witness(const Transaction& tx, const PqSignatureWitness& w) {
     const auto digest = tx_msg_digest(tx);
+    // Nothing unverified ever enters the registry (round-7 hardening): the
+    // full WOTS+/XMSS + SegPQ-anchor chain must pass against THIS tx.
+    if (!pq_verify_transaction(tx, w)) return false;
     Entry e;
     e.witness = w;
     std::memcpy(e.sender.data(), tx.sender_nfa, 42);
     std::lock_guard<std::mutex> lock(mutex_);
-    by_digest_[digest] = e;
+    auto& cands = by_digest_[digest];
+    for (const auto& c : cands)
+        if (std::memcmp(&c.witness, &w, sizeof(w)) == 0) return true; // dedup
+    if (cands.size() >= kMaxWitnessesPerDigest) return false;
+    if (cands.empty() && by_digest_.size() >= kMaxDigestEntries) return false;
+    cands.push_back(e);
     std::array<uint8_t, 42> sender{};
     std::memcpy(sender.data(), tx.sender_nfa, 42);
+    // sender_roots_ is fed ONLY from tx-verified registrations - a wire
+    // registration cannot flip a sender into the PQ class (that flag gates
+    // verify_transaction_proof Tier 1 for mempool admission and the VM).
     sender_roots_[sender] = w.pq_pubkey_root;
+    append_durable_locked(digest, sender, w);
+    return true;
+}
+
+bool PqWitnessRegistry::register_witness_bytes(const std::array<uint8_t, 32>& msg_digest,
+                                               const uint8_t sender_nfa[42],
+                                               const PqSignatureWitness& w) {
+    // Round-7 hardening: a wire/replay registration must carry its own
+    // proof - the witness commitment must match the witness content, and
+    // the WOTS+/XMSS chain must verify against the CLAIMED digest. Garbage
+    // never reaches memory or the durable sidecar.
+    if (!(w.witness_digest == witness_commitment(w))) return false;
+    if (!pq_verify_wots_xmss(msg_digest, w)) return false;
+    Entry e;
+    e.witness = w;
+    std::memcpy(e.sender.data(), sender_nfa, 42);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto& cands = by_digest_[msg_digest];
+    for (const auto& c : cands)
+        if (std::memcmp(&c.witness, &w, sizeof(w)) == 0) return true; // dedup
+    if (cands.size() >= kMaxWitnessesPerDigest) return false;
+    if (cands.empty() && by_digest_.size() >= kMaxDigestEntries) return false;
+    cands.push_back(e);
+    append_durable_locked(msg_digest, e.sender, w);
+    return true;
+}
+
+bool PqWitnessRegistry::append_durable_locked(const std::array<uint8_t, 32>& digest,
+                                              const std::array<uint8_t, 42>& sender,
+                                              const PqSignatureWitness& w) {
+    if (durable_fd_ < 0 || !durable_locked_) return true; // memory-only mode
+    uint8_t rec[8 + 32 + 42 + sizeof(PqSignatureWitness)];
+    std::memcpy(rec, "VXPQWT1", 8);
+    std::memcpy(rec + 8, digest.data(), 32);
+    std::memcpy(rec + 40, sender.data(), 42);
+    std::memcpy(rec + 82, &w, sizeof(w));
+    const ssize_t total = static_cast<ssize_t>(sizeof(rec));
+    ssize_t off = 0;
+    while (off < total) {
+        const ssize_t n = ::write(durable_fd_, rec + off, static_cast<size_t>(total - off));
+        if (n <= 0) return false;
+        off += n;
+    }
+    return ::fsync(durable_fd_) == 0;
+}
+
+void PqWitnessRegistry::attach_durable_log(const std::string& path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (durable_fd_ >= 0 && durable_path_ == path) return; // already attached
+    if (durable_fd_ >= 0) { ::close(durable_fd_); durable_fd_ = -1; }
+    durable_path_ = path;
+    // O_APPEND: every record lands at the current end regardless of what
+    // any other code path did to the file offset (round-7 hardening).
+    const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return; // memory-only fallback; nothing fails the node here
+    // Exclusive flock like PqLeafLedger: two node processes sharing a data
+    // directory must not interleave records into torn halves. A busy log
+    // falls back to memory-only mode - the witness is re-broadcastable,
+    // durability is an optimization here, not a safety invariant.
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) { ::close(fd); return; }
+    durable_fd_ = fd;
+    durable_locked_ = true;
+    // Replay full records only; a short or corrupt record stops the replay
+    // (fail-closed). The flock makes mid-file corruption from a sibling
+    // process impossible; only a hand-corrupted file stops early.
+    uint8_t rec[8 + 32 + 42 + sizeof(PqSignatureWitness)];
+    size_t replayed = 0;
+    for (;;) {
+        if (by_digest_.size() >= kMaxDigestEntries) break; // cap the RAM too
+        ssize_t got = 0;
+        while (got < static_cast<ssize_t>(sizeof(rec))) {
+            const ssize_t n = ::read(fd, rec + got, sizeof(rec) - static_cast<size_t>(got));
+            if (n <= 0) break;
+            got += n;
+        }
+        if (got != static_cast<ssize_t>(sizeof(rec))) break; // partial/no more
+        if (std::memcmp(rec, "VXPQWT1", 8) != 0) break;      // corrupt -> stop
+        Entry e;
+        std::memcpy(&e.witness, rec + 82, sizeof(PqSignatureWitness));
+        std::array<uint8_t, 32> digest{};
+        std::memcpy(digest.data(), rec + 8, 32);
+        std::array<uint8_t, 42> sender{};
+        std::memcpy(sender.data(), rec + 40, 42);
+        auto& cands = by_digest_[digest];
+        bool dup = false;
+        for (const auto& c : cands)
+            if (std::memcmp(&c.witness, &e.witness, sizeof(e.witness)) == 0) { dup = true; break; }
+        if (!dup && cands.size() < kMaxWitnessesPerDigest) {
+            cands.push_back(e);
+            ++replayed;
+        }
+    }
+    (void)replayed;
+    // O_APPEND writes at the end; no explicit seek needed.
 }
 
 bool PqWitnessRegistry::is_pq_sender(const uint8_t sender_nfa[42]) const {
@@ -592,9 +728,28 @@ bool PqWitnessRegistry::lookup(const std::array<uint8_t, 32>& msg_digest,
                                PqSignatureWitness& out) const {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = by_digest_.find(msg_digest);
-    if (it == by_digest_.end()) return false;
-    out = it->second.witness;
+    if (it == by_digest_.end() || it->second.empty()) return false;
+    out = it->second.front().witness;
     return true;
+}
+
+bool PqWitnessRegistry::lookup_verifying(const Transaction& tx,
+                                         PqSignatureWitness& out) const {
+    // Copy the candidate witnesses out under the lock; verification runs
+    // WITHOUT the registry lock (it is pure CPU over public data, and a
+    // full WOTS+/XMSS pass must never serialize every consensus lookup).
+    static thread_local std::vector<PqSignatureWitness> cands;
+    cands.clear();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = by_digest_.find(tx_msg_digest(tx));
+        if (it == by_digest_.end() || it->second.empty()) return false;
+        for (const auto& c : it->second) cands.push_back(c.witness);
+    }
+    for (const auto& w : cands) {
+        if (pq_verify_transaction(tx, w)) { out = w; return true; }
+    }
+    return false;
 }
 
 void PqWitnessRegistry::set_last(const Transaction& tx, const PqSignatureWitness& w) {
