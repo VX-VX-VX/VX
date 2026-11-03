@@ -408,7 +408,7 @@ deep reorgs evaporates on reboot.
   validator-authentication cycle (BACKLOG 0.4 / 2.4), since shares
   currently derive from public data.
 
-### 0.14 Mempool per-sender nonce ordering + publication race
+### 0.14 Mempool per-sender nonce ordering + publication race (CLOSED 2026-11-03)
 
 External review (round 4): (a) the global fee sort in `pull_for_sealing`
 can order a sender's nonce-1 tx before its nonce-0 tx — the block then
@@ -417,13 +417,38 @@ repeatable livelock under load. (b) `count_` is bumped by CAS before the
 entry is written into the map; a concurrent reader can observe count
 including a not-yet-written entry (reads a default Transaction).
 
-- [ ] Order pulled txs per sender by nonce (topological by sender), not
-  only by global fee.
-- [ ] Publish entries before bumping `count_` (or use a generation/
-  seqlock so readers skip incomplete slots).
+- [x] Order pulled txs per sender by nonce: `pull_for_sealing` now
+  snapshots the pool under the mutex, groups it into per-sender chains
+  (admission keeps each sender's nonces contiguous), sorts each chain
+  ascending by nonce, and emits via a deterministic k-way merge — the
+  chain whose head tx has the best fee density wins the next slot. The
+  comparator uses exact priority comparison (the old epsilon tie-break
+  was not a strict weak ordering — the classic std::sort UB pattern)
+  with canonical byte tie-breaks.
+- [x] Publish entries before bumping `count_`: slot claim, entry write
+  and count publication are all under the pool mutex now (`find_slot`'s
+  CAS is gone). `stats()`, `pull_for_sealing` and `remove_sealed` hold
+  the same mutex; `remove_sealed`'s invalidation + compaction + count
+  update is one critical section (a concurrent submit used to be able
+  to lose an accepted tx while its pending balance/nonce stayed
+  reserved). `count()`/`empty()` stay lock-free approximate hints; the
+  dead `version_` counter and unused `validate_pending` wrapper are
+  removed.
 - Acceptance: stress test — N senders x M out-of-order submissions, all
   sealed blocks apply on first attempt; concurrent reader never observes
   an unwritten entry.
+  **Met.** `SealedBatchesApplyOnFirstAttempt` (5 senders x 20 txs, pull
+  in partial batches, replay against per-sender nonce gates — every tx
+  applies first try) and `ConcurrentSubmitsAndSealsStayConsistent`
+  (8 submitter threads racing a sealing reader + concurrent `stats()`;
+  every pulled tx matches a submitted tx — no torn/unwritten slot — and
+  every batch keeps each sender's chain contiguous from the previously
+  sealed prefix). ThreadSanitizer build (GCC, separate build lane): the
+  mempool suite is race-free across 6 runs, 0 TSan warnings.
+  Remnants: none in scope — the pool-side DoS caps (one sender flooding
+  the whole pool) belong to the fee-market spec (BACKLOG 2.5), the
+  admission wiring (nothing feeds `submit()` from the network stack yet)
+  is part of the swarm-intake work.
 
 ---
 

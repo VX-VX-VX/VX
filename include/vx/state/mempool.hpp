@@ -10,7 +10,6 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
-#include <optional>
 #include <unordered_set>
 #include <vector>
 
@@ -58,13 +57,21 @@ struct MevAuditReport {
 double mev_pair_energy(const Transaction& a, const Transaction& b) noexcept;
 
 /**
- * @brief Lock-free / Thread-Safe Mempool Engine
+ * @brief Thread-safe mempool engine
  *
  * Capacity: up to 16,384 pending 112-byte transactions in RAM.
- * Priority ordering: rank by TDI fee-entropy density (fee / entropy_cost)
- * while preserving per-sender nonce order.
+ * Priority ordering: per-sender chains emitted by a deterministic k-way
+ * merge — the chain whose head transaction has the best TDI fee-entropy
+ * density (fee / entropy_cost) wins the next sealing slot. Cross-sender,
+ * the fee market rules; within a sender, nonce order is inviolable, so a
+ * sealed block can never fail apply with "nonce mismatch" (BACKLOG 0.14).
  * Double-spend & balance guard: track pending_outgoing_balance and pending_nonce
  * so a user cannot queue transactions exceeding their available balance.
+ *
+ * Concurrency model: entry storage, pending state and every count
+ * mutation are guarded by one pool mutex; an entry is fully written
+ * before the count reflects it. count()/empty() are lock-free approximate
+ * hints (relaxed atomic loads), not a consistent snapshot.
  */
 class Mempool {
 public:
@@ -123,10 +130,11 @@ private:
         bool valid = false;
     };
 
-    // Lock-free ring buffer for entries
+    // Entry storage: one fixed slot per accepted tx. Written and published
+    // under pending_mutex_ (an entry is complete before count_ shows it);
+    // readers must hold the mutex too.
     alignas(64) std::array<Entry, MEMPOOL_MAX_TXS> entries_;
-    alignas(64) std::atomic<size_t> count_{0};
-    alignas(64) std::atomic<uint64_t> version_{0};  // For optimistic locking
+    alignas(64) std::atomic<size_t> count_{0};  // mutated under pending_mutex_; lock-free approximate hint
 
     // Per-sender pending state (protected by mutex for simplicity, can be lock-free later)
     mutable std::mutex pending_mutex_;
@@ -135,12 +143,6 @@ private:
 
     // Compute TDI-based priority for a transaction
     double compute_priority(const Transaction& tx) const noexcept;
-
-    // Find next available slot (lock-free)
-    std::optional<size_t> find_slot() noexcept;
-
-    // Validate transaction against pending state
-    bool validate_pending(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept;
 
     // Same check with the assumption that pending_mutex_ is already held.
     // The submit path needs this form: validation and pending-state update

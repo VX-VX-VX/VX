@@ -520,9 +520,8 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     random-input runs and ~245k mutation runs clean).
 - **Still open, pinned honestly (expect-success tests).**
   - (None in this section. The remaining consensus gaps are tracked as
-    BACKLOG items with design notes: mempool ordering/races 0.14 — none
-    of them pinned as expect-success tests yet; pinning them is part of
-    their fix cycle.)
+    BACKLOG items with design notes — none of them pinned as
+    expect-success tests yet; pinning them is part of their fix cycle.)
   - *Undo journal serialization* (CLOSED 2026-11-03, BACKLOG 0.11):
     `UndoRecord` holds `std::string` / `std::vector` / `time_point` and
     was written with a raw `write(fd, &record, sizeof(record))` — heap
@@ -545,10 +544,22 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     replayable in both directions. Regression:
     `ReorgUndoRestoresNoncesAndFrames` (rollback + re-apply byte-
     identical to a fresh apply).
-  - *Mempool ordering/race*: the global fee sort can order a sender's
-    nonce-1 tx before its nonce-0 tx (guaranteed apply-failure block),
-    and `count_` is published before the entry is written, so a
-    concurrent reader can observe an unwritten slot (BACKLOG 0.14).
+  - *Mempool ordering/race* (CLOSED 2026-11-03, BACKLOG 0.14): sealing
+    order is now a deterministic k-way merge over per-sender nonce
+    chains — the chain whose head transaction carries the best fee
+    density wins the next slot, so a sender's nonce-1 can never enter a
+    block ahead of its nonce-0 (the global fee sort could invert them
+    and brick every sealed block with a nonce-mismatch apply failure);
+    and entry publication is mutex-serialized — an entry is fully
+    written before the count reflects it, so a concurrent sealing reader
+    can no longer observe an unwritten slot (the pool now guards entry
+    storage, pending state and count mutations with one pool mutex;
+    count()/empty() remain lock-free approximate hints). Regressions:
+    `SealingPreservesPerSenderNonceOrder`,
+    `PullBudgetNeverBreaksSenderChain`,
+    `SealedBatchesApplyOnFirstAttempt`,
+    `ConcurrentSubmitsAndSealsStayConsistent` (8 submitter threads + a
+    sealing reader; ThreadSanitizer-clean across 6 runs).
 - **Test suite.** Double-spend rejection, overspend rejection (live:
   `{"error":"insufficient funds"}` leaves the tip unchanged), coinbase
   checks (`excess_reward`, `unauthorized_genesis` guard replays at
@@ -901,6 +912,13 @@ security just advanced this pass, memory safety via TSan (BACKLOG 1.4).
   "absolute defence" against deep reorgs no longer evaporates on reboot
   (certify N, restart, rollback to N-1 refused, pinned by
   `GqcCheckpointSurvivesRestart`).
+- **Mempool sealing order + publication race** (BACKLOG 0.14,
+  2026-11-03): sealing pulls are now a deterministic k-way merge over
+  per-sender nonce chains (fee market across senders, inviolable nonce
+  order within a sender), and entry storage is mutex-serialized so a
+  concurrent reader never sees an unwritten slot; pinned by four
+  regressions including a multi-threaded stress test that is
+  ThreadSanitizer-clean across 6 runs.
 
 ## Explicitly not promised
 

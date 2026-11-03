@@ -37,11 +37,6 @@ static uint32_t tx_nonce_local(const Transaction& tx) noexcept {
 }
 
 
-bool Mempool::validate_pending(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    return validate_pending_locked(tx, sender_balance, sender_nonce);
-}
-
 bool Mempool::validate_pending_locked(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept {
     Address sender = tx_address(tx.sender_nfa);
     uint64_t amount = tx_amount_local(tx);
@@ -86,25 +81,6 @@ double Mempool::compute_priority(const Transaction& tx) const noexcept {
     return fee_double / entropy_cost;
 }
 
-std::optional<size_t> Mempool::find_slot() noexcept {
-    size_t current = count_.load(std::memory_order_relaxed);
-    if (current >= MEMPOOL_MAX_TXS) {
-        return std::nullopt;
-    }
-
-    // Try to claim a slot atomically
-    while (true) {
-        size_t expected = current;
-        if (count_.compare_exchange_weak(expected, current + 1, std::memory_order_acq_rel)) {
-            return current;
-        }
-        current = expected;
-        if (current >= MEMPOOL_MAX_TXS) {
-            return std::nullopt;
-        }
-    }
-}
-
 SubmitResult Mempool::submit(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) {
     SubmitResult result;
 
@@ -126,17 +102,19 @@ SubmitResult Mempool::submit(const Transaction& tx, const U128& sender_balance, 
     // 3..7: ONE critical section. Validation and the pending-state update
     // are atomic together — two concurrent submits of the same nonce can
     // no longer both pass the check before either reserves (TOCTOU fix).
-    // find_slot()'s count_ CAS does not touch pending_mutex_, and no other
-    // locked section calls back into this path, so the nesting is safe.
     std::lock_guard<std::mutex> pending_lock(pending_mutex_);
     if (!validate_pending_locked(tx, sender_balance, sender_nonce)) {
         result.error = "nonce mismatch or insufficient balance (including pending)";
         return result;
     }
 
-    // 4. Find a slot
-    auto slot = find_slot();
-    if (!slot) {
+    // 4. Claim the next slot. BACKLOG 0.14(b): slot claim, entry write and
+    // count publication all happen under the pool mutex, with the entry
+    // fully written BEFORE the count moves. The old find_slot() CAS bumped
+    // count_ first, so a concurrent reader could observe the bumped count
+    // and read a not-yet-written (default) entry.
+    const size_t slot = count_.load(std::memory_order_relaxed);
+    if (slot >= MEMPOOL_MAX_TXS) {
         result.error = "mempool full (16,384 tx limit)";
         return result;
     }
@@ -147,35 +125,36 @@ SubmitResult Mempool::submit(const Transaction& tx, const U128& sender_balance, 
     uint32_t nonce = tx_nonce_local(tx);
     Address sender = tx_address(tx.sender_nfa);
 
-    // 6. Insert entry (with version for optimistic concurrency)
-    Entry& entry = entries_[*slot];
+    // 6. Insert entry (complete before it becomes visible via count_)
+    Entry& entry = entries_[slot];
     entry.tx = tx;
     entry.fee = U128(fee);
     entry.amount = U128(amount);
     entry.priority = priority;
     entry.sender_nonce = nonce;
     entry.valid = true;
+    count_.store(slot + 1, std::memory_order_release);
 
     // 7. Update pending state (same critical section as step 3)
     pending_outgoing_[sender] = pending_outgoing_[sender] + U128(amount + fee);
     pending_nonces_[sender] = nonce + 1;
 
-    version_.fetch_add(1, std::memory_order_release);
-
     result.ok = true;
-    result.position = *slot;
+    result.position = slot;
     result.projected_height = 0; // Will be set by caller
     return result;
 }
 
 MempoolStats Mempool::stats() const noexcept {
     MempoolStats s;
+    // Snapshot under the pool mutex: an unlocked scan over entries_ raced
+    // with submit/remove_sealed (BACKLOG 0.14b).
+    std::lock_guard<std::mutex> lock(pending_mutex_);
     size_t cnt = count_.load(std::memory_order_relaxed);
     s.count = cnt;
     s.byte_occupancy = cnt * 112;
     s.utilization_pct = (static_cast<double>(cnt) / 580.0) * 100.0; // 580 tx = full 64KB frame
 
-    // Sum up fees and amounts (read-only, no lock needed for approximate stats)
     U128 total_fees{0};
     U128 total_amounts{0};
     for (size_t i = 0; i < cnt; ++i) {
@@ -190,42 +169,89 @@ MempoolStats Mempool::stats() const noexcept {
 }
 
 std::vector<Transaction> Mempool::pull_for_sealing(size_t max_count) noexcept {
-    size_t cnt = count_.load(std::memory_order_acquire);
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    size_t cnt = count_.load(std::memory_order_relaxed);
     if (cnt == 0 || max_count == 0) return {};
 
-    // Collect valid entries with their indices
-    struct Candidate {
-        size_t index;
-        double priority;
-        uint32_t sender_nonce;
+    // ── BACKLOG 0.14(a): per-sender nonce chains.
+    //
+    // The old ordering was a single global fee sort with a GLOBAL nonce
+    // tie-break: a sender's high-fee nonce-1 tx sorted ahead of its own
+    // low-fee nonce-0 tx, the sealed block failed apply with "nonce
+    // mismatch", the miner dropped it with txs retained — a repeatable
+    // livelock under load.
+    //
+    // New ordering: group the pool into per-sender chains (admission makes
+    // each sender's stored nonces contiguous from its expected nonce), then
+    // k-way merge — the chain whose HEAD tx has the best priority wins the
+    // next slot. Cross-sender, the fee market still rules; within a sender,
+    // ascending nonce order is inviolable, so a nonce-k tx can never enter
+    // a block without every lower nonce of the same sender.
+    struct Chain {
+        std::vector<const Entry*> txs; // ascending nonce
     };
-    std::vector<Candidate> candidates;
-    candidates.reserve(cnt);
-
+    std::unordered_map<Address, size_t, AddressHash> chain_of;
+    std::vector<Chain> chains;
+    chains.reserve(cnt);
     for (size_t i = 0; i < cnt; ++i) {
-        if (entries_[i].valid) {
-            candidates.push_back({i, entries_[i].priority, entries_[i].sender_nonce});
+        if (!entries_[i].valid) continue;
+        const Address sender = tx_address(entries_[i].tx.sender_nfa);
+        auto it = chain_of.find(sender);
+        if (it == chain_of.end()) {
+            it = chain_of.emplace(sender, chains.size()).first;
+            chains.emplace_back();
+        }
+        chains[it->second].txs.push_back(&entries_[i]);
+    }
+    for (auto& ch : chains) {
+        std::sort(ch.txs.begin(), ch.txs.end(), [](const Entry* a, const Entry* b) {
+            if (a->sender_nonce != b->sender_nonce)
+                return a->sender_nonce < b->sender_nonce;
+            // Same sender + same nonce cannot pass admission; byte order
+            // keeps the comparator total and deterministic regardless.
+            return std::memcmp(&a->tx, &b->tx, sizeof(Transaction)) < 0;
+        });
+    }
+
+    // K-way merge over chain heads. Comparator uses EXACT priority
+    // comparison: compute_priority is a pure function of the tx bytes, so
+    // equal fees/amounts yield exactly equal doubles on every node. (The
+    // old epsilon tie-break — |a-b| > 1e-9 — was not a strict weak
+    // ordering: intransitive ties are the classic std::sort UB pattern.)
+    struct Head {
+        const Entry* entry;
+        size_t chain;
+        size_t pos; // index of `entry` within chains[chain].txs
+    };
+    const auto head_worse = [](const Head& a, const Head& b) {
+        // Max-heap "less": true when a ranks below b.
+        if (a.entry->priority != b.entry->priority)
+            return a.entry->priority < b.entry->priority;
+        if (a.entry->sender_nonce != b.entry->sender_nonce)
+            return a.entry->sender_nonce > b.entry->sender_nonce;
+        const int c = std::memcmp(a.entry->tx.sender_nfa, b.entry->tx.sender_nfa, 42);
+        if (c != 0) return c > 0;
+        return std::memcmp(&a.entry->tx, &b.entry->tx, sizeof(Transaction)) > 0;
+    };
+    std::vector<Head> heap;
+    heap.reserve(chains.size());
+    for (size_t c = 0; c < chains.size(); ++c)
+        heap.push_back({chains[c].txs.front(), c, 0});
+    std::make_heap(heap.begin(), heap.end(), head_worse);
+
+    std::vector<Transaction> result;
+    result.reserve(std::min(max_count, cnt));
+    while (!heap.empty() && result.size() < max_count) {
+        std::pop_heap(heap.begin(), heap.end(), head_worse);
+        const Head best = heap.back();
+        heap.pop_back();
+        result.push_back(best.entry->tx);
+        const auto& ch = chains[best.chain];
+        if (best.pos + 1 < ch.txs.size()) {
+            heap.push_back({ch.txs[best.pos + 1], best.chain, best.pos + 1});
+            std::push_heap(heap.begin(), heap.end(), head_worse);
         }
     }
-
-    // Sort by priority (highest first), then by sender_nonce for fairness
-    std::sort(candidates.begin(), candidates.end(),
-        [](const Candidate& a, const Candidate& b) {
-            if (std::abs(a.priority - b.priority) > 1e-9) {
-                return a.priority > b.priority; // Higher priority first
-            }
-            return a.sender_nonce < b.sender_nonce; // Lower nonce first (FIFO per sender)
-        });
-
-    // Take up to max_count
-    size_t take = std::min(max_count, candidates.size());
-    std::vector<Transaction> result;
-    result.reserve(take);
-
-    for (size_t i = 0; i < take; ++i) {
-        result.push_back(entries_[candidates[i].index].tx);
-    }
-
     return result;
 }
 
@@ -259,45 +285,49 @@ void Mempool::remove_sealed(const std::vector<Transaction>& sealed_txs) noexcept
         sealed_set.insert(key);
     }
 
-    // Remove sealed entries and update pending state
-    {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        for (size_t i = 0; i < count_.load(std::memory_order_relaxed); ++i) {
-            if (entries_[i].valid) {
-                SealedKey key{tx_address(entries_[i].tx.sender_nfa), entries_[i].sender_nonce};
-                if (sealed_set.find(key) != sealed_set.end()) {
-                    // Found sealed transaction - invalidate and adjust pending state
-                    Address sender = tx_address(entries_[i].tx.sender_nfa);
-                    uint64_t amount = tx_amount_local(entries_[i].tx);
-                    uint32_t fee = tx_fee_local(entries_[i].tx);
+    // BACKLOG 0.14(b): the whole pass — invalidation, pending-state
+    // adjustment, compaction and the count update — is ONE critical
+    // section. The old code released the mutex before compacting, so a
+    // concurrent submit could claim a slot above the snapshot count and
+    // then be silently dropped by the count_.exchange(write_idx) below —
+    // an accepted tx vanishing while its pending balance/nonce stayed
+    // reserved (stuck sender until restart).
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    const size_t cnt = count_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < cnt; ++i) {
+        if (entries_[i].valid) {
+            SealedKey key{tx_address(entries_[i].tx.sender_nfa), entries_[i].sender_nonce};
+            if (sealed_set.find(key) != sealed_set.end()) {
+                // Found sealed transaction - invalidate and adjust pending state
+                Address sender = tx_address(entries_[i].tx.sender_nfa);
+                uint64_t amount = tx_amount_local(entries_[i].tx);
+                uint32_t fee = tx_fee_local(entries_[i].tx);
 
-                    // Subtract from pending outgoing
-                    auto pending_it = pending_outgoing_.find(sender);
-                    if (pending_it != pending_outgoing_.end()) {
-                        if (pending_it->second >= U128(amount + fee)) {
-                            pending_it->second = pending_it->second - U128(amount + fee);
-                        } else {
-                            pending_it->second = U128{0};
-                        }
-                        if (pending_it->second.is_zero()) {
-                            pending_outgoing_.erase(pending_it);
-                        }
+                // Subtract from pending outgoing
+                auto pending_it = pending_outgoing_.find(sender);
+                if (pending_it != pending_outgoing_.end()) {
+                    if (pending_it->second >= U128(amount + fee)) {
+                        pending_it->second = pending_it->second - U128(amount + fee);
+                    } else {
+                        pending_it->second = U128{0};
                     }
-
-                    // Reset pending nonce to the next expected value
-                    pending_nonces_[sender] = entries_[i].sender_nonce + 1;
-
-                    // Invalidate entry
-                    entries_[i].valid = false;
+                    if (pending_it->second.is_zero()) {
+                        pending_outgoing_.erase(pending_it);
+                    }
                 }
+
+                // Reset pending nonce to the next expected value
+                pending_nonces_[sender] = entries_[i].sender_nonce + 1;
+
+                // Invalidate entry
+                entries_[i].valid = false;
             }
         }
     }
 
     // Compact the array (move valid entries to front)
     size_t write_idx = 0;
-    size_t read_cnt = count_.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < read_cnt; ++i) {
+    for (size_t i = 0; i < cnt; ++i) {
         if (entries_[i].valid) {
             if (write_idx != i) {
                 entries_[write_idx] = entries_[i];
@@ -307,9 +337,7 @@ void Mempool::remove_sealed(const std::vector<Transaction>& sealed_txs) noexcept
     }
 
     // Update count
-    size_t old_count = count_.exchange(write_idx, std::memory_order_acq_rel);
-    (void)old_count;
-    version_.fetch_add(1, std::memory_order_release);
+    count_.store(write_idx, std::memory_order_release);
 }
 
 void Mempool::clear() noexcept {
@@ -317,11 +345,11 @@ void Mempool::clear() noexcept {
     pending_outgoing_.clear();
     pending_nonces_.clear();
 
-    for (size_t i = 0; i < count_.load(std::memory_order_relaxed); ++i) {
+    const size_t cnt = count_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < cnt; ++i) {
         entries_[i].valid = false;
     }
     count_.store(0, std::memory_order_release);
-    version_.fetch_add(1, std::memory_order_release);
 }
 
 uint32_t Mempool::get_next_nonce(const Address& a) const noexcept {
