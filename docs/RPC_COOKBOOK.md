@@ -41,15 +41,19 @@ curl -s http://localhost:18099/api/status | python3 -m json.tool
 
 ```json
 {
-    "chain_height": 2,
-    "tip_block_index": 1,
-    "ledger_bytes": 131072,
+    "chain_height": 1,
+    "tip_block_index": 0,
+    "ledger_bytes": 65536,
     "frame_size": 65536,
     "max_tx_per_block": 580,
-    "total_supply_atomics": "264000000000000",
-    "total_supply_vx": "2640000.00000000",
-    "tracked_accounts_count": 3,
-    "tip_hash_hex": "1d22ae15...",
+    "total_supply_atomics": "254000000000000",
+    "total_supply_vx": "2540000.00000000",
+    "max_supply_vx": 7000000000,
+    "issued_supply_atomics": "254000000000000",
+    "issuance_headroom_vx": "6997460000.00000000",
+    "emission_window_blocks": 7000000,
+    "tracked_accounts_count": 1,
+    "tip_hash_hex": "485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d",
     "crypto_engine": "3-Trunk Galois Attractor (3072-bit CRT) + VortexSponge256 (12-Round ARX)",
     "storage_engine": "POSIX mmap/mremap O(1) Zero-Copy"
 }
@@ -68,6 +72,15 @@ After the demo block it differs (the chain grew) — that is expected.
 
 `total_supply_atomics` is a string, not a number: u64 atomics are wider
 than some JSON parsers' integers. 1 VX = 10^8 atomics.
+
+The emission fields are the hard-coded schedule (user-directed
+2026-11-03): at most **7,000,000,000 VX** can ever be issued
+(`max_supply_vx`), a flat 1,000 VX block subsidy runs for heights
+1..`emission_window_blocks` (7,000,000) and zero afterwards,
+`issued_supply_atomics` is the cumulative issuance actually booked
+(coinbase credits minus the fee share re-credited to the producer), and
+`issuance_headroom_vx` is what remains under the cap — the final
+emission blocks mint exactly this remainder, then the cap closes.
 
 ### GET /api/blocks — every block frame
 

@@ -473,11 +473,23 @@ lifecycle → attractor collision behavior.
 
 ### 2.5 Tokenomics & PoGW economics (testnet prerequisite)
 
-- [ ] Emission schedule already partly encoded (miner reward constants);
-  write the full spec: supply curve, fee market, dust thresholds.
-- [ ] Simulate: reward pressure vs. TDI-filtered spam economics.
-- Acceptance: `docs/design/tokenomics.md`; parameters land in genesis
-  config, not scattered constants.
+- [x] Emission schedule hard-coded in consensus (2026-11-03,
+  user-directed): `include/vx/blockchain/emission.hpp` — lifetime cap
+  7,000,000,000 VX (7e17 atoms; the 7 is the protocol's signature digit),
+  flat 1,000 VX block subsidy for heights 1..7,000,000, zero afterwards.
+  Cumulative issuance (all coinbase credits minus the fee share
+  re-credited to the producer) is gated in `LedgerState::apply_block`
+  before any state mutation, restored by the reorg undo, and reported by
+  `/api/status` (`max_supply_vx`, `issued_supply_atomics`,
+  `issuance_headroom_vx`). Genesis allocations count against the cap, so
+  the final emission blocks mint exactly the remaining headroom.
+  Regression: `EmissionScheduleShapeSevenBillion`,
+  `CoinbaseEntitlementEnforced`, `SupplyCapHardStopsIssuance`,
+  `SubsidyEndsAfterEmissionWindow`.
+- [ ] Fee market spec: dust thresholds, minimum relay fee, reward
+  pressure vs. TDI-filtered spam economics (simulate).
+- Acceptance: `docs/design/tokenomics.md`; remaining parameters land in
+  genesis config, not scattered constants.
 
 ---
 

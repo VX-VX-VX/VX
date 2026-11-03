@@ -158,6 +158,9 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
 
     // Reverse transaction effects, newest block first.
     for (const auto& record : to_remove) {
+        // Emission accounting for this record (see the block below).
+        core::U128 coinbase_sum{0};
+        core::U128 record_fees{0};
         for (const auto& tx : record.transactions) {
             vx::blockchain::Address sender, receiver;
             std::memset(sender.data(), 0, 42);
@@ -176,6 +179,21 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
                 // receiver loses the credited amount.
                 ledger_.adjust_balance(sender, tx.amount + tx.fee, true);
                 ledger_.adjust_balance(receiver, tx.amount, false);
+            }
+            // Issuance reversal (emission schedule, 2026-11-03): recompute
+            // the block's issuance exactly as apply_block priced it — all
+            // coinbase credits minus the fee share re-credited to the
+            // producer — and take it back out of the issued-supply counter
+            // so the 7,000,000,000 VX cap gate stays exact after a reorg.
+            if (is_coinbase) coinbase_sum = coinbase_sum + tx.amount;
+            if (!is_coinbase) record_fees = record_fees + tx.fee;
+        }
+        {
+            const core::U128 fee_share = record_fees - record_fees / core::U128(2);
+            const core::U128 recredited =
+                (coinbase_sum < fee_share) ? coinbase_sum : fee_share;
+            if (coinbase_sum > recredited) {
+                ledger_.adjust_issued_supply(coinbase_sum - recredited, false);
             }
         }
     }

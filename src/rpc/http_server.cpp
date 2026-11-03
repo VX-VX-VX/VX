@@ -18,6 +18,7 @@
 #include "vx/vm/vortex_vm.hpp"
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/blockchain/emission.hpp"
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/core/rdtsc_profiler.hpp"
 #include "vx/security/chaos_fuzzer.hpp"
@@ -438,6 +439,7 @@ HttpResponse HttpServer::handle_status(const HttpRequest&) {
     std::string hash_hex = hex_bytes(hash32, 32);
     auto supply = ledger_.total_supply();
     std::string supply_str = supply.to_string();
+    auto issued = ledger_.issued_supply();
 
     std::ostringstream oss;
     oss << "{"
@@ -448,6 +450,10 @@ HttpResponse HttpServer::handle_status(const HttpRequest&) {
         << "\"max_tx_per_block\":580,"
         << "\"total_supply_atomics\":\"" << supply_str << "\","
         << "\"total_supply_vx\":\"" << format_vx(supply.lo) << "\","
+        << "\"max_supply_vx\":" << blockchain::MAX_SUPPLY_VX << ","
+        << "\"issued_supply_atomics\":\"" << issued.to_string() << "\","
+        << "\"issuance_headroom_vx\":\"" << format_vx(ledger_.issuance_headroom().lo) << "\","
+        << "\"emission_window_blocks\":" << blockchain::EMISSION_WINDOW_BLOCKS << ","
         << "\"tracked_accounts_count\":" << ledger_.tracked_addresses() << ","
         << "\"tip_hash_hex\":\"" << hash_hex << "\","
         << "\"crypto_engine\":\"3-Trunk Galois Attractor (3072-bit CRT) + VortexSponge256 (12-Round ARX)\","
@@ -833,8 +839,11 @@ void audit_fill_nfa(uint8_t out[42], uint8_t seed) {
     for (int i = 0; i < 42; ++i) out[i] = static_cast<uint8_t>(seed + i * 7);
 }
 
-// Miner reward policy: 1000 VX per block, expressed in atomics (1 VX = 1e8).
-constexpr uint64_t AUDIT_REWARD_ATOMICS = 1000ull * 100000000ull;
+// Miner reward policy: the schedule's block subsidy (1,000 VX while the
+// emission window is open), expressed in atomics (1 VX = 1e8) — one
+// definition with the consensus schedule (vx/blockchain/emission.hpp).
+constexpr uint64_t AUDIT_REWARD_ATOMICS =
+    vx::blockchain::BLOCK_SUBSIDY_VX * vx::blockchain::ATOMS_PER_VX;
 
 } // namespace
 

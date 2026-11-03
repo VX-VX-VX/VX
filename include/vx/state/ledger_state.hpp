@@ -2,6 +2,7 @@
 
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/blockchain/emission.hpp"
 #include "vx/blockchain/genesis.hpp"
 #include "vx/core/u128.hpp"
 #include "vx/crypto/pq_signature.hpp"
@@ -123,6 +124,11 @@ public:
         const bool legacy_window = (next_height_ <= 1);
         // At most one GENESIS_2 mint per height-1 block (see check below).
         bool genesis_mint_seen = false;
+        // Emission accounting (user-directed schedule, 2026-11-03): mints are
+        // summed during the pre-check and gated AFTER the whole block
+        // validates, before any state mutation (see the gate below the loop).
+        U128 genesis_mint_sum{0};
+        U128 miner_mint_sum{0};
 
         for (uint32_t i = 0; i < n; ++i) {
             const Transaction& tx = block.tx(i);
@@ -238,11 +244,9 @@ public:
                         res.error = "tx " + std::to_string(i) + ": MINER_ must be index 0";
                         return res;
                     }
-                    U128 max_reward = U128(1000ULL * 100000000ULL);
-                    if (U128(amount) > max_reward) {
-                        res.error = "tx " + std::to_string(i) + ": reward exceeds limit";
-                        return res;
-                    }
+                    // The exact emission entitlement (subsidy + fee share)
+                    // is enforced by the gate after the pre-check loop,
+                    // once the block's total fees are known.
                 }
                 // Coinbase transactions don't pay fees
                 fees[i] = U128{0};
@@ -298,6 +302,12 @@ public:
                 intra_debits_[sender] = acc + this_debit;
                 fees[i] = U128(fee);
             }
+            // Emission accounting: mints are separated by sender class so
+            // the gate below the loop can price the subsidy entitlement
+            // (MINER_) separately from protocol allocations (GENESIS).
+            if (is_genesis) genesis_mint_sum = genesis_mint_sum + U128(amount);
+            if (is_miner) miner_mint_sum = miner_mint_sum + U128(amount);
+
             debits[i] = U128(amount);
             Address receiver = blockchain::tx_address(tx.receiver_nfa);
             pending_[receiver] = pending_[receiver] + U128(amount);
@@ -305,6 +315,53 @@ public:
             // Update expected nonce for next transaction from same sender
             if (!is_genesis && !is_miner && !is_genesis_v1) {
                 expected_nonces_[sender] = expected_nonces_[sender] + 1;
+            }
+        }
+
+        // ── Emission gate (user-directed schedule, 2026-11-03) ─────────────
+        // Runs AFTER the whole block validates and BEFORE any state mutation,
+        // so a refused block leaves the ledger byte-identical.
+        //
+        // 1. Subsidy entitlement: the producer's coinbase may carry at most
+        //    the schedule's block subsidy (1,000 VX for heights 1..7,000,000,
+        //    zero outside) plus this block's fee share. Fees re-credited to
+        //    the producer are redistribution of value that already left the
+        //    senders — not new emission.
+        // 2. Hard supply cap: cumulative ISSUANCE (all coinbase credits
+        //    minus the re-credited fee share) may never exceed
+        //    7,000,000,000 VX. Genesis allocations count against the cap,
+        //    so near the end of the schedule the cap - not the schedule -
+        //    determines the last partial subsidy, and after it no further
+        //    subsidy can enter state.
+        U128 total_fees{0};
+        for (uint32_t i = 0; i < n; ++i) {
+            total_fees = total_fees + fees[i];
+        }
+        U128 burned = total_fees / U128(2);
+        U128 miner_reward = total_fees - burned; // Handles odd division
+
+        U128 block_issuance{0};
+        {
+            const U128 entitlement =
+                U128(blockchain::subsidy_atoms(block.header().block_height)) +
+                miner_reward;
+            if (miner_mint_sum > entitlement) {
+                res.error = "coinbase exceeds emission entitlement (subsidy " +
+                            std::to_string(blockchain::subsidy_atoms(block.header().block_height) /
+                                           blockchain::ATOMS_PER_VX) +
+                            " VX + fee share); height " +
+                            std::to_string(block.header().block_height);
+                return res;
+            }
+            const U128 recredited =
+                (miner_mint_sum < miner_reward) ? miner_mint_sum : miner_reward;
+            block_issuance = (genesis_mint_sum + miner_mint_sum) - recredited;
+            const U128 supply_cap = U128(blockchain::max_supply_atoms());
+            if (issued_supply_ > supply_cap || block_issuance > supply_cap - issued_supply_) {
+                res.error = "supply cap exceeded: at most " +
+                            std::to_string(blockchain::MAX_SUPPLY_VX) +
+                            " VX can ever be issued";
+                return res;
             }
         }
 
@@ -319,12 +376,6 @@ public:
         new_bindings_.clear();
 
  // commit with TDI fee burn (50% burned, 50% to miner)
-        U128 total_fees{0};
-        for (uint32_t i = 0; i < n; ++i) {
-            total_fees = total_fees + fees[i];
-        }
-        U128 burned = total_fees / U128(2);
-        U128 miner_reward = total_fees - burned; // Handles odd division
 
         for (uint32_t i = 0; i < n; ++i) {
             const Transaction& tx = block.tx(i);
@@ -356,6 +407,8 @@ public:
 
         // Track burned supply
         burned_supply_ = burned_supply_ + burned;
+        // Commit the block's issuance (gate already proved it fits the cap).
+        issued_supply_ = issued_supply_ + block_issuance;
 
         ++next_height_;
         res.ok = true;
@@ -414,6 +467,32 @@ public:
     /// Total burned supply (TDI burn)
     U128 total_burned() const noexcept { return burned_supply_; }
 
+    /// Cumulative ISSUED supply (all coinbase credits minus fee-share
+    /// re-credits) — the quantity the 7,000,000,000 VX cap bounds.
+    U128 issued_supply() const noexcept { return issued_supply_; }
+
+    /// Headroom left under the hard supply cap, in atoms. Producers clamp
+    /// their coinbase to this so the last blocks of the emission window
+    /// mint exactly the remainder and the cap is reached, not overshot.
+    U128 issuance_headroom() const noexcept {
+        const U128 cap = U128(blockchain::max_supply_atoms());
+        return issued_supply_ >= cap ? U128{} : cap - issued_supply_;
+    }
+
+    /// Direct adjustment for reorg undo (mirrors adjust_balance). The
+    /// caller supplies the issuance being reversed — see UndoEngine.
+    void adjust_issued_supply(U128 delta, bool add) {
+        if (add) {
+            issued_supply_ = issued_supply_ + delta;
+        } else {
+            if (issued_supply_ >= delta) {
+                issued_supply_ = issued_supply_ - delta;
+            } else {
+                issued_supply_ = U128{0};
+            }
+        }
+    }
+
     /// Renders an address with its NFA_V6_ prefix for display.
     static std::string address_label(const Address& a) {
         return "NFA_V6_" + std::string(reinterpret_cast<const char*>(a.data()), 42);
@@ -440,6 +519,9 @@ private:
     std::unordered_map<Address, uint32_t, AddressHash> nonces_;
     std::unordered_map<Address, std::array<uint8_t, 32>, AddressHash> pq_roots_;
     U128 burned_supply_{0};
+    // Cumulative issuance under the 7,000,000,000 VX hard cap. Mutated
+    // only after a block fully validates (transactional, like balances).
+    U128 issued_supply_{0};
     uint64_t next_height_ = 0;
 };
 

@@ -696,16 +696,39 @@ scheduled beyond the 4-node backfill test.
 
 ## Stage 6 — Economics and protocol rules
 
-### 14. Tokenomics — **Designed**
+### 14. Tokenomics — **Emission schedule implemented (hard-coded); fee market still designed**
 
-Miner reward constants and supply accounting exist in code
-(`total_supply` is live-computed and reported at `/api/status`, 2.64M VX
-post-genesis + demo emission in the recorded runs), but there is **no**
-written emission-schedule spec, fee-market description, or simulation of
-the masterplan's scenarios (dominant participant, resource collapse,
-transaction floods). BACKLOG 2.5. The TDI dust gate is the one economic
-mechanism that is both implemented and tested (`dust_spam_tdi` guard
-replay, mempool tests).
+The emission schedule is now hard consensus code, not a parameter
+(user-directed 2026-11-03; `include/vx/blockchain/emission.hpp`):
+- **Hard lifetime cap: 7,000,000,000 VX** (7e17 atoms; the 7 is the
+  protocol's signature digit). `static_assert`ed; no height, vote or
+  config can issue the 7,000,000,001st VX.
+- **Flat 1,000 VX block subsidy for heights 1..7,000,000**, zero at the
+  genesis height and zero after the window — 7,000,000 blocks x 1,000 VX
+  mints exactly the cap.
+- The gated quantity is cumulative **issuance**: all coinbase credits
+  minus the fee share re-credited to the producer (fees re-entering
+  circulation are redistribution, not new emission). Genesis allocations
+  (2.54M faucet + the one-time 100k legacy mint) count against the cap,
+  so the final emission blocks mint only the remaining headroom and the
+  cap closes exactly; afterwards not one atom of new issuance can enter
+  state (zero-amount coinbases remain legal so fee redistribution
+  survives).
+- Enforcement lives in `LedgerState::apply_block` BEFORE any state
+  mutation (a refused block leaves the ledger byte-identical); the reorg
+  undo recomputes and reverses a block's issuance; the miner's coinbase
+  carries subsidy + fee share clamped to the headroom; `/api/status`
+  reports `max_supply_vx`, `issued_supply_atomics`,
+  `issuance_headroom_vx`, `emission_window_blocks`.
+- Regressions: `EmissionScheduleShapeSevenBillion`,
+  `CoinbaseEntitlementEnforced`, `SupplyCapHardStopsIssuance`,
+  `SubsidyEndsAfterEmissionWindow`. Genesis frame and hash unchanged.
+
+Still open (BACKLOG 2.5): a written fee-market description, dust
+thresholds and simulation of the masterplan's scenarios (dominant
+participant, resource collapse, transaction floods). The TDI dust gate is
+the one economic mechanism that is both implemented and tested
+(`dust_spam_tdi` guard replay, mempool tests).
 
 ### 15. Genesis & protocol compatibility — **Tested**
 
@@ -825,6 +848,10 @@ security just advanced this pass, memory safety via TSan (BACKLOG 1.4).
   reuse/restart/exhaustion/tamper tests — see
   [VERIFICATION_EVIDENCE.md](VERIFICATION_EVIDENCE.md) for the full
   evidence chain behind every claim in this record.
+- **Emission schedule hard-coded** (user-directed, 2026-11-03): lifetime
+  cap 7,000,000,000 VX, flat 1,000 VX subsidy over 7,000,000 blocks,
+  issuance gated in the ledger before any state mutation and reversed by
+  the reorg undo — see component 14 and BACKLOG 2.5.
 
 ## Explicitly not promised
 

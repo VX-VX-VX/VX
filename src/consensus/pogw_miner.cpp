@@ -1,5 +1,6 @@
 #include "vx/consensus/pogw_miner.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/blockchain/emission.hpp"
 #include <iostream>
 #include <chrono>
 #include <algorithm>
@@ -67,9 +68,18 @@ void PoGWMiner::mine_one() {
     for(const auto& tx : txs) total_fees = total_fees + state::U128(blockchain::tx_fee(tx));
     state::U128 miner_reward = total_fees / state::U128(2); // 50% of fees
 
+    // Emission schedule (user-directed, hard-coded): the coinbase carries
+    // the schedule's block subsidy (1,000 VX for heights 1..7,000,000,
+    // zero outside) plus the fee share, clamped to the issuance headroom
+    // under the 7,000,000,000 VX supply cap — the final emission blocks
+    // mint exactly the remainder, and after the cap nothing new is issued.
+    state::U128 cb_amount = state::U128(blockchain::subsidy_atoms(height)) + miner_reward;
+    const state::U128 issuance_headroom = ledger_.issuance_headroom();
+    if (cb_amount > issuance_headroom) cb_amount = issuance_headroom;
+
     // Add coinbase as first transaction (index 0)
     blockchain::Transaction cb;
-    coinbase_tx(cb, height, miner_reward, tip);
+    coinbase_tx(cb, height, cb_amount, tip);
 
     // Build block
     blockchain::BlockBuilder final_builder;

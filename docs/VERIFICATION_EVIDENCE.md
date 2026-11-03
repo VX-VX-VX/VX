@@ -121,37 +121,38 @@ cd build && ctest
 Recorded result (GCC release, with the leaf-lifecycle fix in):
 
 ```
-100% tests passed out of 16
-Total Test time (real) = 4.49 sec
+100% tests passed out of 17
+Total Test time (real) = 6.48 sec
 ```
 
-Structure: **16 test binaries** - 12 gtest-structured suites carrying
-**75 named test cases** (enumerated in 3.3), plus 4 scenario-style mains
-carrying **27 numbered test blocks** (enumerated in 3.4). Total: 83
+Structure: **17 test binaries** - 13 gtest-structured suites carrying
+**79 named test cases** (enumerated in 3.3), plus 4 scenario-style mains
+carrying **27 numbered test blocks** (enumerated in 3.4). Total: 106
 discrete test blocks.
 
 ### 3.2 Per-binary results (real ctest output)
 
 ```
- 1/16 VortexMathTest            Passed   0.00 sec
- 2/16 VortexDeepCryptoTest      Passed   0.03 sec
- 3/16 VortexBlockTest           Passed   0.01 sec
- 4/16 VortexMempoolTest         Passed   0.00 sec
- 5/16 VortexVMTest              Passed   0.00 sec
- 6/16 VortexChainReorgTest      Passed   0.00 sec
- 7/16 VortexVaultMemoryTest     Passed   0.01 sec
- 8/16 VortexZkKeyMatrixTest     Passed   0.00 sec
- 9/16 VortexTensorV6Test        Passed   0.00 sec
-10/16 VortexSwarmP2PTest        Passed   0.18 sec
-11/16 VortexGaloisTrieTest      Passed   0.01 sec
-12/16 VortexLandauerMevTest     Passed   0.00 sec
-13/16 VortexGqcRingStealthTest  Passed   0.01 sec
-14/16 VortexVaultHtlcTest       Passed   0.00 sec
-15/16 VortexChaosFuzzerTest     Passed   1.78 sec
-16/16 VortexPqSignatureTest     Passed   3.27 sec
+1/17 Test  #1: VortexMathTest ...................   Passed    0.00 sec
+ 2/17 Test  #2: VortexDeepCryptoTest .............   Passed    0.03 sec
+ 3/17 Test  #3: VortexBlockTest ..................   Passed    0.01 sec
+ 4/17 Test  #4: VortexDocumentedGapsTest .........   Passed    1.53 sec
+ 5/17 Test  #5: VortexMempoolTest ................   Passed    0.00 sec
+ 6/17 Test  #6: VortexVMTest .....................   Passed    0.00 sec
+ 7/17 Test  #7: VortexChainReorgTest .............   Passed    0.00 sec
+ 8/17 Test  #8: VortexVaultMemoryTest ............   Passed    0.03 sec
+ 9/17 Test  #9: VortexZkKeyMatrixTest ............   Passed    0.00 sec
+10/17 Test #10: VortexTensorV6Test ...............   Passed    0.01 sec
+11/17 Test #11: VortexSwarmP2PTest ...............   Passed    0.21 sec
+12/17 Test #12: VortexGaloisTrieTest .............   Passed    0.01 sec
+13/17 Test #13: VortexLandauerMevTest ............   Passed    0.00 sec
+14/17 Test #14: VortexGqcRingStealthTest .........   Passed    0.03 sec
+15/17 Test #15: VortexVaultHtlcTest ..............   Passed    0.01 sec
+16/17 Test #16: VortexChaosFuzzerTest ............   Passed    1.40 sec
+17/17 Test #17: VortexPqSignatureTest ............   Passed    2.96 sec
 ```
 
-### 3.3 The 75 named gtest cases (complete enumeration)
+### 3.3 The 79 named gtest cases (complete enumeration)
 
 **VortexSwarmP2PTest** (tests/test_swarm_p2p.cpp, 6 cases)
 
@@ -270,7 +271,7 @@ discrete test blocks.
 | `SgmtProofForgeryZeroFalsePositives` | forged SGMT proofs have zero false accepts |
 | `FullChaosRoundInvariants` | a full chaos round keeps every documented invariant |
 
-**VortexDocumentedGapsTest** (tests/test_documented_gaps.cpp, 17 cases)
+**VortexDocumentedGapsTest** (tests/test_documented_gaps.cpp, 22 cases)
 
 | Case | Property proven |
 |---|---|
@@ -291,6 +292,11 @@ discrete test blocks.
 | `WitnessRootMismatchRejected` | a witness whose XMSS root differs from the sender's bound key is refused before any balance check |
 | `SelfCertifyingAddressAutoBinds` | a "PQA" address binds to its key on the first witnessed spend; a foreign key is refused afterwards, the owner keeps spending |
 | `WitnessDurableLogSurvivesRestart` | the `<ledger>.pqw` sidecar fsyncs a VXPQWT1 record per registration and replays it on attach (BACKLOG 0.8) |
+| `SecondGenesisMintInBlockRejected` | two GENESIS mints in one height-1 block: the second is refused with `second GENESIS mint in one block`, nothing applies (round 9) |
+| `EmissionScheduleShapeSevenBillion` | the hard-coded schedule: 1,000 VX x 7,000,000 blocks = exactly the 7,000,000,000 VX cap (7e17 atoms), flat inside the window, zero at height 0 and after it |
+| `CoinbaseEntitlementEnforced` | a coinbase one atom above subsidy + fee share is refused; the exact subsidy mints and is booked into the issued-supply counter |
+| `SupplyCapHardStopsIssuance` | with one VX of headroom left, nothing larger can be issued; the final partial subsidy closes the cap exactly; afterwards not one more atom - zero-amount coinbases (fee redistribution) still apply |
+| `SubsidyEndsAfterEmissionWindow` | after block 7,000,000 the subsidy is zero: the exact old reward is refused, a zero-amount coinbase still applies |
 
 ### 3.4 The 27 numbered blocks in the scenario-style mains (complete enumeration)
 **VortexMathTest** (tests/test_vortex.cpp, 6 blocks)
@@ -340,7 +346,7 @@ discrete test blocks.
 | 4 | Frequency (NIST-style) | 100 folded 256-bit digests (25,600 bits): ones 12,828 / zeros 12,772, S_obs 0.350, **p-value 0.726** (alpha 0.01) |
 | 5 | All suites | all 5 cryptographic suites passed |
 
-### 3.5 Real per-case timings (all 75 gtest cases, captured output)
+### 3.5 Real per-case timings (all 79 gtest cases, captured output)
 
 Reproduce: `cd build && for b in test_mempool test_galois_trie
 test_swarm_p2p test_reorg test_vault_memory test_vault_htlc test_vm
@@ -360,11 +366,12 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 2 tests from 1 test suite ran. (0 ms total)
 [  PASSED  ] 2 tests.
+
 [==========] Running 4 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 4 tests from VortexGaloisTrieTest
 [ RUN      ] VortexGaloisTrieTest.Insert100KeysDeterministicRoot
-[       OK ] VortexGaloisTrieTest.Insert100KeysDeterministicRoot (7 ms)
+[       OK ] VortexGaloisTrieTest.Insert100KeysDeterministicRoot (6 ms)
 [ RUN      ] VortexGaloisTrieTest.GetRoundTripAndAbsentKeys
 [       OK ] VortexGaloisTrieTest.GetRoundTripAndAbsentKeys (0 ms)
 [ RUN      ] VortexGaloisTrieTest.ProofGenerateVerifyUnder2048Bytes
@@ -376,6 +383,7 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 4 tests from 1 test suite ran. (10 ms total)
 [  PASSED  ] 4 tests.
+
 [==========] Running 6 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 6 tests from VortexSwarmP2PTest
@@ -396,6 +404,7 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 6 tests from 1 test suite ran. (204 ms total)
 [  PASSED  ] 6 tests.
+
 [==========] Running 1 test from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 1 test from VortexChainReorgTest
@@ -406,22 +415,24 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 1 test from 1 test suite ran. (0 ms total)
 [  PASSED  ] 1 test.
+
 [==========] Running 4 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 4 tests from VortexVaultMemoryTest
 [ RUN      ] VortexVaultMemoryTest.PageStateTransitionsAndBurning
-[       OK ] VortexVaultMemoryTest.PageStateTransitionsAndBurning (3 ms)
+[       OK ] VortexVaultMemoryTest.PageStateTransitionsAndBurning (4 ms)
 [ RUN      ] VortexVaultMemoryTest.HardwareUuidBindingSeed
 [       OK ] VortexVaultMemoryTest.HardwareUuidBindingSeed (0 ms)
 [ RUN      ] VortexVaultMemoryTest.EmergencyBurnAll
-[       OK ] VortexVaultMemoryTest.EmergencyBurnAll (2 ms)
+[       OK ] VortexVaultMemoryTest.EmergencyBurnAll (3 ms)
 [ RUN      ] VortexVaultMemoryTest.RegisterScrubbing
 [       OK ] VortexVaultMemoryTest.RegisterScrubbing (0 ms)
-[----------] 4 tests from VortexVaultMemoryTest (6 ms total)
+[----------] 4 tests from VortexVaultMemoryTest (8 ms total)
 
 [----------] Global test environment tear-down
-[==========] 4 tests from 1 test suite ran. (6 ms total)
+[==========] 4 tests from 1 test suite ran. (8 ms total)
 [  PASSED  ] 4 tests.
+
 [==========] Running 4 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 4 tests from VortexVaultHtlcTest
@@ -438,6 +449,7 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 4 tests from 1 test suite ran. (2 ms total)
 [  PASSED  ] 4 tests.
+
 [==========] Running 5 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 5 tests from VortexVMTest
@@ -456,6 +468,7 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 5 tests from 1 test suite ran. (0 ms total)
 [  PASSED  ] 5 tests.
+
 [==========] Running 6 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 6 tests from VortexLandauerMevTest
@@ -476,43 +489,46 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 6 tests from 1 test suite ran. (1 ms total)
 [  PASSED  ] 6 tests.
+
 [==========] Running 6 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 6 tests from VortexGqcRingStealthTest
 [ RUN      ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked
-[       OK ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked (19 ms)
+[       OK ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked (18 ms)
 [ RUN      ] VortexGqcRingStealthTest.GqcQuorumForgeableFromPublicDataOnly
   [documented gap] GQC quorum forged from public data only: 9/9 shares, zero secrets used. Validator authentication is a BACKLOG 0.4/2.4 item; until then cryptographic finality is NOT claimed.
 [       OK ] VortexGqcRingStealthTest.GqcQuorumForgeableFromPublicDataOnly (0 ms)
 [ RUN      ] VortexGqcRingStealthTest.GqcAggregationDeterministic
 [       OK ] VortexGqcRingStealthTest.GqcAggregationDeterministic (0 ms)
 [ RUN      ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs
-[       OK ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs (3 ms)
+[       OK ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs (2 ms)
 [ RUN      ] VortexGqcRingStealthTest.RingPipelineWrapAround
 [       OK ] VortexGqcRingStealthTest.RingPipelineWrapAround (2 ms)
 [ RUN      ] VortexGqcRingStealthTest.StealthEnvelopeOneOfSixteen
 [       OK ] VortexGqcRingStealthTest.StealthEnvelopeOneOfSixteen (0 ms)
-[----------] 6 tests from VortexGqcRingStealthTest (24 ms total)
+[----------] 6 tests from VortexGqcRingStealthTest (23 ms total)
 
 [----------] Global test environment tear-down
-[==========] 6 tests from 1 test suite ran. (24 ms total)
+[==========] 6 tests from 1 test suite ran. (23 ms total)
 [  PASSED  ] 6 tests.
+
 [==========] Running 4 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 4 tests from VortexTensorV6Test
 [ RUN      ] VortexTensorV6Test.FastReducerAndSacEvaluation
-[       OK ] VortexTensorV6Test.FastReducerAndSacEvaluation (3 ms)
+[       OK ] VortexTensorV6Test.FastReducerAndSacEvaluation (2 ms)
 [ RUN      ] VortexTensorV6Test.MultiTensorV6Pipeline
 [       OK ] VortexTensorV6Test.MultiTensorV6Pipeline (0 ms)
 [ RUN      ] VortexTensorV6Test.TensorNoZeroCollapse
 [       OK ] VortexTensorV6Test.TensorNoZeroCollapse (0 ms)
 [ RUN      ] VortexTensorV6Test.VirtualTensorEvolution
 [       OK ] VortexTensorV6Test.VirtualTensorEvolution (0 ms)
-[----------] 4 tests from VortexTensorV6Test (3 ms total)
+[----------] 4 tests from VortexTensorV6Test (2 ms total)
 
 [----------] Global test environment tear-down
-[==========] 4 tests from 1 test suite ran. (3 ms total)
+[==========] 4 tests from 1 test suite ran. (2 ms total)
 [  PASSED  ] 4 tests.
+
 [==========] Running 9 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 9 tests from VortexZkKeyMatrixTest
@@ -539,82 +555,93 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment tear-down
 [==========] 9 tests from 1 test suite ran. (0 ms total)
 [  PASSED  ] 9 tests.
+
 [==========] Running 6 tests from 1 test suite.
 [----------] Global test environment set-up.
 [----------] 6 tests from VortexChaosFuzzerTest
 [ RUN      ] VortexChaosFuzzerTest.WireHeaderChaos10k
-[       OK ] VortexChaosFuzzerTest.WireHeaderChaos10k (297 ms)
+[       OK ] VortexChaosFuzzerTest.WireHeaderChaos10k (290 ms)
 [ RUN      ] VortexChaosFuzzerTest.FrameTxChaos10k
-[       OK ] VortexChaosFuzzerTest.FrameTxChaos10k (296 ms)
+[       OK ] VortexChaosFuzzerTest.FrameTxChaos10k (292 ms)
 [ RUN      ] VortexChaosFuzzerTest.VmBytecodeChaos10k
-[       OK ] VortexChaosFuzzerTest.VmBytecodeChaos10k (292 ms)
+[       OK ] VortexChaosFuzzerTest.VmBytecodeChaos10k (297 ms)
 [ RUN      ] VortexChaosFuzzerTest.VmInfiniteLoopBounded
 [       OK ] VortexChaosFuzzerTest.VmInfiniteLoopBounded (2 ms)
 [ RUN      ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives
-[       OK ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives (293 ms)
+[       OK ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives (296 ms)
 [ RUN      ] VortexChaosFuzzerTest.FullChaosRoundInvariants
-[       OK ] VortexChaosFuzzerTest.FullChaosRoundInvariants (290 ms)
-[----------] 6 tests from VortexChaosFuzzerTest (1472 ms total)
+[       OK ] VortexChaosFuzzerTest.FullChaosRoundInvariants (292 ms)
+[----------] 6 tests from VortexChaosFuzzerTest (1473 ms total)
 
 [----------] Global test environment tear-down
-[==========] 6 tests from 1 test suite ran. (1472 ms total)
+[==========] 6 tests from 1 test suite ran. (1473 ms total)
 [  PASSED  ] 6 tests.
-[==========] Running 18 tests from 1 test suite.
+
+[==========] Running 22 tests from 1 test suite.
 [----------] Global test environment set-up.
-[----------] 18 tests from VortexDocumentedGapsTest
+[----------] 22 tests from VortexDocumentedGapsTest
 [ RUN      ] VortexDocumentedGapsTest.NoWorkBlockAccepted
 [       OK ] VortexDocumentedGapsTest.NoWorkBlockAccepted (18 ms)
 [ RUN      ] VortexDocumentedGapsTest.KeylessTheftRejected
   [closed] keyless theft rejected: the genesis receiver is PQ-bound to an OFFLINE key (secret not in the repo) and no witness exists for the forged transfer (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.KeylessTheftRejected (30 ms)
+[       OK ] VortexDocumentedGapsTest.KeylessTheftRejected (4 ms)
 [ RUN      ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected
   [fixed] intra-block double spend rejected with 'insufficient funds'; no U128 underflow, no phantom balance.
-[       OK ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected (167 ms)
+[       OK ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected (83 ms)
 [ RUN      ] VortexDocumentedGapsTest.CoinbaseReplayRejected
   [closed] coinbase bound to the chain position: replaying the tag on a competing fork is refused; the honest coinbase pays the producer (BACKLOG 0.6 remainder).
-[       OK ] VortexDocumentedGapsTest.CoinbaseReplayRejected (75 ms)
+[       OK ] VortexDocumentedGapsTest.CoinbaseReplayRejected (56 ms)
 [ RUN      ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected
   [closed] one GENESIS mint per block in the legacy window: the second mint is refused and the block applies nothing.
-[       OK ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected (18 ms)
+[       OK ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected (67 ms)
+[ RUN      ] VortexDocumentedGapsTest.EmissionScheduleShapeSevenBillion
+  [closed] emission hard-coded: 1,000 VX x 7,000,000 blocks = 7,000,000,000 VX lifetime cap (the root-of-seven digit).
+[       OK ] VortexDocumentedGapsTest.EmissionScheduleShapeSevenBillion (0 ms)
+[ RUN      ] VortexDocumentedGapsTest.CoinbaseEntitlementEnforced
+[       OK ] VortexDocumentedGapsTest.CoinbaseEntitlementEnforced (0 ms)
+[ RUN      ] VortexDocumentedGapsTest.SupplyCapHardStopsIssuance
+[       OK ] VortexDocumentedGapsTest.SupplyCapHardStopsIssuance (0 ms)
+[ RUN      ] VortexDocumentedGapsTest.SubsidyEndsAfterEmissionWindow
+[       OK ] VortexDocumentedGapsTest.SubsidyEndsAfterEmissionWindow (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.NonceZeroReplayRejected
   [fixed] fee=0/nonce=0 replay at height 3 rejected with 'nonce mismatch' - the legacy exemption is scoped to the genesis window.
-[       OK ] VortexDocumentedGapsTest.NonceZeroReplayRejected (160 ms)
+[       OK ] VortexDocumentedGapsTest.NonceZeroReplayRejected (119 ms)
 [ RUN      ] VortexDocumentedGapsTest.OversizedTxCountRejected
-[       OK ] VortexDocumentedGapsTest.OversizedTxCountRejected (14 ms)
+[       OK ] VortexDocumentedGapsTest.OversizedTxCountRejected (13 ms)
 [ RUN      ] VortexDocumentedGapsTest.TamperedMerkleRejected
-[       OK ] VortexDocumentedGapsTest.TamperedMerkleRejected (38 ms)
+[       OK ] VortexDocumentedGapsTest.TamperedMerkleRejected (4 ms)
 [ RUN      ] VortexDocumentedGapsTest.HtlcVmFailureForcesLocked
   [fixed] HTLC with a runtime-corrupted opcode settles LOCKED; the VM verdict gates the contract outcome.
 [       OK ] VortexDocumentedGapsTest.HtlcVmFailureForcesLocked (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked
   [fixed] vault token with 28 mutated tail bytes is rejected; the full 32-byte digest is checked.
-[       OK ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked (2 ms)
+[       OK ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked (1 ms)
 [ RUN      ] VortexDocumentedGapsTest.VaultPoolFullNotClobber
   [fixed] full vault pool refuses instead of zeroing a live LOCKED page; both tokens survive.
 [       OK ] VortexDocumentedGapsTest.VaultPoolFullNotClobber (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.TailMetadataCommitted
 [       OK ] VortexDocumentedGapsTest.TailMetadataCommitted (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce
-[       OK ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce (315 ms)
+[       OK ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce (451 ms)
 [ RUN      ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame
-[       OK ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame (23 ms)
+[       OK ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame (77 ms)
 [ RUN      ] VortexDocumentedGapsTest.UnboundSenderRejected
   [closed] a valid witness from an UNBOUND key spends nothing: the sender address commits no PQ root (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.UnboundSenderRejected (42 ms)
+[       OK ] VortexDocumentedGapsTest.UnboundSenderRejected (40 ms)
 [ RUN      ] VortexDocumentedGapsTest.WitnessRootMismatchRejected
   [closed] a witness whose XMSS root differs from the sender's bound key is refused before any balance check (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.WitnessRootMismatchRejected (50 ms)
+[       OK ] VortexDocumentedGapsTest.WitnessRootMismatchRejected (64 ms)
 [ RUN      ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds
   [closed] self-certifying address: first witnessed spend binds it to its key; a foreign key is refused, the owner keeps spending (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds (265 ms)
+[       OK ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds (226 ms)
 [ RUN      ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart
   [closed] durable witness sidecar: registration fsyncs a VXPQWT1 record and a restart replays it (BACKLOG 0.8).
-[       OK ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart (32 ms)
-[----------] 18 tests from VortexDocumentedGapsTest (1256 ms total)
+[       OK ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart (34 ms)
+[----------] 22 tests from VortexDocumentedGapsTest (1267 ms total)
 
 [----------] Global test environment tear-down
-[==========] 18 tests from 1 test suite ran. (1256 ms total)
-[  PASSED  ] 18 tests.
+[==========] 22 tests from 1 test suite ran. (1267 ms total)
+[  PASSED  ] 22 tests.
 ```
 
 Timing facts worth noting (not benchmark claims, just this CPU):
@@ -635,23 +662,24 @@ Recorded result (with the leaf-lifecycle fix in, so TEST 8 ran under
 both sanitizers):
 
 ```
-100% tests passed out of 16
-Total Test time (real) = 9.40 sec
+100% tests passed out of 17
+Total Test time (real) = 11.90 sec
 ```
 
 Tail of the per-binary output (real):
 
 ```
-10/16 VortexSwarmP2PTest   Passed  0.22 sec
-11/16 VortexGaloisTrieTest Passed  0.04 sec
-12/16 VortexLandauerMevTest Passed 0.02 sec
-13/16 VortexGqcRingStealthTest Passed 0.03 sec
-14/16 VortexVaultHtlcTest  Passed  0.02 sec
-15/16 VortexChaosFuzzerTest Passed 3.99 sec
-16/16 VortexPqSignatureTest Passed 4.81 sec
+10/17 Test #10: VortexTensorV6Test ...............   Passed    0.02 sec
+11/17 Test #11: VortexSwarmP2PTest ...............   Passed    0.33 sec
+12/17 Test #12: VortexGaloisTrieTest .............   Passed    0.05 sec
+13/17 Test #13: VortexLandauerMevTest ............   Passed    0.02 sec
+14/17 Test #14: VortexGqcRingStealthTest .........   Passed    0.10 sec
+15/17 Test #15: VortexVaultHtlcTest ..............   Passed    0.02 sec
+16/17 Test #16: VortexChaosFuzzerTest ............   Passed    4.14 sec
+17/17 Test #17: VortexPqSignatureTest ............   Passed    5.27 sec
 ```
 
-Property: zero sanitizer findings anywhere in the 83 test blocks. CI runs
+Property: zero sanitizer findings anywhere in the 106 test blocks. CI runs
 the same lane on every push (`.github/workflows/ci.yml`, job `asan`).
 
 Not covered by this lane: TSan (data races). The swarm layer grew
@@ -977,7 +1005,7 @@ from the repo root after building (section 2).
 | # | Claim | Command | Expected result |
 |---|---|---|---|
 | C1 | 17/17 tests pass | `cd build && ctest` | `100% tests passed out of 17` |
-| C2 | 83 test blocks exist | `cd build && for b in test_*; do ./$b --gtest_list_tests 2>/dev/null; done \| ...` or read section 3 | counts match 3.3/3.4 |
+| C2 | 106 test blocks exist | `cd build && for b in test_*; do ./$b --gtest_list_tests 2>/dev/null; done \| ...` or read section 3 | counts match 3.3/3.4 |
 | C3 | Sanitizer-clean suite | `cd build_san && ctest` | 17/17, no ASan/UBSan output |
 | C4 | Frame geometry is exact | `cd build && ./test_block` | sizes 472/112/65536 printed and asserted |
 | C5 | Capacity is 580 tx | `./build/test_block` | 581st tx rejected |
@@ -1342,6 +1370,7 @@ Notes on fidelity:
 | (2026-11-03, round 8, self-review) | Adversarial hardening of the round-7 code (internal pass — findings fixed by our own audit, not externally replicated; full narrative in VERIFICATION_RECORD §6, round 8). (1) P0: the VX60 plausibility gate still stopped at 0x08, dead-coding `PQ_WITNESS` (0x09) — witnesses could never arrive over the wire; gate widened to 0x01..0x09. (2) P0: the RPC transfer path registered an UNVERIFIED witness and left the block store one block ahead of the ledger whenever the state layer refused a gate-passed block (every later block then fails the height gate — a permanent wedge). Fixed: verify the full WOTS+/XMSS + anchor chain BEFORE registering; new `BlockStore::rollback_last_append()` (ftruncate to the previous tip) wired into the RPC path, the remote-frame path and the miner; the miner no longer applies a frame that failed to append. (3) P1: the witness registry hardened into a verified cache — nothing enters unverified, byte-exact dedup, caps 8 candidates/digest and 50000 digests, sidecar opened O_APPEND 0600 under exclusive flock with memory-only fallback, fail-closed replay honoring the caps, and consensus switched to `lookup_verifying()` (a digest may hold attacker candidates that simply do not verify against the honest transaction). (4) P2: self-certifying PQ bindings are now transactional — collected during validation, applied only after the whole block validates. (5) P2 (found live): the RPC JSON scanner matched only compact JSON, so standard serializers got a misleading "witness required" error, and one `recv()` was treated as one request, truncating split ~3.2 KB witness bodies; now whitespace-tolerant extraction + read-until-Content-Length (64 KiB cap). Live re-verified: garbage 2376-byte witness refused with the WOTS+/XMSS diagnostic and never registered; wrong-nonce diagnostic exact; failed transfers leave balances byte-identical; compact and spaced JSON behave identically. Suite: 17/17 on GCC, ASan+UBSan and fuzz lanes after every fix; fuzz smokes clean.
 
 | (2026-11-03, round 9, delegated audit) | Three hunt-fix-re-hunt cycles over the full tree; every finding proven with an executable exploit before the fix (record in VERIFICATION_RECORD §6, round 9). Fixed: health-loop self-deadlock on the DoS-ban path (one bad-magic frame from any local process froze the whole node — remotely triggerable P0); unbounded GENESIS minting inside one height-1 block (the legacy window read committed balances, so N mints in one block all applied — P0, regression `SecondGenesisMintInBlockRejected`); unbounded blocking sends under the state/peer locks (5 s SO_SNDTIMEO on every socket); double-close fd-reuse race on banned peers (proven with an LD_PRELOAD close-generation tracker: 41 double-closes before, 0 after); unbounded remote memory growth via /api/state/prove (persistent trie stayed read-only, ~32 arena nodes/request growth eliminated); UB float→integer casts on RPC numbers. Report-only with reasons: dormant miner's unsynchronized commit, mempool races behind a zero-caller submit, undo journal raw writes (BACKLOG 0.11), broadcast fd snapshots (receiver fails closed), 0.0.0.0 bind. Same wave: the multi-node harness now drives a real PQ-witnessed transfer through the demo signer (`demo_key:"spender"` + named tx fields + witness_b64) — 10/10 including tip and balance convergence on B and C with post-quantum authorization on every node; the demo signer returns the witness IT just signed (out-parameter on pq_sign_transaction — the registry may hold several valid candidates per digest); fuzz_pq_witness deepened to targeted mutations of a structurally valid witness (cov 2 -> 25, ~245k runs clean). Suite after every fix: 17/17 on GCC, ASan+UBSan and fuzz lanes.
+| (2026-11-03, emission schedule, user-directed) | The emission schedule is hard-coded in consensus: `include/vx/blockchain/emission.hpp` defines the lifetime cap 7,000,000,000 VX (7e17 atoms; the 7 is the protocol's signature digit) and a flat 1,000 VX block subsidy for heights 1..7,000,000 (zero at height 0 and after the window; 7,000,000 blocks x 1,000 VX = the cap exactly, static_asserted). `LedgerState::apply_block` gates cumulative ISSUANCE - all coinbase credits minus the fee share re-credited to the producer (fee redistribution is not new emission) - against the cap BEFORE any state mutation, so a refused block leaves the ledger byte-identical; the producer's coinbase now carries subsidy + fee share clamped to the remaining headroom, so the final emission blocks mint exactly the remainder and the cap closes; genesis allocations count against the cap; the reorg undo recomputes and reverses a block's issuance; `/api/status` reports `max_supply_vx`, `issued_supply_atomics`, `issuance_headroom_vx`, `emission_window_blocks`. Genesis frame and hash unchanged (`485f5afa...`). The dormant PoGWMiner gains the schedule too (subsidy + fee share, headroom-clamped). New regressions: `EmissionScheduleShapeSevenBillion`, `CoinbaseEntitlementEnforced`, `SupplyCapHardStopsIssuance`, `SubsidyEndsAfterEmissionWindow`. Suite: 17/17 on GCC, ASan+UBSan and fuzz lanes (79 named gtest cases); fuzz smokes clean.
 
 Every commit above is GPG-signed locally and **not pushed** at the time
 of signing this document; the push decision stays with the repository
