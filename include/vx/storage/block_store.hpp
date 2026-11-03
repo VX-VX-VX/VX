@@ -73,6 +73,14 @@ public:
     /// false when no record exists or the sidecar contains a corrupt record
     /// (fail closed).
     bool gqc_stamp(uint64_t height, uint8_t out[32]) const;
+
+    /// Highest height stamped in the GQC sidecar (BACKLOG 0.13: the
+    /// finalized checkpoint must outlive the process — on open the rollback
+    /// guard restores it, fail-closed and monotonic). clean=false when the
+    /// sidecar contains a corrupt record — the caller must NOT trust the
+    /// returned height then; a torn tail (fewer than 48 trailing bytes) is
+    /// healed by truncation instead.
+    uint64_t highest_gqc_stamp(bool& clean) const;
     const std::string& path() const noexcept { return path_; }
 
 private:

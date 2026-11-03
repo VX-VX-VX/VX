@@ -7,7 +7,11 @@
 namespace vx::consensus {
 
 GqcFinality::GqcFinality(state::UndoEngine& undo, storage::BlockStore& store)
-    : undo_(undo), store_(store) {}
+    : undo_(undo), store_(store),
+      // BACKLOG 0.13: the undo engine restores the persisted checkpoint
+      // from the store's GQC sidecar on open — seed from it so a restarted
+      // node reports the cemented height instead of 0.
+      finalized_height_(undo.finalized_checkpoint_height()) {}
 
 std::array<uint8_t, 32> GqcFinality::derive_validator_share(
     const std::array<uint8_t, 32>& block_hash,

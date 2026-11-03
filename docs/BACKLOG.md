@@ -375,20 +375,38 @@ permanently gapped senders).
   0.13 (with checkpoint persistence); `load_displaced_frames()` exists
   and is tested, the re-attach consumer ships with the deeper net stack.
 
-### 0.13 GQC checkpoint persistence (RAM-only finalized_height_)
+### 0.13 GQC checkpoint persistence (RAM-only finalized_height_) — CLOSED 2026-11-03
 
 External review (round 4): `finalized_height_` lives only in RAM. After a
 restart the node forgets what was cemented and `rollback_to_height` may
 cross a previously finalized checkpoint — the "absolute defence" against
 deep reorgs evaporates on reboot.
 
-- [ ] Persist the finalized checkpoint (block tail stamp already exists;
-  add a small side-file or scan-back on open: highest height whose tail
-  aggregate verifies against the share-derived recomputation).
-- [ ] `lock_finalized_height` on open must never report a height lower
-  than the persisted one (fail-closed, monotonic).
+- [x] Persist the finalized checkpoint: the `<ledger>.gqc` sidecar stamp
+  already existed (round 5); what was missing is the restore. On open the
+  undo engine now scans the sidecar (`BlockStore::highest_gqc_stamp`) and
+  re-cements the highest stamped height; `GqcFinality` seeds its reported
+  height from the same restored guard, so `/api/consensus/
+  finality_status` tells the truth after a restart too.
+- [x] `lock_finalized_height` on open never reports a height lower than
+  the persisted one: the restore is monotonic (a lower value cannot lower
+  the guard) and the sidecar scan is fail-closed — a corrupt record means
+  nothing is restored and `finalized_sidecar_trusted()` reports false (no
+  fabricated checkpoint); a torn tail (a crash mid-stamp) is healed by
+  truncation to the last complete record, like the undo journal.
+- [x] Test: `GqcCheckpointSurvivesRestart` — certify block N, "restart"
+  (fresh ledger + fresh undo engine over the same store), the guard
+  reports N again, `lock_finalized_height(0)` cannot lower it, rollback
+  to N-1 is refused with `ERR_FINALIZED_BY_GQC`; a corrupt sidecar is
+  reported untrusted and fabricates nothing.
 - Acceptance: restart test — finalize block N, restart, rollback to N-1
-  is refused.
+  refused. Met.
+- Honest remainder: a corrupt sidecar is not rebuilt automatically (the
+  stamps are re-written by re-certification; until then the guard
+  protects only what the running process cemented). Verifying a restored
+  stamp against the share-derived recomputation on open belongs to the
+  validator-authentication cycle (BACKLOG 0.4 / 2.4), since shares
+  currently derive from public data.
 
 ### 0.14 Mempool per-sender nonce ordering + publication race
 

@@ -16,6 +16,7 @@
 #include <cstring>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <unistd.h>
 
@@ -111,7 +112,98 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     const auto cert2 = gqc2.finalize_block(tip_h, h2, kValidators);
     EXPECT_FALSE(cert2.certified);
     EXPECT_NE(cert2.error.find("quorum"), std::string::npos);
-    EXPECT_EQ(gqc2.finalized_checkpoint_height(), 0u);
+    // BACKLOG 0.13: the guard is seeded from the persisted checkpoint (the
+    // undo engine restored it), so a second finality object reports the
+    // cemented height, not 0 — the quorum failure adds nothing new to it.
+    EXPECT_EQ(gqc2.finalized_checkpoint_height(), tip_h);
+
+    std::filesystem::remove_all(tmp_dir);
+}
+
+// ── BACKLOG 0.13: the finalized checkpoint outlives the process. After a
+// restart the rollback guard must report at least the persisted cemented
+// height (fail-closed, monotonic), a rollback below it must still be
+// refused, and a sidecar that does not parse cleanly must not be trusted.
+TEST(VortexGqcRingStealthTest, GqcCheckpointSurvivesRestart) {
+    const std::string tmp_dir = (std::filesystem::temp_directory_path() / ("vx_gqc_restart_" + std::to_string(::getpid()))).string();
+    std::filesystem::create_directories(tmp_dir);
+
+    vx::storage::BlockStore store(tmp_dir + "/gqc_restart.vxb", "genesis.bin", 1);
+
+    // Mine one block so there is a non-genesis tip to certify.
+    {
+        vx::blockchain::BlockBuilder builder;
+        builder.set_height(store.chain_height());
+        builder.set_timestamp(1'761'000'005ULL); // >= genesis ts
+        uint8_t tip0[32] = {};
+        store.tip_hash(tip0);
+        builder.set_prev_hash(tip0);
+        std::array<uint8_t, 384> coords{};
+        builder.set_attractor_coords(coords.data());
+        vx::blockchain::Transaction mint{};
+        vx::blockchain::set_nfa_field(mint.sender_nfa, "MINER_GQC_RESTART_000000000000000000000000");
+        vx::blockchain::set_nfa_field(mint.receiver_nfa, "GQC_RESTART_RECV_00000000000000000000000");
+        vx::blockchain::tx_set_amount(mint, 1'000'000);
+        vx::blockchain::tx_set_fee(mint, 100);
+        vx::blockchain::set_coinbase_binding(mint, store.chain_height(), tip0);
+        builder.add_transaction(mint);
+        builder.finalize();
+        vx::blockchain::BlockFrame frame;
+        std::memcpy(frame.data(), builder.bytes().data(), 65536);
+        ASSERT_TRUE(vx::blockchain::seal_pogw_nonce(frame, 1)) << "PoGW seal failed";
+        ASSERT_TRUE(store.append_block(frame)) << "test block rejected";
+    }
+    const uint64_t tip_h = store.chain_height() - 1;
+    ASSERT_GE(tip_h, 1u);
+
+    // Session 1: certify the tip with a full quorum.
+    {
+        vx::state::LedgerState ledger;
+        vx::state::UndoEngine undo(tmp_dir, store, ledger);
+        GqcFinality gqc(undo, store);
+        uint8_t tip[32];
+        store.tip_hash(tip);
+        std::array<uint8_t, 32> block_hash{};
+        std::memcpy(block_hash.data(), tip, 32);
+        for (uint16_t v = 0; v < 9; ++v) {
+            gqc.collect_share(tip_h, block_hash, v,
+                              GqcFinality::derive_validator_share(block_hash, tip_h, v));
+        }
+        const auto cert = gqc.finalize_block(tip_h, block_hash, 9);
+        ASSERT_TRUE(cert.certified) << cert.error;
+        EXPECT_EQ(undo.finalized_checkpoint_height(), tip_h);
+    }
+
+    // Session 2 (the restart): a fresh ledger and a fresh undo engine over
+    // the SAME store — the guard must come back from the sidecar.
+    {
+        vx::state::LedgerState ledger2;
+        vx::state::UndoEngine undo2(tmp_dir, store, ledger2);
+        EXPECT_TRUE(undo2.finalized_sidecar_trusted());
+        EXPECT_EQ(undo2.finalized_checkpoint_height(), tip_h)
+            << "the checkpoint evaporated on restart (RAM-only guard)";
+        // Monotonic: a lower cement attempt cannot lower the guard.
+        undo2.lock_finalized_height(0);
+        EXPECT_EQ(undo2.finalized_checkpoint_height(), tip_h);
+        // Acceptance: rolling back BELOW the persisted checkpoint is refused.
+        EXPECT_FALSE(undo2.rollback_to_height(tip_h - 1));
+        EXPECT_EQ(undo2.last_error(), "ERR_FINALIZED_BY_GQC");
+    }
+
+    // A sidecar that does not parse cleanly is not trusted: nothing is
+    // fabricated, the engine says so, and the journal still works.
+    {
+        std::ofstream f(tmp_dir + "/gqc_restart.vxb.gqc",
+                        std::ios::binary | std::ios::app);
+        f << std::string(48, '\xFF'); // corrupt record after the valid ones
+    }
+    {
+        vx::state::LedgerState ledger3;
+        vx::state::UndoEngine undo3(tmp_dir, store, ledger3);
+        EXPECT_FALSE(undo3.finalized_sidecar_trusted());
+        EXPECT_EQ(undo3.finalized_checkpoint_height(), 0u)
+            << "a corrupt sidecar must not fabricate a checkpoint";
+    }
 
     std::filesystem::remove_all(tmp_dir);
 }

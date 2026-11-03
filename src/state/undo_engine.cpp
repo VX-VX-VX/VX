@@ -233,6 +233,7 @@ UndoEngine::UndoEngine(const std::string& data_dir, storage::BlockStore& store, 
     undo_file_ = undo_path / "undo.vxl";
     displaced_file_ = undo_path / "displaced.vxd";
     load_latest_undo_journal();
+    restore_finalized_checkpoint();
 }
 
 UndoEngine::~UndoEngine() {
@@ -666,6 +667,36 @@ std::vector<DisplacedFrame> UndoEngine::load_displaced_frames() const {
 void UndoEngine::update_undo_metadata() {
     // Update undo.vxl metadata header
     // This allows quick identification and versioning
+}
+
+void UndoEngine::restore_finalized_checkpoint() {
+    // BACKLOG 0.13: the finalized checkpoint lives only in RAM no longer —
+    // on open the guard is restored from the store's GQC sidecar (the
+    // highest height whose aggregate was stamped by a successful
+    // certification), monotonically: a restart must never report a height
+    // LOWER than the persisted one.
+    if (!store_) {
+        finalized_sidecar_trusted_ = false;
+        return;
+    }
+    bool clean = true;
+    const uint64_t highest = store_->highest_gqc_stamp(clean);
+    if (!clean) {
+        // Fail closed on trust, open on capability: a sidecar that does
+        // not parse cleanly is not trusted, so nothing is restored (the
+        // guard protects only what this process cemented); consensus
+        // never depends on the guard, and re-certification re-stamps the
+        // sidecar.
+        finalized_sidecar_trusted_ = false;
+        std::cerr << "GQC sidecar does not parse cleanly; the persisted"
+                     " finalized checkpoint was not restored"
+                  << std::endl;
+        return;
+    }
+    if (highest > finalized_checkpoint_height_) {
+        finalized_checkpoint_height_ = highest;
+    }
+    finalized_sidecar_trusted_ = true;
 }
 
 bool UndoEngine::emergency_rollback() {

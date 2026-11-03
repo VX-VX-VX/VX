@@ -101,6 +101,13 @@ public:
     }
     /// Last refusal reason (e.g. "ERR_FINALIZED_BY_GQC") after a failed op.
     const std::string& last_error() const noexcept { return last_error_; }
+    /// BACKLOG 0.13: false when the persisted GQC sidecar did not parse
+    /// cleanly on open, so the restored checkpoint could not be trusted.
+    /// The operator re-certifies to rebuild the sidecar; the guard protects
+    /// only what this process cemented in the meantime.
+    bool finalized_sidecar_trusted() const noexcept {
+        return finalized_sidecar_trusted_;
+    }
 
     // Emergency rollback to genesis
     bool emergency_rollback();
@@ -121,11 +128,16 @@ private:
     // them would duplicate every record and double-revert on rollback.
     size_t committed_upto_ = 0;
  uint64_t finalized_checkpoint_height_ = 0; // GQC cement
+    bool finalized_sidecar_trusted_ = true; // BACKLOG 0.13
     std::string last_error_;
 
     void truncate_undo_file();
     void update_undo_metadata();
     void load_latest_undo_journal();
+    // BACKLOG 0.13: restore the persisted finalized checkpoint from the
+    // store's GQC sidecar on open, monotonically (never lower than what
+    // this process already cemented in RAM).
+    void restore_finalized_checkpoint();
 };
 
 } // namespace vx::state

@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <stdexcept>
 
@@ -254,8 +255,7 @@ bool BlockStore::stamp_gqc(uint64_t height, const uint8_t agg[32]) {
     return ok;
 }
 
-bool BlockStore::gqc_stamp(uint64_t height, uint8_t out[32]) const {
-    if (height >= count_) return false;
+bool BlockStore::gqc_stamp(uint64_t height, uint8_t out[32]) const {    if (height >= count_) return false;
     const int gfd = ::open((path_ + ".gqc").c_str(), O_RDONLY);
     if (gfd < 0) return false;
     bool found = false;
@@ -279,6 +279,48 @@ bool BlockStore::gqc_stamp(uint64_t height, uint8_t out[32]) const {
     }
     ::close(gfd);
     return found && !corrupt;
+}
+
+uint64_t BlockStore::highest_gqc_stamp(bool& clean) const {
+    clean = true;
+    const int gfd = ::open((path_ + ".gqc").c_str(), O_RDONLY);
+    if (gfd < 0) return 0; // no sidecar yet: nothing was ever cemented
+
+    struct stat st{};
+    if (::fstat(gfd, &st) < 0 || st.st_size == 0) {
+        ::close(gfd);
+        return 0;
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(st.st_size));
+    const ssize_t got = ::read(gfd, buf.data(), buf.size());
+    ::close(gfd);
+    if (got != static_cast<ssize_t>(buf.size())) {
+        clean = false;
+        return 0;
+    }
+
+    // Records are fixed 48 bytes ("VXGQCRT1" + u64 height + 32 B aggregate).
+    // The highest complete record wins; a bad magic anywhere is corruption
+    // (fail closed: the caller must not trust the result); a torn TAIL of
+    // fewer than 48 bytes is healed by truncation, like the undo journal.
+    constexpr size_t kRec = 48;
+    uint64_t highest = 0;
+    size_t off = 0;
+    while (off + kRec <= buf.size()) {
+        if (std::memcmp(buf.data() + off, "VXGQCRT1", 8) != 0) {
+            clean = false;
+            return highest;
+        }
+        uint64_t h = 0;
+        std::memcpy(&h, buf.data() + off + 8, 8);
+        if (h > highest) highest = h;
+        off += kRec;
+    }
+    if (off != buf.size()) {
+        // Torn tail: heal by truncating to the last complete record.
+        std::filesystem::resize_file(path_ + ".gqc", static_cast<uintmax_t>(off));
+    }
+    return highest;
 }
 
 } // namespace vx::storage

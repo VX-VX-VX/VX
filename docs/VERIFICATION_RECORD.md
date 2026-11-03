@@ -258,9 +258,17 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
   commitment (`hash_block` over header AND tail — a mutated PoGW nonce
   now changes the block id; the published genesis constant was
   recomputed accordingly).
-- **Still open (round 4).** The finalized checkpoint height lives only
-  in RAM: after a restart the rollback guard forgets what was cemented
-  (BACKLOG 0.13, fail-closed restore on open).
+- **Still open (round 4) — CLOSED 2026-11-03 (BACKLOG 0.13).** The
+  finalized checkpoint used to live only in RAM: after a restart the
+  rollback guard forgot what was cemented. The guard is now restored on
+  open from the `<ledger>.gqc` sidecar (highest stamped height,
+  monotonic, fail-closed: a corrupt sidecar is reported untrusted and
+  fabricates nothing; a torn tail is healed). Regression:
+  `GqcCheckpointSurvivesRestart` (certify N, restart, rollback to N-1
+  refused). Honest remainder: a restored stamp is not yet re-verified
+  against the share-derived recomputation on open — that belongs to the
+  validator-authentication cycle (BACKLOG 0.4 / 2.4), since shares
+  currently derive from public data.
 - **Implementation.** `src/consensus/gqc_finality.cpp`;
   `/api/consensus/finality_status` reports checkpoint height, pending
   finality and the rollback guard; `/api/swarm/simulate_split_reorg`
@@ -512,9 +520,9 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     random-input runs and ~245k mutation runs clean).
 - **Still open, pinned honestly (expect-success tests).**
   - (None in this section. The remaining consensus gaps are tracked as
-    BACKLOG items with design notes: GQC checkpoint durability 0.13,
-    mempool ordering/races 0.14 — none of them pinned as expect-success
-    tests yet; pinning them is part of their fix cycle.)
+    BACKLOG items with design notes: mempool ordering/races 0.14 — none
+    of them pinned as expect-success tests yet; pinning them is part of
+    their fix cycle.)
   - *Undo journal serialization* (CLOSED 2026-11-03, BACKLOG 0.11):
     `UndoRecord` holds `std::string` / `std::vector` / `time_point` and
     was written with a raw `write(fd, &record, sizeof(record))` — heap
@@ -888,6 +896,11 @@ security just advanced this pass, memory safety via TSan (BACKLOG 1.4).
   rollback + re-apply is byte-identical to a fresh apply — see
   [VERIFICATION_EVIDENCE.md](VERIFICATION_EVIDENCE.md) for the full
   evidence chain.
+- **Finality checkpoint persisted** (BACKLOG 0.13, 2026-11-03): the
+  rollback guard is restored on open from the GQC sidecar — the
+  "absolute defence" against deep reorgs no longer evaporates on reboot
+  (certify N, restart, rollback to N-1 refused, pinned by
+  `GqcCheckpointSurvivesRestart`).
 
 ## Explicitly not promised
 
