@@ -322,13 +322,13 @@ non-trivial member.
   clean.
   Regressions: `UndoJournalByteFormatRoundTrip`,
   `UndoJournalRejectsHostileFiles`.
-  Honest remainder for 0.12: the in-memory journal now retains records
+  Honest remainder for 0.13: the in-memory journal now retains records
   after commit (rollback must keep working post-commit), so journal
-  pruning below the GQC checkpoint belongs to 0.12/0.13.
+  pruning below the GQC checkpoint belongs to 0.13.
 - Acceptance: the replay path touches only plain bytes; ASan lane runs a
   rollback-over-poisoned-journal case clean.
 
-### 0.12 Reorg undo correctness (journal the displaced block, restore nonces)
+### 0.12 Reorg undo correctness (journal the displaced block, restore nonces) — CLOSED 2026-11-03
 
 External review (round 4): `rollback_to_height` reads the block at the
 rollback height from the store BEFORE the truncation append, so the
@@ -337,13 +337,43 @@ on ordering; and `UndoTransaction` restores balances but not sender
 nonces, so a reorg can desynchronize nonce accounting (replayed or
 permanently gapped senders).
 
-- [ ] Journal the DISPLACED block frames (read before truncate, write
-  before rollback), so a rollback is replayable in both directions.
-- [ ] Snapshot/restore `next_nonce` per sender inside `UndoTransaction`
-  alongside balances.
-- [ ] Test: reorg across a block whose txs advanced nonces, then
-  re-apply the same txs; nonces and balances must both converge.
+- [x] The journal records transactions FROM THE FRAME BEING APPLIED, not
+  from the store: the resync path journals before the store append, so
+  reading the store at that height captured the DISPLACED block's
+  transactions — the rollback then reversed effects that never happened
+  on this fork. The pre-state tip now comes from the block's own
+  prev_hash, so journaling is ordering-independent.
+- [x] Journal the DISPLACED block frames: `rollback_to_height` preserves
+  every block above the target in the side journal `undo/displaced.vxd`
+  ("VXDISPLC", byte-format records `u64 height | u32 len | frame`, same
+  fail-closed policy as the undo journal — foreign magic or a torn record
+  yields nothing, 64 MiB cap) BEFORE any state is mutated, so a reorg is
+  replayable in both directions (`load_displaced_frames()` reads them
+  back, tested byte-exact).
+- [x] Snapshot/restore sender nonces: every undo transaction carries the
+  sender's pre-block next-nonce (journal format version 2); rollback
+  restores it newest-first, so the oldest pre-fork snapshot wins for
+  senders that spent in several rolled-back blocks. Coinbase senders are
+  not recorded (they never take part in nonce accounting).
+- [x] Restore tracked-account state: addresses a rolled-back fork
+  CREATED (untracked before the block, tracked after) are journaled in a
+  created-address list and erased by the rollback once their reversed
+  balance is zero (`LedgerState::forget_empty_address`). Found by the
+  regression below: without this, re-applying a height-1 GENESIS_2 mint
+  after a rollback is refused forever ("receiver already tracked") — the
+  reorg would brick the node.
+- [x] Test: `ReorgUndoRestoresNoncesAndFrames` — reorg across a fork
+  (a GENESIS_2 mint, then a block with TWO spends from one sender — the
+  intra-block sequential-nonce path), journaled in the resync ordering;
+  rollback to genesis preserves the displaced frames byte-exact and
+  restores balances, nonces AND the tracked-account set; re-applying the
+  same frames lands byte-identical to a fresh apply (total supply, issued
+  supply, balances, sender nonce, account count); a replayed nonce is
+  still refused afterwards.
 - Acceptance: rollback + re-apply is byte-identical to a fresh apply.
+- Honest remainder: journal pruning below the GQC checkpoint belongs to
+  0.13 (with checkpoint persistence); `load_displaced_frames()` exists
+  and is tested, the re-attach consumer ships with the deeper net stack.
 
 ### 0.13 GQC checkpoint persistence (RAM-only finalized_height_)
 

@@ -123,21 +123,21 @@ Recorded result (GCC release, with the leaf-lifecycle fix in):
 ```
 100% tests passed out of 17
 
-Total Test time (real) =  12.71 sec
+Total Test time (real) =  6.30 sec
 ```
 
 Structure: **17 test binaries** - 13 gtest-structured suites carrying
-**81 named test cases** (enumerated in 3.3), plus 4 scenario-style mains
-carrying **27 numbered test blocks** (enumerated in 3.4). Total: 106
+**82 named test cases** (enumerated in 3.3), plus 4 scenario-style mains
+carrying **27 numbered test blocks** (enumerated in 3.4). Total: 109
 discrete test blocks.
 
 ### 3.2 Per-binary results (real ctest output)
 
 ```
-1/17 Test  #1: VortexMathTest ...................   Passed    0.00 sec
- 2/17 Test  #2: VortexDeepCryptoTest .............   Passed    0.04 sec
+ 1/17 Test  #1: VortexMathTest ...................   Passed    0.00 sec
+ 2/17 Test  #2: VortexDeepCryptoTest .............   Passed    0.03 sec
  3/17 Test  #3: VortexBlockTest ..................   Passed    0.01 sec
- 4/17 Test  #4: VortexDocumentedGapsTest .........   Passed    2.46 sec
+ 4/17 Test  #4: VortexDocumentedGapsTest .........   Passed    2.80 sec
  5/17 Test  #5: VortexMempoolTest ................   Passed    0.00 sec
  6/17 Test  #6: VortexVMTest .....................   Passed    0.00 sec
  7/17 Test  #7: VortexChainReorgTest .............   Passed    0.00 sec
@@ -149,11 +149,11 @@ discrete test blocks.
 13/17 Test #13: VortexLandauerMevTest ............   Passed    0.00 sec
 14/17 Test #14: VortexGqcRingStealthTest .........   Passed    0.03 sec
 15/17 Test #15: VortexVaultHtlcTest ..............   Passed    0.01 sec
-16/17 Test #16: VortexChaosFuzzerTest ............   Passed    1.45 sec
-17/17 Test #17: VortexPqSignatureTest ............   Passed    3.01 sec
+16/17 Test #16: VortexChaosFuzzerTest ............   Passed    1.43 sec
+17/17 Test #17: VortexPqSignatureTest ............   Passed    3.00 sec
 ```
 
-### 3.3 The 81 named gtest cases (complete enumeration)
+### 3.3 The 82 named gtest cases (complete enumeration)
 
 **VortexSwarmP2PTest** (tests/test_swarm_p2p.cpp, 6 cases)
 
@@ -272,7 +272,7 @@ discrete test blocks.
 | `SgmtProofForgeryZeroFalsePositives` | forged SGMT proofs have zero false accepts |
 | `FullChaosRoundInvariants` | a full chaos round keeps every documented invariant |
 
-**VortexDocumentedGapsTest** (tests/test_documented_gaps.cpp, 22 cases)
+**VortexDocumentedGapsTest** (tests/test_documented_gaps.cpp, 25 cases)
 
 | Case | Property proven |
 |---|---|
@@ -299,7 +299,8 @@ discrete test blocks.
 | `SupplyCapHardStopsIssuance` | with one VX of headroom left, nothing larger can be issued; the final partial reward closes the cap exactly; afterwards not one more atom - zero-amount coinbases (fee redistribution) still apply |
 | `RewardIndependentOfHeight` | the reward depends on the block's hash, not its height: the 50 VX floor still mints at height 400,000,000 (far past the retired 12,000,000-block window of the earlier draft), a zero-amount coinbase stays legal |
 | `UndoJournalByteFormatRoundTrip` | the journal is a versioned byte format (BACKLOG 0.11): records survive commit + reload, a rollback over them restores balances AND the issued-supply counter exactly, and a second reload + commit does not duplicate records (a duplicate would double-revert on rollback) |
-| `UndoJournalRejectsHostileFiles` | a journal that is not the current format is never replayed: wrong magic, unknown version and mid-file corruption are discarded, a short/torn tail is healed to the last complete record, and pointer-shaped poison bytes are never dereferenced (the rollback-over-poisoned-journal case runs clean under ASan) |
+| `UndoJournalRejectsHostileFiles` | a journal that is not the current format is never replayed: wrong magic, unknown version (including a version-1 file under the v2 format — reject-or-migrate) and mid-file corruption are discarded, a short/torn tail is healed to the last complete record, and pointer-shaped poison bytes are never dereferenced (the rollback-over-poisoned-journal case runs clean under ASan); the displaced-frame side journal gets the same policy |
+| `ReorgUndoRestoresNoncesAndFrames` | a reorg rollback is replayable in both directions (BACKLOG 0.12): the journal records the frame being applied (not whatever the store holds at that height), the rollback preserves the displaced fork frames byte-exact in `undo/displaced.vxd`, restores sender nonces AND the tracked-account set (an address the fork created is untracked once its reversed balance is zero — a re-applied height-1 GENESIS_2 mint used to be refused forever), and re-applying the same frames lands byte-identical to a fresh apply while a replayed nonce stays refused |
 
 ### 3.4 The 27 numbered blocks in the scenario-style mains (complete enumeration)
 **VortexMathTest** (tests/test_vortex.cpp, 6 blocks)
@@ -349,7 +350,7 @@ discrete test blocks.
 | 4 | Frequency (NIST-style) | 100 folded 256-bit digests (25,600 bits): ones 12,828 / zeros 12,772, S_obs 0.350, **p-value 0.726** (alpha 0.01) |
 | 5 | All suites | all 5 cryptographic suites passed |
 
-### 3.5 Real per-case timings (all 81 gtest cases, captured output)
+### 3.5 Real per-case timings (all 82 gtest cases, captured output)
 
 Reproduce: `cd build && for b in test_mempool test_galois_trie
 test_swarm_p2p test_reorg test_vault_memory test_vault_htlc test_vm
@@ -363,11 +364,11 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [ RUN      ] VortexMempoolTest.StaticAssertGeometry
 [       OK ] VortexMempoolTest.StaticAssertGeometry (0 ms)
 [ RUN      ] VortexMempoolTest.MempoolConstruction
-[       OK ] VortexMempoolTest.MempoolConstruction (1 ms)
-[----------] 2 tests from VortexMempoolTest (1 ms total)
+[       OK ] VortexMempoolTest.MempoolConstruction (0 ms)
+[----------] 2 tests from VortexMempoolTest (0 ms total)
 
 [----------] Global test environment tear-down
-[==========] 2 tests from 1 test suite ran. (1 ms total)
+[==========] 2 tests from 1 test suite ran. (0 ms total)
 [  PASSED  ] 2 tests.
 [==========] Running 4 tests from 1 test suite.
 [----------] Global test environment set-up.
@@ -397,13 +398,13 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [ RUN      ] VortexSwarmP2PTest.FullBlockRoundTripOverTcp
 [       OK ] VortexSwarmP2PTest.FullBlockRoundTripOverTcp (0 ms)
 [ RUN      ] VortexSwarmP2PTest.SplitBrainReorgConverges
-[       OK ] VortexSwarmP2PTest.SplitBrainReorgConverges (109 ms)
+[       OK ] VortexSwarmP2PTest.SplitBrainReorgConverges (108 ms)
 [ RUN      ] VortexSwarmP2PTest.ListenerRelaysVerifiedFrameToHook
 [       OK ] VortexSwarmP2PTest.ListenerRelaysVerifiedFrameToHook (100 ms)
-[----------] 6 tests from VortexSwarmP2PTest (210 ms total)
+[----------] 6 tests from VortexSwarmP2PTest (209 ms total)
 
 [----------] Global test environment tear-down
-[==========] 6 tests from 1 test suite ran. (210 ms total)
+[==========] 6 tests from 1 test suite ran. (209 ms total)
 [  PASSED  ] 6 tests.
 [==========] Running 1 test from 1 test suite.
 [----------] Global test environment set-up.
@@ -426,10 +427,10 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [       OK ] VortexVaultMemoryTest.EmergencyBurnAll (3 ms)
 [ RUN      ] VortexVaultMemoryTest.RegisterScrubbing
 [       OK ] VortexVaultMemoryTest.RegisterScrubbing (0 ms)
-[----------] 4 tests from VortexVaultMemoryTest (7 ms total)
+[----------] 4 tests from VortexVaultMemoryTest (8 ms total)
 
 [----------] Global test environment tear-down
-[==========] 4 tests from 1 test suite ran. (7 ms total)
+[==========] 4 tests from 1 test suite ran. (8 ms total)
 [  PASSED  ] 4 tests.
 [==========] Running 4 tests from 1 test suite.
 [----------] Global test environment set-up.
@@ -489,14 +490,14 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment set-up.
 [----------] 6 tests from VortexGqcRingStealthTest
 [ RUN      ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked
-[       OK ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked (19 ms)
+[       OK ] VortexGqcRingStealthTest.GqcFinalizedReorgBlocked (18 ms)
 [ RUN      ] VortexGqcRingStealthTest.GqcQuorumForgeableFromPublicDataOnly
   [documented gap] GQC quorum forged from public data only: 9/9 shares, zero secrets used. Validator authentication is a BACKLOG 0.4/2.4 item; until then cryptographic finality is NOT claimed.
 [       OK ] VortexGqcRingStealthTest.GqcQuorumForgeableFromPublicDataOnly (0 ms)
 [ RUN      ] VortexGqcRingStealthTest.GqcAggregationDeterministic
 [       OK ] VortexGqcRingStealthTest.GqcAggregationDeterministic (0 ms)
 [ RUN      ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs
-[       OK ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs (2 ms)
+[       OK ] VortexGqcRingStealthTest.RingPipelineThroughputNoAllocs (3 ms)
 [ RUN      ] VortexGqcRingStealthTest.RingPipelineWrapAround
 [       OK ] VortexGqcRingStealthTest.RingPipelineWrapAround (2 ms)
 [ RUN      ] VortexGqcRingStealthTest.StealthEnvelopeOneOfSixteen
@@ -552,39 +553,39 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [----------] Global test environment set-up.
 [----------] 6 tests from VortexChaosFuzzerTest
 [ RUN      ] VortexChaosFuzzerTest.WireHeaderChaos10k
-[       OK ] VortexChaosFuzzerTest.WireHeaderChaos10k (296 ms)
+[       OK ] VortexChaosFuzzerTest.WireHeaderChaos10k (294 ms)
 [ RUN      ] VortexChaosFuzzerTest.FrameTxChaos10k
-[       OK ] VortexChaosFuzzerTest.FrameTxChaos10k (293 ms)
+[       OK ] VortexChaosFuzzerTest.FrameTxChaos10k (298 ms)
 [ RUN      ] VortexChaosFuzzerTest.VmBytecodeChaos10k
-[       OK ] VortexChaosFuzzerTest.VmBytecodeChaos10k (291 ms)
+[       OK ] VortexChaosFuzzerTest.VmBytecodeChaos10k (294 ms)
 [ RUN      ] VortexChaosFuzzerTest.VmInfiniteLoopBounded
 [       OK ] VortexChaosFuzzerTest.VmInfiniteLoopBounded (2 ms)
 [ RUN      ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives
-[       OK ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives (289 ms)
+[       OK ] VortexChaosFuzzerTest.SgmtProofForgeryZeroFalsePositives (292 ms)
 [ RUN      ] VortexChaosFuzzerTest.FullChaosRoundInvariants
-[       OK ] VortexChaosFuzzerTest.FullChaosRoundInvariants (284 ms)
-[----------] 6 tests from VortexChaosFuzzerTest (1458 ms total)
+[       OK ] VortexChaosFuzzerTest.FullChaosRoundInvariants (292 ms)
+[----------] 6 tests from VortexChaosFuzzerTest (1475 ms total)
 
 [----------] Global test environment tear-down
-[==========] 6 tests from 1 test suite ran. (1458 ms total)
+[==========] 6 tests from 1 test suite ran. (1475 ms total)
 [  PASSED  ] 6 tests.
-[==========] Running 24 tests from 1 test suite.
+[==========] Running 25 tests from 1 test suite.
 [----------] Global test environment set-up.
-[----------] 24 tests from VortexDocumentedGapsTest
+[----------] 25 tests from VortexDocumentedGapsTest
 [ RUN      ] VortexDocumentedGapsTest.NoWorkBlockAccepted
-[       OK ] VortexDocumentedGapsTest.NoWorkBlockAccepted (18 ms)
+[       OK ] VortexDocumentedGapsTest.NoWorkBlockAccepted (19 ms)
 [ RUN      ] VortexDocumentedGapsTest.KeylessTheftRejected
   [closed] keyless theft rejected: the genesis receiver is PQ-bound to an OFFLINE key (secret not in the repo) and no witness exists for the forged transfer (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.KeylessTheftRejected (106 ms)
+[       OK ] VortexDocumentedGapsTest.KeylessTheftRejected (25 ms)
 [ RUN      ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected
   [fixed] intra-block double spend rejected with 'insufficient funds'; no U128 underflow, no phantom balance.
-[       OK ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected (197 ms)
+[       OK ] VortexDocumentedGapsTest.DoubleSpendInBlockRejected (109 ms)
 [ RUN      ] VortexDocumentedGapsTest.CoinbaseReplayRejected
   [closed] coinbase bound to the chain position: replaying the tag on a competing fork is refused; the honest coinbase pays the producer (BACKLOG 0.6 remainder).
-[       OK ] VortexDocumentedGapsTest.CoinbaseReplayRejected (68 ms)
+[       OK ] VortexDocumentedGapsTest.CoinbaseReplayRejected (23 ms)
 [ RUN      ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected
   [closed] one GENESIS mint per block in the legacy window: the second mint is refused and the block applies nothing.
-[       OK ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected (25 ms)
+[       OK ] VortexDocumentedGapsTest.SecondGenesisMintInBlockRejected (23 ms)
 [ RUN      ] VortexDocumentedGapsTest.EmissionRewardTiersAndCap
   [closed] emission hard-coded: 50 VX floor, hash tiers 75/100/200/400/1000 VX at 20/24/28/32/40 zero bits, lifetime cap 7,000,000,000 VX (the root-of-seven digit).
 [       OK ] VortexDocumentedGapsTest.EmissionRewardTiersAndCap (0 ms)
@@ -595,48 +596,50 @@ test_chaos_fuzzer test_documented_gaps; do ./$b; done`
 [ RUN      ] VortexDocumentedGapsTest.RewardIndependentOfHeight
 [       OK ] VortexDocumentedGapsTest.RewardIndependentOfHeight (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.UndoJournalByteFormatRoundTrip
-[       OK ] VortexDocumentedGapsTest.UndoJournalByteFormatRoundTrip (41 ms)
+[       OK ] VortexDocumentedGapsTest.UndoJournalByteFormatRoundTrip (32 ms)
 [ RUN      ] VortexDocumentedGapsTest.UndoJournalRejectsHostileFiles
 [       OK ] VortexDocumentedGapsTest.UndoJournalRejectsHostileFiles (0 ms)
+[ RUN      ] VortexDocumentedGapsTest.ReorgUndoRestoresNoncesAndFrames
+[       OK ] VortexDocumentedGapsTest.ReorgUndoRestoresNoncesAndFrames (211 ms)
 [ RUN      ] VortexDocumentedGapsTest.NonceZeroReplayRejected
   [fixed] fee=0/nonce=0 replay at height 3 rejected with 'nonce mismatch' - the legacy exemption is scoped to the genesis window.
-[       OK ] VortexDocumentedGapsTest.NonceZeroReplayRejected (90 ms)
+[       OK ] VortexDocumentedGapsTest.NonceZeroReplayRejected (113 ms)
 [ RUN      ] VortexDocumentedGapsTest.OversizedTxCountRejected
-[       OK ] VortexDocumentedGapsTest.OversizedTxCountRejected (36 ms)
+[       OK ] VortexDocumentedGapsTest.OversizedTxCountRejected (127 ms)
 [ RUN      ] VortexDocumentedGapsTest.TamperedMerkleRejected
-[       OK ] VortexDocumentedGapsTest.TamperedMerkleRejected (51 ms)
+[       OK ] VortexDocumentedGapsTest.TamperedMerkleRejected (8 ms)
 [ RUN      ] VortexDocumentedGapsTest.HtlcVmFailureForcesLocked
   [fixed] HTLC with a runtime-corrupted opcode settles LOCKED; the VM verdict gates the contract outcome.
 [       OK ] VortexDocumentedGapsTest.HtlcVmFailureForcesLocked (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked
   [fixed] vault token with 28 mutated tail bytes is rejected; the full 32-byte digest is checked.
-[       OK ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked (1 ms)
+[       OK ] VortexDocumentedGapsTest.VaultTokenDigestFullyChecked (2 ms)
 [ RUN      ] VortexDocumentedGapsTest.VaultPoolFullNotClobber
   [fixed] full vault pool refuses instead of zeroing a live LOCKED page; both tokens survive.
 [       OK ] VortexDocumentedGapsTest.VaultPoolFullNotClobber (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.TailMetadataCommitted
 [       OK ] VortexDocumentedGapsTest.TailMetadataCommitted (0 ms)
 [ RUN      ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce
-[       OK ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce (189 ms)
+[       OK ] VortexDocumentedGapsTest.PogwGateAcceptsSealedWorkAndBindsTheNonce (841 ms)
 [ RUN      ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame
-[       OK ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame (6 ms)
+[       OK ] VortexDocumentedGapsTest.RecoveryRejectsCorruptedLedgerFrame (92 ms)
 [ RUN      ] VortexDocumentedGapsTest.UnboundSenderRejected
   [closed] a valid witness from an UNBOUND key spends nothing: the sender address commits no PQ root (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.UnboundSenderRejected (75 ms)
+[       OK ] VortexDocumentedGapsTest.UnboundSenderRejected (61 ms)
 [ RUN      ] VortexDocumentedGapsTest.WitnessRootMismatchRejected
   [closed] a witness whose XMSS root differs from the sender's bound key is refused before any balance check (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.WitnessRootMismatchRejected (38 ms)
+[       OK ] VortexDocumentedGapsTest.WitnessRootMismatchRejected (90 ms)
 [ RUN      ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds
   [closed] self-certifying address: first witnessed spend binds it to its key; a foreign key is refused, the owner keeps spending (BACKLOG 0.7).
-[       OK ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds (204 ms)
+[       OK ] VortexDocumentedGapsTest.SelfCertifyingAddressAutoBinds (243 ms)
 [ RUN      ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart
   [closed] durable witness sidecar: registration fsyncs a VXPQWT1 record and a restart replays it (BACKLOG 0.8).
-[       OK ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart (33 ms)
-[----------] 24 tests from VortexDocumentedGapsTest (1189 ms total)
+[       OK ] VortexDocumentedGapsTest.WitnessDurableLogSurvivesRestart (34 ms)
+[----------] 25 tests from VortexDocumentedGapsTest (2063 ms total)
 
 [----------] Global test environment tear-down
-[==========] 24 tests from 1 test suite ran. (1189 ms total)
-[  PASSED  ] 24 tests.
+[==========] 25 tests from 1 test suite ran. (2063 ms total)
+[  PASSED  ] 25 tests.
 ```
 
 Timing facts worth noting (not benchmark claims, just this CPU):
@@ -659,7 +662,7 @@ both sanitizers):
 ```
 100% tests passed out of 17
 
-Total Test time (real) =  12.46 sec
+Total Test time (real) =  12.43 sec
 ```
 
 Tail of the per-binary output (real):
@@ -675,7 +678,7 @@ Tail of the per-binary output (real):
 17/17 Test #17: VortexPqSignatureTest ............   Passed    5.55 sec
 ```
 
-Property: zero sanitizer findings anywhere in the 108 test blocks. CI runs
+Property: zero sanitizer findings anywhere in the 109 test blocks. CI runs
 the same lane on every push (`.github/workflows/ci.yml`, job `asan`).
 
 Not covered by this lane: TSan (data races). The swarm layer grew
@@ -693,7 +696,7 @@ threads is **not** currently evidenced.
 | `fuzz_pq_witness` | PQ witness verify | 20k execs, seed 1 | CI green (last push) |
 | `fuzz_wire` | VX60 ingest gate | 200k execs, seed 1 | CI green (last push) |
 | `fuzz_rpc` (new, `93e1756`) | the whole JSON RPC surface | 200k execs, seed 1 | **200 000 runs, 484 s, 0 crashes** (section 5.2) |
-| `fuzz_undo_journal` (new) | the undo journal replay path (BACKLOG 0.11) | 200k execs, seed 1 | **200 000 runs, 0 crashes** over a 9-file hostile/valid seed corpus |
+| `fuzz_undo_journal` (new) | the undo journal replay path (BACKLOG 0.11) | 200k execs, seed 1 | **200 000 runs, 0 crashes** over a hostile/valid seed corpus (re-seeded for format v2: 9 hostile/valid v2 seeds plus the legacy-version seeds; 150 000 execs recorded after the v2 bump) |
 
 Reproduce:
 
@@ -1002,7 +1005,7 @@ from the repo root after building (section 2).
 | # | Claim | Command | Expected result |
 |---|---|---|---|
 | C1 | 17/17 tests pass | `cd build && ctest` | `100% tests passed out of 17` |
-| C2 | 108 test blocks exist | `cd build && for b in test_*; do ./$b --gtest_list_tests 2>/dev/null; done \| ...` or read section 3 | counts match 3.3/3.4 |
+| C2 | 109 test blocks exist | `cd build && for b in test_*; do ./$b --gtest_list_tests 2>/dev/null; done \| ...` or read section 3 | counts match 3.3/3.4 |
 | C3 | Sanitizer-clean suite | `cd build_san && ctest` | 17/17, no ASan/UBSan output |
 | C4 | Frame geometry is exact | `cd build && ./test_block` | sizes 472/112/65536 printed and asserted |
 | C5 | Capacity is 580 tx | `./build/test_block` | 581st tx rejected |
@@ -1370,7 +1373,8 @@ Notes on fidelity:
 | (2026-11-03, emission schedule, user-directed) | The emission schedule is hard-coded in consensus: `include/vx/blockchain/emission.hpp` defines the lifetime cap 7,000,000,000 VX (7e17 atoms; the 7 is the protocol's signature digit) and a flat 1,000 VX block subsidy for heights 1..7,000,000 (zero at height 0 and after the window; 7,000,000 blocks x 1,000 VX = the cap exactly, static_asserted). `LedgerState::apply_block` gates cumulative ISSUANCE - all coinbase credits minus the fee share re-credited to the producer (fee redistribution is not new emission) - against the cap BEFORE any state mutation, so a refused block leaves the ledger byte-identical; the producer's coinbase now carries subsidy + fee share clamped to the remaining headroom, so the final emission blocks mint exactly the remainder and the cap closes; genesis allocations count against the cap; the reorg undo recomputes and reverses a block's issuance; `/api/status` reports `max_supply_vx`, `issued_supply_atomics`, `issuance_headroom_vx`, `emission_window_blocks`. Genesis frame and hash unchanged (`485f5afa...`). The dormant PoGWMiner gains the schedule too (subsidy + fee share, headroom-clamped). New regressions: `EmissionScheduleShapeSevenBillion`, `CoinbaseEntitlementEnforced`, `SupplyCapHardStopsIssuance`, `SubsidyEndsAfterEmissionWindow`. Suite: 17/17 on GCC, ASan+UBSan and fuzz lanes (79 named gtest cases); fuzz smokes clean.
 | (2026-11-03, emission schedule revision) | The first cut (flat 1,000 VX over 7,000,000 blocks) was revised the same day on user feedback: 7,000,000 blocks is a too-short emission horizon at a seconds-scale block target. The cap stays exactly 7,000,000,000 VX; the schedule is now a halving curve - three 4,000,000-block epochs paying 1,000 / 500 / 250 VX (whole atomics: 1e11 / 5e10 / 2.5e10), zero afterwards. 4M x (1,000 + 500 + 250) = the cap exactly, so the static_asserts still bind the schedule to the cap; the emission window grows to 12,000,000 blocks (~69 years at the 5-second dev target). The ledger gate, the miner clamp, the undo reversal and the /api/status fields are unchanged - only `subsidy_atoms()` and its asserts moved. Regressions updated, suite 17/17 on GCC, ASan+UBSan and fuzz lanes (79 named gtest cases).
 | (2026-11-03, emission schedule revision 2: hash-tier reward) | The halving curve was revised again the same day on user feedback: the block reward now depends on the block's own hash, not its height. The guaranteed floor is 50 VX for every valid block; the leading zero bits of the full-frame VortexSponge256 commitment unlock bonus tiers - 20/24/28/32/40 zero bits pay 75/100/200/400 and the 1,000 VX jackpot (frequencies ~1 in 1M / 17M / 268M / 4.3B / 1.1T blocks). A miner cannot mint the bonus, only find a rarer hash, so a bigger reward is strictly more proof-of-work; the thresholds are absolute, so any node verifies the reward by recounting zeros in the hash it already computes for the PoGW gate - no difficulty estimate enters consensus accounting, and the height-window subsidy (`subsidy_atoms`) is gone entirely. The ledger gate now recomputes the frame hash itself (`BlockView::bytes`) and entitlement = reward(hash) + fee share; the miner claims a tier and searches for a hash that justifies the claim, escalating when the found hash is rarer than claimed (the coinbase amount is part of the hashed frame, so claim and justifying hash are searched together); the audit's excess_reward constant is the 50 VX floor. `/api/status` swaps `emission_window_blocks` for `block_reward_base_vx`, `block_reward_max_vx`, `reward_tier_count`. Regressions: `EmissionScheduleShapeSevenBillion` -> `EmissionRewardTiersAndCap`, `SubsidyEndsAfterEmissionWindow` -> `RewardIndependentOfHeight`, `CoinbaseEntitlementEnforced`/`SupplyCapHardStopsIssuance` rewritten frame-hash-exact; suite 17/17 on GCC, ASan+UBSan and fuzz lanes (79 named gtest cases); live smoke on a fresh node verified the new `/api/status` fields.
-| (2026-11-03, BACKLOG 0.11: undo journal serialization) | The round-4 review finding is closed: the undo journal no longer serializes heap pointers. `src/state/undo_engine.cpp` now writes a versioned byte format - magic `VXUNDOJL` + u32 format version header, then fixed-width little-endian records (u64 height, i64 timestamp_ns, 32 B prev tip hash, 16 B prev supply, u64 accounts, u64 tx_count, then 42+42 B addresses and 16+16 B amounts/fees per transaction), every field written byte-wise, partial writes handled, fsync on append and rewrite. Reject-or-migrate: a file with a wrong magic/version (including every pre-0.11 raw-pointer file) is discarded and the journal rebuilds from live block application; mid-file corruption (>= one minimal record of garbage) is discarded, a short/torn tail is healed by truncating to the last complete record. Two real bugs fixed alongside: a reloaded journal was re-committed wholesale on destruction, duplicating every record in the file so a later rollback reversed each effect TWICE (fixed with a committed-baseline offset - only records not yet on disk are appended), and a block the ledger refused left its pre-state journal record behind so a later rollback would reverse effects that never happened (new `UndoEngine::drop_last_record()`, wired into the swarm resync path). Regressions: `UndoJournalByteFormatRoundTrip`, `UndoJournalRejectsHostileFiles` (rollback over pointer-shaped poison runs clean under ASan). New fuzz target `fuzz_undo_journal` (journal bytes -> parse -> rollback -> reload; 200k execs over a 9-file hostile/valid seed corpus, 0 crashes). Suite 17/17 on GCC, ASan+UBSan and fuzz lanes (81 named gtest cases). Honest remainder for 0.12: the in-memory journal now retains records after commit (rollback must keep working post-commit), so journal pruning below the GQC checkpoint belongs to 0.12/0.13.
+| (2026-11-03, BACKLOG 0.11: undo journal serialization) | The round-4 review finding is closed: the undo journal no longer serializes heap pointers. `src/state/undo_engine.cpp` now writes a versioned byte format - magic `VXUNDOJL` + u32 format version header, then fixed-width little-endian records (u64 height, i64 timestamp_ns, 32 B prev tip hash, 16 B prev supply, u64 accounts, u64 tx_count, then 42+42 B addresses and 16+16 B amounts/fees per transaction), every field written byte-wise, partial writes handled, fsync on append and rewrite. Reject-or-migrate: a file with a wrong magic/version (including every pre-0.11 raw-pointer file) is discarded and the journal rebuilds from live block application; mid-file corruption (>= one minimal record of garbage) is discarded, a short/torn tail is healed by truncating to the last complete record. Two real bugs fixed alongside: a reloaded journal was re-committed wholesale on destruction, duplicating every record in the file so a later rollback reversed each effect TWICE (fixed with a committed-baseline offset - only records not yet on disk are appended), and a block the ledger refused left its pre-state journal record behind so a later rollback would reverse effects that never happened (new `UndoEngine::drop_last_record()`, wired into the swarm resync path). Regressions: `UndoJournalByteFormatRoundTrip`, `UndoJournalRejectsHostileFiles` (rollback over pointer-shaped poison runs clean under ASan). New fuzz target `fuzz_undo_journal` (journal bytes -> parse -> rollback -> reload; 200k execs over a 9-file hostile/valid seed corpus, 0 crashes). Suite 17/17 on GCC, ASan+UBSan and fuzz lanes (81 named gtest cases). Honest remainder for 0.12: the in-memory journal now retains records after commit (rollback must keep working post-commit), so journal pruning below the GQC checkpoint belongs to 0.12/0.13. |
+| (2026-11-03, BACKLOG 0.12: reorg undo correctness) | The round-4 reorg findings are closed, plus one the new regression itself uncovered. First: the journal recorded transactions by reading the store at the block's own height - but the resync path journals BEFORE the store append, so the record captured the DISPLACED block's transactions and the rollback reversed effects that never happened on this fork; `apply_block` now records the frame being passed in, with the pre-state tip taken from the block's own prev_hash (journaling is ordering-independent). Second: `UndoTransaction` restores balances but not sender nonces - every undo transaction now carries the sender's pre-block next-nonce (journal format version 2) and the rollback restores it newest-first. Third (found by the new regression): a rollback left addresses the fork CREATED as tracked zero-balance accounts, so a re-applied height-1 GENESIS_2 mint was refused forever - the reorg bricked the node; undo records now carry a created-address list and `LedgerState::forget_empty_address()` untracks them once the reversed balance is zero. Fourth: the displaced fork frames are preserved in the side journal `undo/displaced.vxd` (`VXDISPLC`, same fail-closed policy, 64 MiB cap) BEFORE any state is mutated, so a reorg is replayable in both directions (`load_displaced_frames()` reads them back byte-exact). Regression `ReorgUndoRestoresNoncesAndFrames`: reorg across a mint + a two-spend block (intra-block sequential nonces), rollback to genesis, re-apply the same frames - supply, issued supply, balances, sender nonce and account count converge byte-identically with a fresh apply, and a replayed nonce stays refused. Suite 17/17 on GCC, ASan+UBSan and fuzz lanes (82 named gtest cases); `fuzz_undo_journal` re-seeded for format v2, 150 000 execs, 0 crashes. Honest remainder for 0.13: journal pruning below the GQC checkpoint; the displaced-frame re-attach consumer ships with the deeper net stack. |
 
 
 Every commit above is GPG-signed locally and **not pushed** at the time

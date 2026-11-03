@@ -453,6 +453,19 @@ public:
         return balances_.find(a) != balances_.end();
     }
 
+    /// Drop an address whose balance is zero from the tracked account map
+    /// (BACKLOG 0.12, reorg undo): an address CREATED by a rolled-back
+    /// fork must return to the untracked pre-fork state — otherwise a
+    /// re-applied height-1 GENESIS_2 mint would be refused forever because
+    /// its receiver now counts as "already tracked". Returns true when an
+    /// entry was erased.
+    bool forget_empty_address(const Address& a) {
+        const auto it = balances_.find(a);
+        if (it == balances_.end() || !(it->second == U128{})) return false;
+        balances_.erase(it);
+        return true;
+    }
+
     /// Exposes the full active account map for RPC enumeration.
     const std::unordered_map<Address, U128, AddressHash>& accounts() const noexcept {
         return balances_;

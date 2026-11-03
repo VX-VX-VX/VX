@@ -512,10 +512,9 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     random-input runs and ~245k mutation runs clean).
 - **Still open, pinned honestly (expect-success tests).**
   - (None in this section. The remaining consensus gaps are tracked as
-    BACKLOG items with design notes: undo journal serialization 0.11,
-    reorg undo correctness 0.12, GQC checkpoint durability 0.13, mempool
-    ordering/races 0.14 — none of them pinned as expect-success tests
-    yet; pinning them is part of their fix cycle.)
+    BACKLOG items with design notes: GQC checkpoint durability 0.13,
+    mempool ordering/races 0.14 — none of them pinned as expect-success
+    tests yet; pinning them is part of their fix cycle.)
   - *Undo journal serialization* (CLOSED 2026-11-03, BACKLOG 0.11):
     `UndoRecord` holds `std::string` / `std::vector` / `time_point` and
     was written with a raw `write(fd, &record, sizeof(record))` — heap
@@ -524,10 +523,20 @@ are BACKLOG 1.3 (cryptanalysis battery), 2.1 (security-model write-up) and
     migrate on open, torn-tail healing); see the Evidence changelog and
     regressions `UndoJournalByteFormatRoundTrip` /
     `UndoJournalRejectsHostileFiles`.
-  - *Reorg undo defects*: `rollback_to_height` journals the displaced
-    block read from the wrong side of the truncation, and
-    `UndoTransaction` restores balances but not sender nonces (BACKLOG
-    0.12).
+  - *Reorg undo defects* (CLOSED 2026-11-03, BACKLOG 0.12): the journal
+    read the displaced block's transactions from the store (the resync
+    path journals before the store append, so the rollback reversed
+    effects that never happened on this fork) — now it records the frame
+    being applied, with the pre-state tip from the block's own prev_hash
+    (ordering-independent); sender nonces are snapshotted per undo
+    transaction and restored by the rollback; addresses the fork CREATED
+    are untracked once their reversed balance is zero (a re-applied
+    height-1 GENESIS_2 mint used to be refused forever — the reorg
+    bricked the node); and the displaced fork frames are preserved in the
+    side journal `undo/displaced.vxd` before any mutation, so a reorg is
+    replayable in both directions. Regression:
+    `ReorgUndoRestoresNoncesAndFrames` (rollback + re-apply byte-
+    identical to a fresh apply).
   - *Mempool ordering/race*: the global fee sort can order a sender's
     nonce-1 tx before its nonce-0 tx (guaranteed apply-failure block),
     and `count_` is published before the entry is written, so a
@@ -872,6 +881,13 @@ security just advanced this pass, memory safety via TSan (BACKLOG 1.4).
   zero bits of the block's own PoGW hash; the cap, not a height window,
   ends emission), issuance gated in the ledger before any state mutation
   and reversed by the reorg undo — see component 14 and BACKLOG 2.5.
+- **Reorg undo correctness** (BACKLOG 0.12, 2026-11-03): the rollback
+  now journals the frame being applied (not whatever the store holds at
+  that height), restores sender nonces and the tracked-account set, and
+  preserves the displaced fork frames in a fail-closed side journal, so
+  rollback + re-apply is byte-identical to a fresh apply — see
+  [VERIFICATION_EVIDENCE.md](VERIFICATION_EVIDENCE.md) for the full
+  evidence chain.
 
 ## Explicitly not promised
 

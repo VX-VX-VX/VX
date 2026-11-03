@@ -760,6 +760,9 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     auto put_u64 = [](std::vector<uint8_t>& v, uint64_t x) {
         for (int i = 0; i < 8; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i)));
     };
+    auto put_u32 = [](std::vector<uint8_t>& v, uint32_t x) {
+        for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i)));
+    };
     auto write_file = [&](const std::vector<uint8_t>& bytes) {
         std::ofstream f(jpath, std::ios::binary);
         f.write(reinterpret_cast<const char*>(bytes.data()),
@@ -793,12 +796,27 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
         EXPECT_FALSE(undo.rollback_to_height(0));
     }
 
+    // (b2) Right magic, the previous format version (1, pre-0.12: no
+    // prev_sender_nonce in undo transactions): reject-or-migrate — the
+    // file is discarded and the journal rebuilds from live application.
+    {
+        std::vector<uint8_t> bytes;
+        bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
+        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.insert(bytes.end(), 80, 0x00); // one well-formed zero-tx record
+        write_file(bytes);
+        vx::state::UndoEngine undo(dir, store, ledger);
+        EXPECT_FALSE(std::filesystem::exists(jpath))
+            << "a version-1 journal must be migrated (discarded), not replayed";
+        EXPECT_FALSE(undo.rollback_to_height(0));
+    }
+
     // (c) Valid header, mid-file corruption (at least one minimal record
     // of garbage): discarded, never healed.
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.push_back(2); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
         bytes.insert(bytes.end(), 200, 0xFF);
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
@@ -813,7 +831,7 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.push_back(2); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
         bytes.insert(bytes.end(), 5, 0xFF);
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
@@ -829,23 +847,209 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.push_back(2); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
         put_u64(bytes, 1);                    // height 1
         put_u64(bytes, 0);                    // timestamp
         bytes.insert(bytes.end(), 32, 0x00);  // prev tip hash
         put_u64(bytes, 0); put_u64(bytes, 0); // prev supply
         put_u64(bytes, 0);                    // prev accounts count
         put_u64(bytes, 0);                    // tx_count = 0
+        put_u64(bytes, 0);                    // created_count = 0 (v2 field)
         bytes.insert(bytes.end(), 10, 0xAB);  // torn tail
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
         ASSERT_TRUE(std::filesystem::exists(jpath));
-        EXPECT_EQ(std::filesystem::file_size(jpath), 12ULL + 80ULL)
+        EXPECT_EQ(std::filesystem::file_size(jpath), 12ULL + 88ULL)
             << "the torn tail was not healed to the last complete record";
         EXPECT_TRUE(undo.rollback_to_height(0)) << undo.last_error();
     }
     EXPECT_FALSE(std::filesystem::exists(jpath))
         << "a rollback that empties the journal must remove the file";
+
+    // (e) The displaced-frame side journal gets the same fail-closed
+    // policy: a foreign file and a torn record yield nothing, never a
+    // crash and never a trustful replay.
+    {
+        const std::string dpath = dir + "/undo/displaced.vxd";
+        auto write_disp = [&](const std::vector<uint8_t>& bytes) {
+            std::ofstream f(dpath, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()));
+            ASSERT_TRUE(f.good());
+        };
+        // Foreign magic + pointer-shaped poison.
+        {
+            std::vector<uint8_t> bytes(300, 0x00);
+            const uint64_t poison = 0x00005A5A5A5A5A5AULL;
+            for (size_t off = 0; off + 8 <= bytes.size(); off += 8)
+                std::memcpy(bytes.data() + off, &poison, 8);
+            write_disp(bytes);
+            vx::state::UndoEngine undo(dir, store, ledger);
+            EXPECT_TRUE(undo.load_displaced_frames().empty())
+                << "a foreign displaced journal must yield nothing";
+        }
+        // Right magic, torn record: height + a frame length that is never
+        // backed by frame bytes.
+        {
+            std::vector<uint8_t> bytes;
+            bytes.insert(bytes.end(), {'V', 'X', 'D', 'I', 'S', 'P', 'L', 'C'});
+            bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+            put_u64(bytes, 7);
+            put_u32(bytes, 65536);
+            write_disp(bytes);
+            vx::state::UndoEngine undo(dir, store, ledger);
+            EXPECT_TRUE(undo.load_displaced_frames().empty())
+                << "a torn displaced record must not be replayed";
+        }
+        std::filesystem::remove(dpath);
+    }
+
+    std::filesystem::remove_all(dir);
+}
+
+// ── BACKLOG 0.12: a reorg rollback must be replayable in both directions.
+// The fork is journaled in the resync ordering (undo BEFORE the store
+// append — the ordering that used to capture the DISPLACED block's
+// transactions from the store); a rollback to genesis must preserve the
+// displaced frames in the side journal, restore sender nonces alongside
+// balances, and re-applying the same frames must land on byte-identical
+// state: a fresh ledger that applied the same frames once.
+TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
+    const std::string dir = temp_dir("vx_gap_reorg_undo");
+    const std::string store_path = dir + "/reorg.vxb";
+    auto store = std::make_unique<vx::storage::BlockStore>(store_path, "genesis.bin", 8);
+    vx::state::LedgerState ledger;
+
+    const auto* g = store->get_block(0);
+    ASSERT_NE(g, nullptr);
+    BlockFrame gf;
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
+
+    const PqAccount sender_acc = make_pq_account("VX_TEST_REORG_UNDO_SK_V1");
+    const Address& sender = sender_acc.addr;
+    const Address sink = addr_of("NFA_REORG_SINK_0000000000000000000000000");
+    const uint64_t ts = std::time(nullptr);
+    std::vector<BlockFrame> fork; // the displaced fork, in order
+
+    {
+        vx::state::UndoEngine undo(dir, *store, ledger);
+
+        // Height 1: fund the sender (GENESIS_2 mint, legacy window).
+        {
+            BlockBuilder b = next_block(*store, ts);
+            Transaction mint = make_tx(addr_of("GENESIS_2"), sender, 1000000000u, 0);
+            sign_transaction(mint);
+            ASSERT_TRUE(b.add_transaction(mint));
+            b.finalize();
+            BlockFrame f;
+            std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+            ASSERT_TRUE(seal_pogw_nonce(f, store->required_pogw_bits()));
+            undo.apply_block(BlockView(f)); // journal BEFORE the store append
+            ASSERT_TRUE(store->append_block(f));
+            ASSERT_TRUE(ledger.apply_block(BlockView(f)).ok);
+            fork.push_back(f);
+        }
+
+        // Height 2: TWO spends from the same sender in one block (nonces
+        // 0 and 1) — the intra-block sequential-nonce path.
+        {
+            BlockBuilder b = next_block(*store, ts + 5);
+            Transaction s1 = make_tx(sender, sink, 100000000u, 0);
+            ASSERT_TRUE(pq_sign(s1, sender_acc));
+            Transaction s2 = make_tx(sender, sink, 100000000u, 1);
+            ASSERT_TRUE(pq_sign(s2, sender_acc));
+            ASSERT_TRUE(b.add_transaction(s1));
+            ASSERT_TRUE(b.add_transaction(s2));
+            b.finalize();
+            BlockFrame f;
+            std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+            ASSERT_TRUE(seal_pogw_nonce(f, store->required_pogw_bits()));
+            undo.apply_block(BlockView(f)); // journal BEFORE the store append
+            ASSERT_TRUE(store->append_block(f));
+            ASSERT_TRUE(ledger.apply_block(BlockView(f)).ok);
+            fork.push_back(f);
+        }
+
+        // ── Reorg: roll the whole fork back to genesis ─────────────────
+        ASSERT_TRUE(undo.rollback_to_height(0)) << undo.last_error();
+
+        // The PRE-FORK state: neither the sender nor the sink existed yet,
+        // so both balances are zero AND untracked (an address the fork
+        // created must not linger as a tracked zero-balance account, or a
+        // re-applied GENESIS_2 mint would be refused forever).
+        EXPECT_EQ(ledger.balance_of(sender), U128{})
+            << "the fork's credits were not reversed";
+        EXPECT_EQ(ledger.balance_of(sink), U128{});
+        EXPECT_FALSE(ledger.tracked_addresses_containing(sender))
+            << "an address created by the fork stayed tracked";
+        EXPECT_FALSE(ledger.tracked_addresses_containing(sink));
+        EXPECT_EQ(ledger.get_next_nonce(sender), 0u)
+            << "the sender's nonce counter was not restored by the rollback";
+        EXPECT_EQ(ledger.next_expected_height(), 1u);
+
+        // The displaced frames survived in the side journal, byte-exact.
+        const auto displaced = undo.load_displaced_frames();
+        ASSERT_EQ(displaced.size(), fork.size())
+            << "the displaced fork frames were not preserved by the rollback";
+        for (size_t i = 0; i < fork.size(); ++i) {
+            EXPECT_EQ(displaced[i].height, i + 1);
+            EXPECT_EQ(0, std::memcmp(displaced[i].frame.data(), fork[i].data(),
+                                     BLOCK_SIZE_BYTES))
+                << "displaced frame " << i << " does not match the fork block";
+        }
+    } // destructor commits: everything durable, nothing re-appended
+
+    // Truncate the store back to genesis and re-point the journal at the
+    // reopened file — the same sequence the live reorg path runs.
+    store.reset();
+    std::filesystem::resize_file(store_path, BLOCK_SIZE_BYTES);
+    store = std::make_unique<vx::storage::BlockStore>(store_path, "genesis.bin", 8);
+
+    {
+        vx::state::UndoEngine undo(dir, *store, ledger);
+        undo.attach_store(*store);
+
+        // Re-apply the SAME fork: legal again only because the rollback
+        // restored the nonces (and the pre-state records match the frames).
+        for (const auto& f : fork) {
+            undo.apply_block(BlockView(f));
+            ASSERT_TRUE(store->append_block(f));
+            const auto res = ledger.apply_block(BlockView(f));
+            ASSERT_TRUE(res.ok) << "re-apply refused after rollback: " << res.error;
+        }
+
+        // ── Acceptance: rollback + re-apply == a fresh apply ───────────
+        vx::state::LedgerState fresh;
+        ASSERT_TRUE(fresh.apply_block(BlockView(gf)).ok);
+        for (const auto& f : fork) {
+            const auto res = fresh.apply_block(BlockView(f));
+            ASSERT_TRUE(res.ok) << "fresh apply refused: " << res.error;
+        }
+        EXPECT_EQ(ledger.total_supply(), fresh.total_supply());
+        EXPECT_EQ(ledger.issued_supply(), fresh.issued_supply());
+        EXPECT_EQ(ledger.balance_of(sender), fresh.balance_of(sender));
+        EXPECT_EQ(ledger.balance_of(sink), fresh.balance_of(sink));
+        EXPECT_EQ(ledger.get_next_nonce(sender), fresh.get_next_nonce(sender))
+            << "nonce accounting desynchronized across the reorg";
+        EXPECT_EQ(ledger.accounts().size(), fresh.accounts().size());
+
+        // Replay protection is intact: the consumed nonce 1 is gone.
+        {
+            BlockBuilder b = next_block(*store, ts + 10);
+            Transaction replay = make_tx(sender, sink, 100000000u, 1);
+            ASSERT_TRUE(pq_sign(replay, sender_acc));
+            ASSERT_TRUE(b.add_transaction(replay));
+            b.finalize();
+            BlockFrame f;
+            std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+            ASSERT_TRUE(seal_pogw_nonce(f, store->required_pogw_bits()));
+            const auto res = ledger.apply_block(BlockView(f));
+            EXPECT_FALSE(res.ok) << "a replayed nonce was accepted after the reorg";
+            EXPECT_NE(res.error.find("nonce mismatch"), std::string::npos)
+                << "expected the nonce check to fire, got: " << res.error;
+        }
+    }
 
     std::filesystem::remove_all(dir);
 }

@@ -21,8 +21,26 @@ struct UndoRecord {
         std::string receiver;
         U128 amount;
         U128 fee;
+        // BACKLOG 0.12: the sender's next-nonce value BEFORE this block
+        // applied, restored by rollback so a reorg cannot desynchronize
+        // nonce accounting (replayed or permanently gapped senders).
+        uint32_t prev_sender_nonce = 0;
     };
     std::vector<UndoTransaction> transactions;
+    // BACKLOG 0.12: addresses (42 B each) that were UNTRACKED before this
+    // block applied — the fork created them. Rollback erases a created
+    // address once its reversed balance is zero, returning the account map
+    // to the byte-identical pre-fork state (a re-applied GENESIS_2 mint
+    // demands an untracked receiver).
+    std::vector<std::string> created_addresses;
+};
+
+// A displaced fork block preserved by a rollback (BACKLOG 0.12): the
+// journal records the frame bytes themselves, so a reorg is replayable in
+// both directions — the rolled-back fork can be re-attached later.
+struct DisplacedFrame {
+    uint64_t height = 0;
+    blockchain::BlockFrame frame{};
 };
 
 struct UndoEngine {
@@ -59,6 +77,19 @@ public:
     // Rollback to target height
     bool rollback_to_height(uint64_t target_height);
 
+    // Preserve the frames a rollback is about to displace (BACKLOG 0.12):
+    // every block above target_height is copied from the store into the
+    // durable side file undo/displaced.vxd BEFORE any state is mutated —
+    // the caller may truncate the store file right after the rollback, and
+    // a reorg is only replayable in both directions if the displaced fork
+    // survives somewhere. Returns the number of frames preserved.
+    size_t journal_displaced_frames(uint64_t target_height);
+
+    // Read back the preserved displaced frames (height-ordered as written).
+    // A hostile or torn file yields the records that parsed cleanly and
+    // nothing more; a wrong magic/version yields an empty vector.
+    std::vector<DisplacedFrame> load_displaced_frames() const;
+
   // ── GQC finality checkpoint ─────────────────────────────────
     // Cement a GQC-certified block: any later rollback_to_height(h) with
     // h below this checkpoint is refused with ERR_FINALIZED_BY_GQC.
@@ -82,6 +113,7 @@ private:
     storage::BlockStore* store_;
     LedgerState& ledger_;
     std::filesystem::path undo_file_;
+    std::filesystem::path displaced_file_; // displaced fork frames (0.12)
     std::vector<UndoRecord> undo_journal_;
     // Records [0, committed_upto_) are already durable in the file; a
     // commit appends only the tail. Reloaded records are durable by

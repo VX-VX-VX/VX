@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <unordered_map>
 #include <vector>
 
 namespace vx::state {
@@ -26,8 +27,13 @@ namespace {
 //   record:  u64 height | i64 timestamp_ns | 32 B prev_tip_hash |
 //            16 B prev_supply (lo, hi) | u64 prev_accounts_count |
 //            u64 tx_count | tx_count x (42 B sender | 42 B receiver |
-//                                        16 B amount | 16 B fee)
+//                                        16 B amount | 16 B fee |
+//                                        4 B prev_sender_nonce) |
+//            u64 created_count | created_count x 42 B address
 //
+// Version 2 (BACKLOG 0.12) added prev_sender_nonce to every undo
+// transaction and the created-address list, so a rollback restores sender
+// nonces and the tracked-account state alongside balances.
 // All integers are little-endian. Loss of the journal never endangers
 // consensus (it only costs reorg capability): a file with a wrong
 // magic/version or a malformed record is discarded and rebuilt from live
@@ -35,16 +41,34 @@ namespace {
 // truncating to the last complete record.
 
 constexpr char kUndoMagic[8] = {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'};
-constexpr uint32_t kUndoVersion = 1;
+constexpr uint32_t kUndoVersion = 2;
 constexpr size_t kUndoHeaderSize = 12;
-constexpr size_t kUndoTxSize = 42 + 42 + 16 + 16;
-// A zero-tx record: the smallest possible complete record. Fewer bytes
-// than this at the end of a file cannot start a valid record — that is a
-// torn tail, not corruption.
-constexpr size_t kMinRecordSize = 80;
+constexpr size_t kUndoTxSize = 42 + 42 + 16 + 16 + 4;
+// A zero-tx record: the smallest possible complete record (height, time,
+// tip, supply, accounts count, zero tx count, zero created addresses).
+// Fewer bytes than this at the end of a file cannot start a valid record —
+// that is a torn tail, not corruption.
+constexpr size_t kMinRecordSize = 88;
 // A safety cap on replay input, not a real limit: 64 MiB covers roughly
 // 400k single-tx records; larger files are treated as malformed.
 constexpr size_t kUndoFileCap = 64ULL * 1024 * 1024;
+
+// ── Displaced-frame side file (BACKLOG 0.12) ────────────────────────────────
+// When a rollback displaces fork blocks, their 64 KiB frames are preserved
+// in a second versioned byte file so the reorg stays replayable in both
+// directions:
+//
+//   header:  magic "VXDISPLC" (8 B) + u32 LE format version
+//   record:  u64 height | u32 frame_len | frame_len frame bytes
+//
+constexpr char kDisplacedMagic[8] = {'V', 'X', 'D', 'I', 'S', 'P', 'L', 'C'};
+constexpr uint32_t kDisplacedVersion = 1;
+constexpr size_t kDisplacedHeaderSize = 12;
+constexpr size_t kDisplacedRecordOverhead = 8 + 4;
+// Same policy as the journal: a safety cap on replay input, not a real
+// limit — 64 MiB holds about a thousand displaced frames. Appending past
+// the cap simply stops preserving (reorg capability, never consensus).
+constexpr size_t kDisplacedFileCap = 64ULL * 1024 * 1024;
 
 void put_u32(std::vector<uint8_t>& out, uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(v >> (8 * i)));
@@ -61,9 +85,9 @@ void put_bytes(std::vector<uint8_t>& out, const uint8_t* p, size_t n) {
 }
 
 size_t record_bytes(const UndoRecord& r) {
-    return 8 + 8 + 32 + 16 + 8 + 8 + r.transactions.size() * kUndoTxSize;
+    return 8 + 8 + 32 + 16 + 8 + 8 + r.transactions.size() * kUndoTxSize +
+           8 + r.created_addresses.size() * 42;
 }
-
 void serialize_record(const UndoRecord& r, std::vector<uint8_t>& out) {
     put_u64(out, r.height);
     put_u64(out, static_cast<uint64_t>(
@@ -87,6 +111,13 @@ void serialize_record(const UndoRecord& r, std::vector<uint8_t>& out) {
         put_bytes(out, addr, 42);
         put_u128(out, tx.amount);
         put_u128(out, tx.fee);
+        put_u32(out, tx.prev_sender_nonce);
+    }
+    put_u64(out, r.created_addresses.size());
+    for (const auto& created : r.created_addresses) {
+        uint8_t addr[42] = {0};
+        std::memcpy(addr, created.data(), std::min(created.size(), size_t(42)));
+        put_bytes(out, addr, 42);
     }
 }
 
@@ -103,6 +134,12 @@ struct ByteReader {
         *out = p;
         p += n;
         return true;
+    }
+    uint32_t get_u32() {
+        const uint8_t* b;
+        if (!take(4, &b)) return 0;
+        return uint32_t(b[0]) | (uint32_t(b[1]) << 8) |
+               (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
     }
     uint64_t get_u64() {
         const uint8_t* b;
@@ -149,8 +186,21 @@ bool parse_record(ByteReader& r, UndoRecord& out) {
         tx.receiver.assign(reinterpret_cast<const char*>(addr), 42);
         tx.amount = r.get_u128();
         tx.fee = r.get_u128();
+        tx.prev_sender_nonce = r.get_u32();
         if (!r.ok) return false;
         out.transactions.push_back(std::move(tx));
+    }
+    const uint64_t created_count = r.get_u64();
+    if (!r.ok) return false;
+    // The block cannot create more addresses than it has txs (senders and
+    // receivers together, so twice the tx count is the honest bound).
+    if (created_count > 2 * blockchain::MAX_TX_PER_BLOCK) return false; // malformed
+    out.created_addresses.reserve(created_count);
+    for (uint64_t i = 0; i < created_count; ++i) {
+        uint8_t addr[42] = {0};
+        r.get_bytes(addr, 42);
+        if (!r.ok) return false;
+        out.created_addresses.emplace_back(reinterpret_cast<const char*>(addr), 42);
     }
     return r.ok;
 }
@@ -181,6 +231,7 @@ UndoEngine::UndoEngine(const std::string& data_dir, storage::BlockStore& store, 
     std::filesystem::path undo_path = std::filesystem::path(data_dir_) / "undo";
     std::filesystem::create_directories(undo_path);
     undo_file_ = undo_path / "undo.vxl";
+    displaced_file_ = undo_path / "displaced.vxd";
     load_latest_undo_journal();
 }
 
@@ -194,26 +245,63 @@ void UndoEngine::apply_block(const blockchain::BlockView& block) {
     UndoRecord record;
     record.height = block.header().block_height;
     record.timestamp = std::chrono::system_clock::now();
-    uint8_t tip_hash[32];
-    store_->tip_hash(tip_hash);
-    record.prev_tip_hash = std::string(reinterpret_cast<const char*>(tip_hash), 32);
+    // The pre-state tip is the block's own prev_hash — true no matter
+    // whether the caller journaled before or after the store append
+    // (BACKLOG 0.12: the journal must not depend on call ordering).
+    const uint8_t* prev_hash = block.header().prev_block_hash;
+    record.prev_tip_hash.assign(reinterpret_cast<const char*>(prev_hash), 32);
     record.prev_supply = ledger_.total_supply();
     record.prev_accounts_count = ledger_.accounts().size();
 
-    // Record transaction effects
+    // Record transaction effects FROM THE FRAME BEING APPLIED (BACKLOG
+    // 0.12). The resync path journals before the store append, so reading
+    // the store at this height used to capture the DISPLACED block's
+    // transactions — the rollback then reversed effects that never
+    // happened on this fork.
     if (block.header().tx_count > blockchain::MAX_TX_PER_BLOCK) return; // malformed frame: nothing to record
+    std::unordered_map<std::string, uint32_t> pre_nonces; // first sight per sender
+    std::vector<std::string> created; // addresses untracked before this block
     for (uint32_t i = 0; i < block.header().tx_count; ++i) {
-        auto* raw = store_->get_block(record.height);
-        if (!raw) break;
-        blockchain::BlockView v{std::span<const uint8_t, 65536>(reinterpret_cast<const uint8_t*>(raw), 65536)};
-        const auto& tx = v.tx(i);
+        const auto& tx = block.tx(i);
         UndoRecord::UndoTransaction undo_tx;
-        undo_tx.sender = std::string(reinterpret_cast<const char*>(tx.sender_nfa), 42);
-        undo_tx.receiver = std::string(reinterpret_cast<const char*>(tx.receiver_nfa), 42);
+        undo_tx.sender.assign(reinterpret_cast<const char*>(tx.sender_nfa), 42);
+        undo_tx.receiver.assign(reinterpret_cast<const char*>(tx.receiver_nfa), 42);
         undo_tx.amount = core::U128(blockchain::tx_amount(tx));
         undo_tx.fee = core::U128(blockchain::tx_fee(tx));
-        record.transactions.push_back(undo_tx);
+        // Sender nonce snapshot (BACKLOG 0.12): the next-nonce value
+        // before this block applies. Coinbase senders never take part in
+        // nonce accounting, so they are not recorded (nor restored).
+        const bool is_coinbase =
+            (std::strncmp(undo_tx.sender.c_str(), "GENESIS", 7) == 0) ||
+            (std::strncmp(undo_tx.sender.c_str(), "MINER_", 6) == 0);
+        if (!is_coinbase) {
+            auto it = pre_nonces.find(undo_tx.sender);
+            if (it == pre_nonces.end()) {
+                Address sender{};
+                std::memcpy(sender.data(), tx.sender_nfa, 42);
+                undo_tx.prev_sender_nonce = ledger_.get_next_nonce(sender);
+                pre_nonces.emplace(undo_tx.sender, undo_tx.prev_sender_nonce);
+            } else {
+                undo_tx.prev_sender_nonce = it->second;
+            }
+        }
+        // Created-address detection (BACKLOG 0.12): any endpoint the
+        // ledger did not track before this block becomes tracked by it.
+        // At most 2 x tx_count such addresses exist per block.
+        if (created.size() < 2 * size_t(block.header().tx_count)) {
+            Address endpoint{};
+            std::memcpy(endpoint.data(), tx.sender_nfa, 42);
+            if (!ledger_.tracked_addresses_containing(endpoint)) {
+                created.emplace_back(undo_tx.sender);
+            }
+            std::memcpy(endpoint.data(), tx.receiver_nfa, 42);
+            if (!ledger_.tracked_addresses_containing(endpoint)) {
+                created.emplace_back(undo_tx.receiver);
+            }
+        }
+        record.transactions.push_back(std::move(undo_tx));
     }
+    record.created_addresses = std::move(created);
 
     // Store record in undo journal
     undo_journal_.push_back(record);
@@ -362,6 +450,12 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
     }
     if (to_remove.empty()) return true; // nothing above target — already there
 
+    // Preserve the displaced fork frames BEFORE any mutation (BACKLOG
+    // 0.12): the caller may truncate the store file right after this
+    // rollback, and a reorg is only replayable in both directions if the
+    // displaced frames survive in the side journal.
+    journal_displaced_frames(target_height);
+
     // Drop them from the journal.
     undo_journal_.erase(
         std::remove_if(undo_journal_.begin(), undo_journal_.end(),
@@ -393,6 +487,12 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
                 // receiver loses the credited amount.
                 ledger_.adjust_balance(sender, tx.amount + tx.fee, true);
                 ledger_.adjust_balance(receiver, tx.amount, false);
+                // Nonce restore (BACKLOG 0.12): put the sender's next-nonce
+                // counter back where it stood before this block applied.
+                // Records unwind newest-first, so the oldest pre-block
+                // snapshot wins for senders that spent in several of the
+                // rolled-back blocks — exactly the pre-reorg state.
+                ledger_.set_next_nonce(sender, tx.prev_sender_nonce);
             }
             // Issuance reversal (emission schedule, 2026-11-03): recompute
             // the block's issuance exactly as apply_block priced it — all
@@ -409,6 +509,17 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
             if (coinbase_sum > recredited) {
                 ledger_.adjust_issued_supply(coinbase_sum - recredited, false);
             }
+        }
+        // Untrack the addresses this block CREATED (BACKLOG 0.12): after
+        // the reversal their balance is zero, so they return to the
+        // untracked pre-fork state — the account map converges with a
+        // fresh apply (a re-applied GENESIS_2 mint demands an untracked
+        // receiver).
+        for (const auto& created : record.created_addresses) {
+            Address created_addr{};
+            std::memcpy(created_addr.data(), created.data(),
+                        std::min(created.size(), size_t(42)));
+            ledger_.forget_empty_address(created_addr);
         }
     }
 
@@ -454,6 +565,102 @@ void UndoEngine::truncate_undo_file() {
         return;
     }
     committed_upto_ = undo_journal_.size();
+}
+
+size_t UndoEngine::journal_displaced_frames(uint64_t target_height) {
+    if (!store_) return 0;
+    const uint64_t top = store_->chain_height();
+    if (top == 0 || target_height + 1 >= top) return 0;
+
+    // Existing size (the cap applies to the whole side file).
+    std::error_code ec;
+    const auto cur = std::filesystem::file_size(displaced_file_, ec);
+    uint64_t file_size = ec ? 0 : static_cast<uint64_t>(cur);
+
+    int fd = ::open(displaced_file_.string().c_str(),
+                    O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return 0;
+
+    struct stat st{};
+    bool ok = ::fstat(fd, &st) == 0;
+    if (ok && st.st_size == 0) {
+        std::vector<uint8_t> header;
+        header.reserve(kDisplacedHeaderSize);
+        put_bytes(header, reinterpret_cast<const uint8_t*>(kDisplacedMagic), 8);
+        put_u32(header, kDisplacedVersion);
+        ok = write_all(fd, header.data(), header.size());
+    }
+
+    size_t preserved = 0;
+    std::vector<uint8_t> buf;
+    for (uint64_t h = target_height + 1; ok && h < top; ++h) {
+        const auto* raw = store_->get_block(h);
+        if (!raw) continue; // sparse store: nothing to preserve at h
+        if (file_size + kDisplacedRecordOverhead + blockchain::BLOCK_SIZE_BYTES >
+            kDisplacedFileCap) {
+            // Cap reached: stop preserving (reorg capability, never
+            // consensus). Whatever fit stays, all of it complete records.
+            break;
+        }
+        buf.clear();
+        put_u64(buf, h);
+        put_u32(buf, static_cast<uint32_t>(blockchain::BLOCK_SIZE_BYTES));
+        ok = write_all(fd, buf.data(), buf.size()) &&
+             write_all(fd, reinterpret_cast<const uint8_t*>(raw),
+                       blockchain::BLOCK_SIZE_BYTES);
+        if (ok) {
+            file_size += kDisplacedRecordOverhead + blockchain::BLOCK_SIZE_BYTES;
+            ++preserved;
+        }
+    }
+    if (ok) ok = ::fsync(fd) == 0;
+    ::close(fd);
+    if (!ok) {
+        std::cerr << "Failed to append displaced-frame journal" << std::endl;
+        return preserved;
+    }
+    return preserved;
+}
+
+std::vector<DisplacedFrame> UndoEngine::load_displaced_frames() const {
+    std::vector<DisplacedFrame> out;
+    if (!std::filesystem::exists(displaced_file_)) return out;
+
+    int fd = ::open(displaced_file_.string().c_str(), O_RDONLY);
+    if (fd < 0) return out;
+
+    struct stat st{};
+    if (::fstat(fd, &st) < 0 || static_cast<uint64_t>(st.st_size) > kDisplacedFileCap) {
+        // Oversized input is malformed by policy: trust nothing.
+        ::close(fd);
+        return out;
+    }
+    std::vector<uint8_t> buffer(static_cast<size_t>(st.st_size));
+    const ssize_t got = ::read(fd, buffer.data(), buffer.size());
+    ::close(fd);
+    if (got != static_cast<ssize_t>(buffer.size())) return out;
+
+    if (buffer.size() < kDisplacedHeaderSize ||
+        std::memcmp(buffer.data(), kDisplacedMagic, 8) != 0) {
+        return out;
+    }
+    const uint8_t* vp = buffer.data() + 8;
+    const uint32_t version = uint32_t(vp[0]) | (uint32_t(vp[1]) << 8) |
+                             (uint32_t(vp[2]) << 16) | (uint32_t(vp[3]) << 24);
+    if (version != kDisplacedVersion) return out;
+
+    ByteReader r{buffer.data() + kDisplacedHeaderSize, buffer.data() + buffer.size()};
+    while (r.ok) {
+        DisplacedFrame f;
+        f.height = r.get_u64();
+        const uint32_t len = r.get_u32();
+        if (!r.ok) break;
+        if (len != blockchain::BLOCK_SIZE_BYTES) break; // unknown shape: stop
+        r.get_bytes(f.frame.data(), len);
+        if (!r.ok) break;
+        out.push_back(std::move(f));
+    }
+    return out;
 }
 
 void UndoEngine::update_undo_metadata() {
