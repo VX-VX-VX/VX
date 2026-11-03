@@ -704,3 +704,23 @@ outside this repo by design (build tools are not consensus code).
 - ASCII-only, no absolute paths, no machine-specific content.
 - GPG-signed commits, no attribution trailers, push on explicit command
   only.
+
+### Zero-trust review discipline (standing rule, set 2026-11-03)
+
+- Nothing is trusted on reputation. Doubt is the default posture: a
+  component is unsafe until a test proves otherwise, and a review that
+  finds nothing is never taken as proof of safety.
+- Every diff that touches cryptography, consensus, the wire protocol,
+  storage, money math or authorization MUST pass an adversarial
+  security-review pass — a dedicated agent instructed to be harsh and
+  total, hunting exploitable defects the way a CVE researcher would
+  (attack surfaces, state-machine holes, arithmetic and concurrency
+  edge cases, fail-open paths) — BEFORE the change is committed.
+- Findings are fixed the same day for P0/P1; design-level findings are
+  pinned in the BACKLOG with a documented rationale; every reviewer PoC
+  becomes an automated regression test.
+- No masking hacks: a finding is never silenced by hiding the symptom;
+  the root cause is fixed or the limitation is documented honestly.
+- The current stage adds: after each major work stage, a full-repo
+  adversarial re-hunt runs before the next stage starts, so defects are
+  found by us before anyone else finds them.

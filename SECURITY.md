@@ -4,6 +4,16 @@ VX is an **experimental research alpha**. It has not been independently
 audited and must not be trusted with real funds. That said, security
 reports are taken seriously.
 
+## Internal review discipline
+
+Development runs on a zero-trust process (see the BACKLOG working
+rules): every change to cryptography, consensus, the wire protocol,
+storage, money math or authorization passes an adversarial security
+review before it is committed, findings are fixed or pinned honestly,
+and every reproduced defect becomes an automated regression test. This
+is our own discipline, not an audit — it does not substitute for
+independent verification, which remains not performed.
+
 ## Supported versions
 
 | Version | Supported |
