@@ -5,7 +5,7 @@ export default function ThemeDrawer() {
   const {
     showThemeDrawer, toggleThemeDrawer, activeTheme, toggleTheme,
     glow, setGlow, density, setDensity, cornerRadius, setCornerRadius,
-    bgGrid, setBgGrid, scanlines, setScanlines
+    bgGrid, setBgGrid, scanlines, setScanlines, hashDisplay, setHashDisplay
   } = useTheme()
 
   if (!showThemeDrawer) return null
@@ -149,6 +149,26 @@ export default function ThemeDrawer() {
                   }`}
                 >
                   {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Hash / coordinate display mode (personalization) */}
+          <div className="flex items-center justify-between">
+            <h3 className="font-mono text-[10px] text-[var(--text-muted)]">HASH & COORD VIEW</h3>
+            <div className="flex gap-1 border border-[var(--border-subtle)] rounded overflow-hidden">
+              {(['short', 'full'] as const).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => setHashDisplay(mode)}
+                  className={`px-2 py-1 text-[10px] font-mono transition-all ${
+                    hashDisplay === mode
+                      ? 'bg-[var(--accent-primary)] text-[var(--bg-primary)]'
+                      : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  {mode === 'short' ? 'SHORT' : 'FULL'}
                 </button>
               ))}
             </div>

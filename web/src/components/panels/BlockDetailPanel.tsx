@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Block, Transaction } from '../../contexts/WorkspaceContext'
+import { useTheme } from '../../contexts/ThemeContext'
 import { Copy, Search } from 'lucide-react'
 import HexInspectorFull from '../visualization/HexInspectorFull'
 
@@ -11,6 +12,10 @@ interface BlockDetailPanelProps {
 
 export default function BlockDetailPanel({ block, tx, onTxSelect }: BlockDetailPanelProps) {
   const [showHex, setShowHex] = useState(false)
+  // Personalization: 'full' shows every hex digit by default (per-section
+  // expander still available); 'short' truncates behind the expander.
+  const { hashDisplay } = useTheme()
+  const [showFullCoords, setShowFullCoords] = useState(hashDisplay === 'full')
 
   if (!block) {
     return (
@@ -53,11 +58,33 @@ export default function BlockDetailPanel({ block, tx, onTxSelect }: BlockDetailP
               <DetailRow label="HEIGHT" value={block.height.toString()} />
               <DetailRow label="TIMESTAMP" value={new Date(block.timestamp * 1000).toISOString()} />
               <DetailRow label="TX COUNT" value={block.tx_count.toString()} />
-              <DetailRow label="PREV HASH" value={block.prev_block_hash_hex} copyable />
-              <DetailRow label="MERKLE ROOT" value={block.merkle_root_hex} copyable />
-              <DetailRow label="X COORD" value={block.attractor_coords.x_hex.slice(0, 64) + '...'} copyable />
-              <DetailRow label="Y COORD" value={block.attractor_coords.y_hex.slice(0, 64) + '...'} copyable />
-              <DetailRow label="Z COORD" value={block.attractor_coords.z_hex.slice(0, 64) + '...'} copyable />
+              <DetailRow label="BLOCK HASH" value={block.block_hash_hex} copyable mono />
+              <DetailRow label="PREV HASH" value={block.prev_block_hash_hex} copyable mono />
+              <DetailRow label="MERKLE ROOT" value={block.merkle_root_hex} copyable mono />
+            </div>
+            {/* Attractor coordinates: full 256-hex-digit values behind a
+                toggle — truncation hides the actual data the chain commits. */}
+            <div className="p-3 pt-0 space-y-2 font-mono text-xs">
+              <button
+                onClick={() => setShowFullCoords(!showFullCoords)}
+                className="text-[10px] text-[var(--text-muted)] hover:text-[var(--accent-primary)] transition-colors"
+              >
+                {showFullCoords ? '▾' : '▸'} ATTRACTOR COORDINATES (X·Y·Z, 128B EACH)
+              </button>
+              {(['x_hex', 'y_hex', 'z_hex'] as const).map(k => {
+                const v = block.attractor_coords[k]
+                const expanded = showFullCoords || hashDisplay === 'full'
+                return (
+                  <DetailRow
+                    key={k}
+                    label={k.replace('_hex', '').toUpperCase() + ' COORD'}
+                    value={expanded ? v : v.slice(0, 64) + '…'}
+                    copyValue={v}
+                    copyable
+                    mono
+                  />
+                )
+              })}
             </div>
           </div>
 
@@ -90,7 +117,7 @@ export default function BlockDetailPanel({ block, tx, onTxSelect }: BlockDetailP
               <span className="font-mono text-xs text-[var(--accent-primary)]">TRANSACTIONS ({block.tx_count})</span>
             </div>
             <div className="p-3 space-y-2 max-h-64 overflow-auto">
-              {block.transactions.map((t, _idx) => (
+              {(block.transactions || []).map((t, _idx) => (
                 <TxRow
                   key={_idx}
                   tx={t}
@@ -112,16 +139,28 @@ export default function BlockDetailPanel({ block, tx, onTxSelect }: BlockDetailP
   )
 }
 
-function DetailRow({ label, value, copyable = false }: { label: string; value: string; copyable?: boolean }) {
+function DetailRow({
+  label,
+  value,
+  copyValue,
+  copyable = false,
+  mono = false,
+}: { label: string; value: string; copyValue?: string; copyable?: boolean; mono?: boolean }) {
   return (
-    <div className="flex items-center gap-2 text-[var(--text-muted)]">
-      <span className="w-24 font-bold text-[var(--text-primary)]">{label}</span>
-      <span className="flex-1 truncate font-mono tabular-nums">{value}</span>
+    <div className="flex items-start gap-2 text-[var(--text-muted)]">
+      <span className="w-24 flex-shrink-0 font-bold text-[var(--text-primary)]">{label}</span>
+      <span
+        className={`flex-1 break-all ${mono ? 'font-mono tabular-nums' : ''} ${
+          mono ? '' : 'truncate'
+        }`}
+      >
+        {value}
+      </span>
       {copyable && (
         <button
-          onClick={() => navigator.clipboard.writeText(value)}
-          className="p-1 hover:text-[var(--accent-primary)] transition-colors"
-          title="Copy"
+          onClick={() => navigator.clipboard.writeText(copyValue ?? value)}
+          className="p-1 flex-shrink-0 hover:text-[var(--accent-primary)] transition-colors"
+          title="Copy full value"
         >
           <Copy className="w-3 h-3" />
         </button>
@@ -165,10 +204,10 @@ function TxRow({ tx, index, selected, onClick }: { tx: Transaction; index: numbe
         </span>
       </div>
       <div className="flex gap-2 text-[var(--text-muted)]">
-        <span className="truncate flex-1">{tx.sender_nfa.slice(0, 20)}...</span>
-        <span className="w-4 text-center">→</span>
-        <span className="truncate flex-1">{tx.receiver_nfa.slice(0, 20)}...</span>
-        <span className="w-20 text-right tabular-nums">{Number(tx.amount_atomics) / 1e8} VX</span>
+        <span className="flex-1 break-all">{tx.sender_nfa}</span>
+        <span className="w-4 text-center flex-shrink-0">→</span>
+        <span className="flex-1 break-all">{tx.receiver_nfa}</span>
+        <span className="w-20 text-right tabular-nums flex-shrink-0">{Number(tx.amount_atomics) / 1e8} VX</span>
       </div>
       <div className="text-[8px] text-[var(--text-muted)] mt-1">
         PROOF: {tx.cocoon_proof_hex}

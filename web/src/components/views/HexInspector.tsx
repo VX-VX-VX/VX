@@ -1,11 +1,14 @@
 import { useState } from 'react'
 import { useWorkspace } from '../../contexts/WorkspaceContext'
-import { Search, ChevronLeft, ChevronRight, Copy, X } from 'lucide-react'
+import type { Block } from '../../contexts/WorkspaceContext'
+import { useTheme } from '../../contexts/ThemeContext'
+import { Search, ChevronLeft, ChevronRight, Copy } from 'lucide-react'
 
 const BYTES_PER_ROW = 16
 
 export default function HexInspector() {
-  const { blocks, selectedBlock } = useWorkspace()
+  const { blocks, selectedBlock, setSelectedBlock } = useWorkspace()
+  const { hashDisplay } = useTheme()
   const [viewMode, setViewMode] = useState<'header' | 'tx'>('header')
   const [hoveredByte, setHoveredByte] = useState<{ offset: number; byte: number; field: string; fullValue: string } | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
@@ -23,6 +26,20 @@ export default function HexInspector() {
   // Default to first block (bounds-safe fallbacks for short/malformed RPC data)
   const block = selectedBlock || blocks[0]
   const tx = block.transactions && block.transactions.length > 0 ? block.transactions[0] : { raw_tx_hex: '' }
+
+  // Chain-order navigation: move between adjacent frames without leaving
+  // the hex view. blocks[] is ordered by height from the node.
+  const blockIdx = blocks.findIndex(b => b.height === block.height)
+  const prevBlock = blockIdx > 0 ? blocks[blockIdx - 1] : null
+  const nextBlock = blockIdx >= 0 && blockIdx + 1 < blocks.length ? blocks[blockIdx + 1] : null
+  const tipBlock = blocks.reduce((tip, b) => (b.height > tip.height ? b : tip), blocks[0])
+  const goTo = (b: Block | null) => {
+    if (!b) return
+    setSelectedBlock(b)
+    setSearchResults([])
+    setSearchQuery('')
+    setCurrentSearchIdx(0)
+  }
 
   // Convert hex string to byte array (tolerant: odd length, invalid chars, empty input)
   const hexToBytes = (hex: string): Uint8Array => {
@@ -204,19 +221,46 @@ export default function HexInspector() {
         </button>
       </div>
 
-      {/* Block Metadata */}
+      {/* Block Metadata + chain navigation */}
       <div className="px-4 py-2 border-b border-[var(--border-subtle)] bg-[var(--bg-panel)]/50 flex items-center justify-between font-mono text-[10px]">
         <div className="flex items-center gap-3">
-          <X
-            onClick={() => console.log('Close')}
-            className="w-4 h-4 cursor-pointer text-[var(--text-muted)] hover:text-[var(--accent-primary)]"
-          />
+          <button
+            onClick={() => goTo(prevBlock)}
+            disabled={!prevBlock}
+            className="btn-ghost p-0.5 disabled:opacity-30"
+            title={prevBlock ? `Block #${prevBlock.height}` : 'At genesis'}
+          >
+            <ChevronLeft className="w-4 h-4" />
+          </button>
           <span className="text-[var(--text-muted)]">BLOCK #{block.height}</span>
+          <button
+            onClick={() => goTo(nextBlock)}
+            disabled={!nextBlock}
+            className="btn-ghost p-0.5 disabled:opacity-30"
+            title={nextBlock ? `Block #${nextBlock.height}` : 'At tip'}
+          >
+            <ChevronRight className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => goTo(tipBlock)}
+            disabled={block.height === tipBlock.height}
+            className="btn-ghost text-[10px] px-1.5 py-0.5 disabled:opacity-30"
+            title={`Jump to tip (block #${tipBlock.height})`}
+          >
+            TIP
+          </button>
         </div>
         <div className="flex items-center gap-4">
           <span className="text-[var(--text-muted)]">HASH:</span>
-          <span className="font-mono text-[var(--accent-primary)] truncate w-32">{(block.block_hash_hex || '').slice(0, 16)}...</span>
-          <span className="text-[var(--text-muted)]">•</span>
+          <span
+            className={`font-mono text-[var(--accent-primary)] cursor-pointer hover:underline ${hashDisplay === 'full' ? 'break-all' : ''}`}
+            title={block.block_hash_hex}
+            onClick={() => navigator.clipboard.writeText(block.block_hash_hex || '')}
+          >
+            {hashDisplay === 'full'
+              ? (block.block_hash_hex || '')
+              : (block.block_hash_hex || '').slice(0, 16) + '…'}
+          </span>          <span className="text-[var(--text-muted)]">•</span>
           <span className="text-[var(--text-primary)] text-[10px] tabular-nums">{block.tx_count ?? 0} TX</span>
           <span className="text-[var(--text-muted)]">•</span>
           <span className="font-mono text-[10px] tabular-nums">{block.timestamp ? new Date(block.timestamp * 1000).toLocaleTimeString() : '—'}</span>

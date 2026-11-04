@@ -4,6 +4,10 @@ export type Theme = 'obsidian' | 'aurum' | 'lapis' | 'arch' | 'vault'
 export type View = 'command' | 'hex' | 'security' | 'lab' | 'vault' | 'zk_matrix' | 'tensor_v6' | 'asm_studio' | 'war_room'
 type Density = 'compact' | 'comfortable'
 type CornerRadius = 0 | 6 | 12
+// Personalization: how hashes/coordinates render everywhere. 'short'
+// truncates long values behind an expander; 'full' always shows every
+// hex digit (copy actions always carry the FULL value either way).
+export type HashDisplay = 'short' | 'full'
 
 // URL sub-page routing: each view owns a real pathname (shareable, back/forward
 // works via popstate). vite dev serves the SPA fallback for all of these.
@@ -35,6 +39,8 @@ interface ThemeContextType {
   cornerRadius: CornerRadius
   bgGrid: 'dots' | 'blueprint' | 'solid'
   scanlines: boolean
+  hashDisplay: HashDisplay
+  setHashDisplay: (v: HashDisplay) => void
   toggleThemeDrawer: () => void
   toggleTheme: (t: Theme) => void
   switchView: (v: View) => void
@@ -77,6 +83,9 @@ export const ThemeProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   const [scanlines, setScanlines] = useState(() => {
     return localStorage.getItem('vortex-scanlines') === 'true'
   })
+  const [hashDisplay, setHashDisplay] = useState<HashDisplay>(() => {
+    return (localStorage.getItem('vortex-hash-display') as HashDisplay) || 'short'
+  })
 
   // Persist settings
   useEffect(() => {
@@ -92,6 +101,7 @@ export const ThemeProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   useEffect(() => localStorage.setItem('vortex-density', density), [density])
   useEffect(() => localStorage.setItem('vortex-grid', bgGrid), [bgGrid])
   useEffect(() => localStorage.setItem('vortex-scanlines', String(scanlines)), [scanlines])
+  useEffect(() => localStorage.setItem('vortex-hash-display', hashDisplay), [hashDisplay])
 
   // pushState routing: the URL always mirrors the active view
   const switchView = React.useCallback((v: View) => {
@@ -142,6 +152,8 @@ export const ThemeProvider: React.FC<{ children: ReactNode }> = ({ children }) =
         cornerRadius,
         bgGrid,
         scanlines,
+        hashDisplay,
+        setHashDisplay,
         toggleThemeDrawer: () => setShowThemeDrawer(!showThemeDrawer),
         toggleTheme: setActiveTheme,
         switchView,

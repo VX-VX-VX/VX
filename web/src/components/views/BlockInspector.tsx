@@ -7,6 +7,13 @@ export default function BlockInspector({ selectedBlockHeight }: { selectedBlockH
   const { blocks } = useWorkspace()
   const [isCanvasReady, setIsCanvasReady] = useState(false)
 
+  // Hooks MUST run before any conditional return: when blocks arrive
+  // asynchronously the early returns below would otherwise change the hook
+  // count between renders and crash React.
+  useEffect(() => {
+    setIsCanvasReady(true)
+  }, [blocks])
+
   if (!blocks.length) {
     return (
       <div className="h-full flex items-center justify-center">
@@ -31,10 +38,6 @@ export default function BlockInspector({ selectedBlockHeight }: { selectedBlockH
       </div>
     )
   }
-
-  useEffect(() => {
-    setIsCanvasReady(true)
-  }, [block])
 
   const handlePixelSelect = (offset: number) => {
     const rows = document.querySelectorAll('#hex-table > div > div')

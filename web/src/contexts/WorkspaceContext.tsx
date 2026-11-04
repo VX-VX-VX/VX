@@ -88,7 +88,7 @@ interface WorkspaceContextType {
   fetchStatus: () => Promise<void>
   fetchBlocks: () => Promise<void>
   fetchAccounts: () => Promise<void>
-  fetchBlock: (height: number) => Promise<void>
+  fetchBlock: (height: number) => Promise<Block | null>
   executeTransfer: (sender: string, receiver: string, amount: number) => Promise<any>
   executeAudit: (type: string) => Promise<any>
   executePqSign: (opts?: { amount_vx?: number; fee?: number; nonce?: number; seed_hex?: string }) => Promise<any>
@@ -243,12 +243,22 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
     }
   }, [apiCall, checkAndMarkDirty])
 
-  const fetchBlock = useCallback(async (height: number) => {
-    // Blocks endpoint already returns all blocks
-    if (!blocks.find(b => b.height === height)) {
-      await fetchBlocks()
+  const fetchBlock = useCallback(async (height: number): Promise<Block | null> => {
+    const cached = blocks.find(b => b.height === height)
+    if (cached) return cached
+    // Blocks endpoint already returns all blocks; a point lookup is a
+    // refresh + search. Returns null when the node does not have the height.
+    try {
+      const data = await apiCall('/blocks')
+      const found: Block | undefined = data.blocks.find((b: Block) => b.height === height)
+      if (checkAndMarkDirty('blocks', data.blocks)) {
+        setBlocks(data.blocks)
+      }
+      return found ?? null
+    } catch {
+      return null
     }
-  }, [blocks, fetchBlocks])
+  }, [apiCall, blocks, checkAndMarkDirty])
 
   const executeTransfer = useCallback(async (sender: string, receiver: string, amount: number) => {
     const data = await apiCall('/transfer', {

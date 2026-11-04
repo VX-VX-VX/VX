@@ -1,15 +1,51 @@
 import React, { useEffect, useState } from 'react'
 import { useWorkspace } from '../../contexts/WorkspaceContext'
 import { useTheme } from '../../contexts/ThemeContext'
-import { Send, Terminal } from 'lucide-react'
+import { Send, Terminal, ArrowDownToLine } from 'lucide-react'
 import AttractorCanvas from '../visualization/AttractorCanvas'
 import BlockDetailPanel from '../panels/BlockDetailPanel'
 
+// The strip renders a WINDOW of the chain, not all frames: a 1000-block
+// ledger is ~1000 heavy cards and the browser chokes on the full map().
+// The window grows on demand and the tip is always reachable in one click.
+const STRIP_WINDOW = 50
+const STRIP_WINDOW_STEP = 100
+
 export default function CommandCenter() {
-  const { blocks, accounts, selectedBlock, selectedTx, refreshAll, executeTransfer, setSelectedBlock, setSelectedTx, addRpcLog } = useWorkspace()
-  const { activeTheme } = useTheme()
+  const { blocks, accounts, selectedBlock, selectedTx, refreshAll, executeTransfer, setSelectedBlock, setSelectedTx, addRpcLog, fetchBlock } = useWorkspace()
+  const { activeTheme, hashDisplay } = useTheme()
   const [transferForm, setTransferForm] = useState({ sender: '', receiver: '', amount: '' })
   const [tdiStatus, setTdiStatus] = useState<{ tdi: number; annihilated: boolean; reason: string } | null>(null)
+  const [stripLimit, setStripLimit] = useState(STRIP_WINDOW)
+  const [jumpHeight, setJumpHeight] = useState('')
+
+  // Default selection: the chain TIP, once frames arrive.
+  useEffect(() => {
+    if (!selectedBlock && blocks.length > 0) {
+      setSelectedBlock(blocks.reduce((tip, b) => (b.height > tip.height ? b : tip), blocks[0]))
+    }
+  }, [blocks, selectedBlock, setSelectedBlock])
+
+  // Keep the selected frame visible in the strip (also fires on jump).
+  useEffect(() => {
+    if (!selectedBlock) return
+    const el = document.getElementById(`frame-${selectedBlock.height}`)
+    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }, [selectedBlock])
+
+  const tipBlock = blocks.length ? blocks.reduce((tip, b) => (b.height > tip.height ? b : tip), blocks[0]) : null
+
+  const handleJump = async () => {
+    const h = parseInt(jumpHeight, 10)
+    if (isNaN(h) || h < 0) return
+    const target = blocks.find(b => b.height === h) ?? (await fetchBlock(h))
+    if (!target) {
+      addRpcLog(`Block #${h} not found on node`)
+      return
+    }
+    setSelectedBlock(target)
+    setSelectedTx(null)
+  }
 
   useEffect(() => {
     refreshAll()
@@ -48,18 +84,42 @@ export default function CommandCenter() {
   return (
     <div className="h-full grid grid-cols-12 grid-rows-6 gap-4 p-4 overflow-auto">
       {/* LEFT TOP: Block strip */}
-      <div className="col-span-7 row-span-3 panel panel-specular overflow-hidden">
-        <div className="p-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
+      <div className="col-span-7 row-span-3 panel panel-specular overflow-hidden flex flex-col">
+        <div className="p-3 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2">
           <span className="font-mono text-xs text-[var(--accent-primary)]">LEDGER.VXB FRAME STRIP</span>
-          <span className="font-mono text-[10px] text-[var(--text-muted)]">
-            {blocks.length} FRAMES • {blocks.length * 64} KB
-          </span>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={0}
+              value={jumpHeight}
+              onChange={e => setJumpHeight(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && handleJump()}
+              placeholder="# height"
+              className="input-field w-24 text-[10px] py-1"
+            />
+            <button onClick={handleJump} className="btn-secondary text-[10px] px-2 py-1">
+              JUMP
+            </button>
+            {tipBlock && (
+              <button
+                onClick={() => { setSelectedBlock(tipBlock); setSelectedTx(null) }}
+                className="btn-secondary text-[10px] px-2 py-1 flex items-center gap-1"
+                title={`Jump to tip (block #${tipBlock.height})`}
+              >
+                <ArrowDownToLine className="w-3 h-3" /> TIP
+              </button>
+            )}
+            <span className="font-mono text-[10px] text-[var(--text-muted)]">
+              {blocks.length} FRAMES • {blocks.length * 64} KB
+            </span>
+          </div>
         </div>
-        <div className="p-3 h-[calc(100%-40px)] overflow-y-auto">
+        <div className="p-3 flex-1 overflow-y-auto">
           <div className="space-y-2">
-            {blocks.slice().reverse().map((block) => (
+            {blocks.slice().reverse().slice(0, stripLimit).map((block) => (
               <button
                 key={block.height}
+                id={`frame-${block.height}`}
                 onClick={() => { setSelectedBlock(block); setSelectedTx(null); }}
                 className={`w-full text-left p-3 rounded transition-all font-mono text-xs ${
                   selectedBlock?.height === block.height
@@ -80,18 +140,44 @@ export default function CommandCenter() {
                     {block.memory_layout.utilization_pct.toFixed(2)}% UTIL
                   </div>
                 </div>
-                <div className="flex gap-2 mt-1 text-[10px] text-[var(--text-muted)]">
-                  <span>{block.block_hash_hex.slice(0, 12)}...</span>
+                <div className="flex flex-wrap gap-x-2 mt-1 text-[10px] text-[var(--text-muted)]">
+                  <span className="break-all">{hashDisplay === 'full' ? block.block_hash_hex : block.block_hash_hex.slice(0, 12) + '...'}</span>
                   <span>•</span>
-                  <span>{new Date(block.timestamp * 1000).toLocaleTimeString()}</span>
+                  <span className="tabular-nums">{new Date(block.timestamp * 1000).toLocaleTimeString()}</span>
                 </div>
               </button>
             ))}
+            {blocks.length > stripLimit && (
+              <button
+                onClick={() => setStripLimit(l => l + STRIP_WINDOW_STEP)}
+                className="w-full p-2 rounded border border-[var(--border-subtle)] text-center font-mono text-[10px] text-[var(--text-muted)] hover:border-[var(--accent-primary)]/50 hover:text-[var(--text-primary)] transition-all"
+              >
+                SHOW OLDER FRAMES ({blocks.length - stripLimit} MORE)
+              </button>
+            )}
           </div>
         </div>
       </div>
 
-      {/* RIGHT TOP: Balance cards + transfer form */}
+      {/* RIGHT TOP: Block Detail (moved up: details first, no scrolling down) */}
+      <div className="col-span-5 row-span-3 panel panel-specular overflow-hidden">
+        <BlockDetailPanel block={selectedBlock} tx={selectedTx} onTxSelect={setSelectedTx} />
+      </div>
+
+      {/* LEFT BOTTOM: Attractor Canvas */}
+      <div className="col-span-7 row-span-3 panel panel-specular">
+        <div className="p-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
+          <span className="font-mono text-xs text-[var(--accent-primary)]">3-TRUNK GALOIS ATTRACTOR ORBIT</span>
+          <span className="font-mono text-[10px] text-[var(--text-muted)]">
+            P=2^1024-2^64-1747 • Q=2^1024-2^888-3943 • R=2^1024-2^512-267799
+          </span>
+        </div>
+        <div className="p-3 h-[calc(100%-40px)]">
+          <AttractorCanvas block={selectedBlock} />
+        </div>
+      </div>
+
+      {/* RIGHT BOTTOM: Balance cards + transfer form */}
       <div className="col-span-5 row-span-3 panel panel-specular overflow-hidden flex flex-col">
         <div className="p-3 border-b border-[var(--border-subtle)]">
           <span className="font-mono text-xs text-[var(--accent-primary)]">BALANCE VAULT & EXPRESS TRANSFER</span>
@@ -173,23 +259,6 @@ export default function CommandCenter() {
         </div>
       </div>
 
-      {/* LEFT BOTTOM: Attractor Canvas */}
-      <div className="col-span-7 row-span-3 panel panel-specular">
-        <div className="p-3 border-b border-[var(--border-subtle)] flex items-center justify-between">
-          <span className="font-mono text-xs text-[var(--accent-primary)]">3-TRUNK GALOIS ATTRACTOR ORBIT</span>
-          <span className="font-mono text-[10px] text-[var(--text-muted)]">
-            P=2^1024-2^64-1747 • Q=2^1024-2^888-3943 • R=2^1024-2^512-267799
-          </span>
-        </div>
-        <div className="p-3 h-[calc(100%-40px)]">
-          <AttractorCanvas block={selectedBlock} />
-        </div>
-      </div>
-
-      {/* RIGHT BOTTOM: Block Detail */}
-      <div className="col-span-5 row-span-3 panel panel-specular overflow-hidden">
-        <BlockDetailPanel block={selectedBlock} tx={selectedTx} onTxSelect={setSelectedTx} />
-      </div>
     </div>
   )
 }
