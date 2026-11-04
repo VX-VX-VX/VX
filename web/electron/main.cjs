@@ -19,8 +19,9 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      webSecurity: false, // Allow cleartext RPC to a user-selected local node
-      allowRunningInsecureContent: true,
+      // Sandbox defaults kept intact: RPC to a user-selected node is done by
+      // the main process over IPC (vx:rpc), never by disabling webSecurity —
+      // the renderer stays behind the same-origin policy.
     },
     icon: path.join(__dirname, '../public/icon.png'),
   });
@@ -42,6 +43,31 @@ function createWindow() {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+  });
+
+  // RPC bridge: renderer asks the main process to fetch an absolute http(s)
+  // URL. Node's fetch has no CORS, so cross-origin RPC works without
+  // weakening the renderer. GET/POST of JSON bodies only, no redirects.
+  const RPC_TIMEOUT_MS = 30000;
+  ipcMain.handle('vx:rpc', async (_event, url, options = {}) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+      throw new Error('vx:rpc: absolute http(s) URL required');
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        method: typeof options.method === 'string' ? options.method : 'GET',
+        headers: options.headers && typeof options.headers === 'object' ? options.headers : {},
+        body: typeof options.body === 'string' ? options.body : undefined,
+        signal: controller.signal,
+        redirect: 'error',
+      });
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, statusText: res.statusText, text };
+    } finally {
+      clearTimeout(timer);
+    }
   });
 
   // Handle window controls

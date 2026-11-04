@@ -158,6 +158,22 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
     return changed
   }, [isEqual])
 
+  // Electron bridge: absolute http(s) requests are proxied through the main
+  // process (window.vxRpc, no CORS there) so the renderer never needs
+  // webSecurity disabled. Returns null when the bridge is unavailable or the
+  // URL is relative (same-origin proxy path) — the caller falls back to fetch.
+  const bridgeFetch = useCallback((url: string, init?: RequestInit): Promise<Response> | null => {
+    const bridge = (globalThis as any).vxRpc
+    if (!bridge || !/^https?:\/\//i.test(url)) return null
+    return bridge(url, {
+      method: init?.method || 'GET',
+      headers: init?.headers,
+      body: typeof init?.body === 'string' ? init.body : undefined,
+    }).then((r: { ok: boolean; status: number; statusText: string; text: string }) =>
+      new Response(r.text, { status: r.status, statusText: r.statusText })
+    )
+  }, [])
+
   // API call with In-Flight Promise Coalescing (replaces AbortController dedupe)
   const apiCall = useCallback(async (endpoint: string, options?: RequestInit): Promise<any> => {
     const method = options?.method || 'GET'
@@ -176,10 +192,11 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
     const url = resolveUrl(endpoint)
     const promise = (async () => {
       try {
-        const res = await fetch(url, {
+        const init: RequestInit = {
           headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           ...options
-        })
+        }
+        const res = (await bridgeFetch(url, init)) ?? await fetch(url, init)
 
         const elapsed = performance.now() - start
         if (!res.ok) {
@@ -206,7 +223,7 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
     }
 
     return promise
-  }, [addRpcLog, resolveUrl])
+  }, [addRpcLog, resolveUrl, bridgeFetch])
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -315,11 +332,21 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
       return
     }
 
+    // Under Electron with a cross-origin absolute RPC host, EventSource would
+    // need CORS the node does not send. The 10s polling refresh already
+    // covers push reactions (block_sealed → refreshAll), so skip SSE there;
+    // an SSE-over-IPC relay is BACKLOG 0.17.
+    const sseUrl = resolveUrl('/api/events')
+    if (/^https?:\/\//i.test(sseUrl) && (globalThis as any).vxRpc) {
+      addRpcLog('SSE: cross-origin host under Electron — relying on polling refresh')
+      return
+    }
+
     isSseConnectingRef.current = true
     addRpcLog('SSE: Connecting to /api/events...')
 
     try {
-      const es = new EventSource(resolveUrl('/api/events'))
+      const es = new EventSource(sseUrl)
       eventSourceRef.current = es
 
       es.onopen = () => {

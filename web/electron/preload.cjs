@@ -9,6 +9,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('window-maximized', (_, maximized) => callback(maximized));
   },
 
+  // RPC bridge: absolute http(s) fetches are performed by the main process
+  // (no CORS there), so the renderer never needs webSecurity disabled.
+  vxRpc: (url, options) => ipcRenderer.invoke('vx:rpc', url, options),
+
   // RPC host configuration
   getRpcHost: () => ipcRenderer.invoke('get-rpc-host'),
   setRpcHost: (host) => ipcRenderer.invoke('set-rpc-host', host),

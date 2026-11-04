@@ -450,6 +450,17 @@ including a not-yet-written entry (reads a default Transaction).
   admission wiring (nothing feeds `submit()` from the network stack yet)
   is part of the swarm-intake work.
 
+### 0.17 Electron renderer stays sandboxed (delivered 2026-11-04) — residual: SSE relay
+
+CodeQL flagged `webSecurity: false` (Medium) and `allowRunningInsecureContent: true`
+(High) in `web/electron/main.cjs`. Both removed: the renderer keeps the
+same-origin policy; cross-origin RPC to a user-selected node now runs in the
+main process over an IPC bridge (`vx:rpc`, GET/POST of JSON bodies only,
+redirects refused, 30 s abort). SSE (`/api/events`) is skipped under Electron
+when the RPC host is cross-origin — the 10 s polling refresh covers push
+reactions. Residual: a proper SSE-over-IPC relay in the main process so
+push immediacy returns to the desktop client without re-opening the renderer.
+
 ### 0.16 GQC sidecar v2 (delivered 2026-11-04) — residual hardening
 
 The v2 record (52 B, CRC32C over height+aggregate) closes the
