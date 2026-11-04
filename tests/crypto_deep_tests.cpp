@@ -269,14 +269,27 @@ void runWifMatrixFuzzing() {
         assert(mask_b.rfind("UMSK[BETA]:", 0) == 0);
         assert(mask_a != mask_b);
         // Every masked payload is 4-byte UTF-8 glyphs (Mathematical Alphanumeric
-        // block): strip the prefix and check a uniform glyph encoding.
+        // block); the base64URL separators '-' and '_' intentionally stay
+        // literal ASCII. Strip the prefix and decode the glyph stream.
         const std::string payload_a = mask_a.substr(mask_a.find(':') + 1);
         bool utf8_uniform = true;
         for (size_t i = 0; i < payload_a.size();) {
             const unsigned char c = static_cast<unsigned char>(payload_a[i]);
-            const size_t len = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
-            if (len != 4) utf8_uniform = false;
-            i += len;
+            if (c < 0x80) {
+                // Only the base64URL separators may appear as literal ASCII.
+                if (c != '-' && c != '_') utf8_uniform = false;
+                i += 1;
+            } else {
+                const size_t len = (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+                // Glyphs must come from the plane-1 Mathematical Alphanumeric
+                // block, i.e. every multi-byte sequence is 4 bytes.
+                if (len != 4) utf8_uniform = false;
+                for (size_t k = 1; k < len && i + k < payload_a.size(); ++k) {
+                    const unsigned char cc = static_cast<unsigned char>(payload_a[i + k]);
+                    if ((cc & 0xC0) != 0x80) utf8_uniform = false;
+                }
+                i += len;
+            }
         }
         assert(utf8_uniform);
 
