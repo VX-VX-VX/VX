@@ -138,6 +138,11 @@ target_link_libraries(test_vm PRIVATE vx_core gtest gtest_main)
 add_executable(test_reorg tests/test_reorg.cpp)
 target_link_libraries(test_reorg PRIVATE vx_core gtest gtest_main)
 
+# Reorg carousel stress test: two node views, 13 partition/fork/heal cycles,
+# displaced-frame integrity, undo-journal survival, GQC finality interplay.
+add_executable(test_reorg_carousel tests/test_reorg_carousel.cpp)
+target_link_libraries(test_reorg_carousel PRIVATE vx_core gtest gtest_main)
+
 # Vault Memory test suite
 add_executable(test_vault_memory tests/test_vault_memory.cpp)
 target_link_libraries(test_vault_memory PRIVATE vx_core gtest gtest_main)
@@ -184,7 +189,7 @@ target_link_libraries(test_retarget PRIVATE vx_core gtest gtest_main)
 # custom-main suites out of existence — a green lane then proves only
 # "did not crash" (found 2026-11-04; zero-trust review discipline).
 foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
-            test_mempool test_vm test_reorg
+            test_mempool test_vm test_reorg test_reorg_carousel
             test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
@@ -211,6 +216,7 @@ add_test(NAME VortexVaultHtlcTest COMMAND test_vault_htlc)
 add_test(NAME VortexChaosFuzzerTest COMMAND test_chaos_fuzzer)
 add_test(NAME VortexPqSignatureTest COMMAND test_pq_signatures)
 add_test(NAME VortexRetargetTest COMMAND test_retarget)
+add_test(NAME VortexReorgCarouselTest COMMAND test_reorg_carousel)
 
 # ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────
 # Standalone fuzz harnesses for the three highest-risk parse/verify surfaces:
