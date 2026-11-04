@@ -150,6 +150,12 @@ target_link_libraries(test_reorg_carousel PRIVATE vx_core gtest gtest_main)
 add_executable(test_bifurcation tests/test_bifurcation.cpp)
 target_link_libraries(test_bifurcation PRIVATE vx_core gtest gtest_main)
 
+# 1000-block deterministic stress chain: build, invariant sweeps every 100
+# blocks, PRNG rollback probes with fresh-prefix replay equality, displaced
+# frames, GQC checkpoints, mempool churn.
+add_executable(test_chain_stress tests/test_chain_stress.cpp)
+target_link_libraries(test_chain_stress PRIVATE vx_core gtest gtest_main)
+
 # Vault Memory test suite
 add_executable(test_vault_memory tests/test_vault_memory.cpp)
 target_link_libraries(test_vault_memory PRIVATE vx_core gtest gtest_main)
@@ -200,7 +206,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
-           )
+            test_chain_stress)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -225,6 +231,7 @@ add_test(NAME VortexPqSignatureTest COMMAND test_pq_signatures)
 add_test(NAME VortexRetargetTest COMMAND test_retarget)
 add_test(NAME VortexReorgCarouselTest COMMAND test_reorg_carousel)
 add_test(NAME VxBifurcationOracleTest COMMAND test_bifurcation)
+add_test(NAME VortexChainStressTest COMMAND test_chain_stress)
 
 # ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────
 # Standalone fuzz harnesses for the three highest-risk parse/verify surfaces:
