@@ -138,6 +138,11 @@ target_link_libraries(test_vm PRIVATE vx_core gtest gtest_main)
 add_executable(test_reorg tests/test_reorg.cpp)
 target_link_libraries(test_reorg PRIVATE vx_core gtest gtest_main)
 
+# Crash/persistence torture: 100 simulated torn-state trials (store, undo
+# journal, GQC sidecar, displaced journal) + 30 real SIGKILL trials.
+add_executable(test_crash_torture tests/test_crash_torture.cpp)
+target_link_libraries(test_crash_torture PRIVATE vx_core gtest gtest_main)
+
 # Boundary-value torture on the money math: exact-balance drains, dust
 # boundary, UINT64_MAX amounts, UINT32_MAX fees, coinbase claims (0, floor,
 # 1001 VX), GENESIS_2 mint edges, 580-tx block, PQ 16-leaf cap.
@@ -212,7 +217,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
-            test_chain_stress test_boundary_torture)
+            test_chain_stress test_boundary_torture test_crash_torture)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -239,6 +244,7 @@ add_test(NAME VortexReorgCarouselTest COMMAND test_reorg_carousel)
 add_test(NAME VxBifurcationOracleTest COMMAND test_bifurcation)
 add_test(NAME VortexChainStressTest COMMAND test_chain_stress)
 add_test(NAME VortexBoundaryTortureTest COMMAND test_boundary_torture)
+add_test(NAME VxCrashTortureTest COMMAND test_crash_torture)
 
 # ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────
 # Standalone fuzz harnesses for the three highest-risk parse/verify surfaces:
