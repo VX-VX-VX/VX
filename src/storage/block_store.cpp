@@ -59,7 +59,13 @@ static bool validate_region(const uint8_t* base, uint64_t from, uint64_t to) {
 // ── BlockStore ───────────────────────────────────────────────────────────────
 
 BlockStore::BlockStore(const std::string& path, const std::string& genesis_path,
-                       uint64_t required_pogw_bits) : path_(path), required_pogw_bits_(required_pogw_bits) {
+                       uint64_t required_pogw_bits, const consensus::PogwRetargetParams& retarget)
+    : path_(path), retarget_(retarget) {
+    // The ctor parameter is the ASERT anchor/genesis difficulty; the
+    // retarget parameters supply the half-life. The anchor from the caller
+    // wins, so tests can keep passing a low seal strength while pinning a
+    // fast test half-life alongside it.
+    retarget_.anchor_bits = required_pogw_bits;
     fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd_ < 0) {
         throw std::runtime_error("BlockStore: cannot open '" + path + "': " + std::strerror(errno));
@@ -180,7 +186,10 @@ bool BlockStore::append_block(const BlockFrame& frame) {
         ctx.prev_timestamp = tip ? tip->header.timestamp : 0;
     }
     ctx.now_unix = static_cast<uint64_t>(std::time(nullptr));
-    ctx.difficulty_bits = required_pogw_bits_;
+    // ASERT retarget (BACKLOG 0.9 remainder): the gate demands the height's
+    // own difficulty, recomputed from the genesis anchor -- never read from
+    // the frame, never stored, identical on every node with the same anchor.
+    ctx.difficulty_bits = pogw_bits_for_height(expected_height);
     if (!blockchain::validate_block(*reinterpret_cast<const blockchain::RawBlock*>(frame.data()),
                                     ctx, &last_error_)) {
         return false;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vx/blockchain/block.hpp"
+#include "vx/consensus/retarget.hpp"
 #include <cstdint>
 #include <string>
 #include <span>
@@ -15,16 +16,26 @@ namespace vx::storage {
  * zero-copy BlockView straight from the page cache.
  *
  * On open, an empty ledger is auto-initialized from ./genesis.bin.
+ *
+ * PoGW difficulty is ASERT-retargeted and height-derived (BACKLOG 0.9
+ * remainder): the ctor parameter carries the genesis/anchor seal strength
+ * and the difficulty for any height is recomputed from it and the half-life,
+ * never stored -- so every node with the same genesis anchor agrees on the
+ * difficulty with no wire or store format change.
  */
 class BlockStore {
 public:
     /// Opens (or creates) the ledger file. If empty, seeds it with genesis.bin.
-    /// `required_pogw_bits` is the live-intake work requirement enforced by
-    /// append_block (BACKLOG 0.9); production uses the default (16), tests
-    /// may lower it to keep PoGW search fast. Throws std::runtime_error on
-    /// I/O failure or corrupt frames.
+    /// `required_pogw_bits` is the ASERT anchor/genesis difficulty (the seal
+    /// strength of heights 0 and 1); the live requirement at later heights
+    /// grows from it by the retarget half-life (see vx/consensus/retarget.hpp).
+    /// Production uses the default (16); tests may lower it to keep PoGW
+    /// search fast. `retarget` pins the retarget parameters; all nodes on one
+    /// chain must share them. Throws std::runtime_error on I/O failure or
+    /// corrupt frames.
     explicit BlockStore(const std::string& path, const std::string& genesis_path = "genesis.bin",
-                        uint64_t required_pogw_bits = blockchain::DEFAULT_POGW_DIFFICULTY_BITS);
+                        uint64_t required_pogw_bits = blockchain::DEFAULT_POGW_DIFFICULTY_BITS,
+                        const consensus::PogwRetargetParams& retarget = consensus::POGW_MAINNET_RETARGET);
 
     ~BlockStore() noexcept;
 
@@ -48,9 +59,22 @@ public:
     /// success). Diagnostics only — the bool return is the contract.
     const std::string& last_error() const noexcept { return last_error_; }
 
-    /// Live-intake difficulty this store enforces (miners query it so their
-    /// search never aims below the gate).
-    uint64_t required_pogw_bits() const noexcept { return required_pogw_bits_; }
+    /// ASERT PoGW difficulty (required leading zero bits) at a given height.
+    /// Pure function of the anchor parameters and the height; heights 0 and 1
+    /// sit at the anchor. The height-0 genesis frame is the anchor and is
+    /// exempt from the gate (it is seeded directly, never appended).
+    uint64_t pogw_bits_for_height(uint64_t height) const noexcept {
+        return consensus::asert_pogw_bits(retarget_, height);
+    }
+
+    /// Live-intake difficulty this store enforces: the ASERT bits for the
+    /// NEXT expected height (the sealing frontier, height == chain_height()).
+    /// Height-aware, so miners, RPC sealing helpers and tests can keep
+    /// querying it exactly as before the retarget -- their search always aims
+    /// at the difficulty the append gate will demand.
+    uint64_t required_pogw_bits() const noexcept {
+        return pogw_bits_for_height(count_);
+    }
 
     /// Zero-copy O(1) view of the block at height H. nullptr if out of range.
     const blockchain::RawBlock* get_block(uint64_t height) const noexcept;
@@ -91,7 +115,7 @@ private:
     void* mapped_ = nullptr;
     uint64_t mapped_bytes_ = 0;
     uint64_t count_ = 0;
-    uint64_t required_pogw_bits_ = blockchain::DEFAULT_POGW_DIFFICULTY_BITS;
+    consensus::PogwRetargetParams retarget_ = consensus::POGW_MAINNET_RETARGET;
     std::string last_error_;
 };
 

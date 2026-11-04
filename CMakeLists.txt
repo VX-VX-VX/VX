@@ -175,15 +175,20 @@ target_link_libraries(test_chaos_fuzzer PRIVATE vx_core gtest gtest_main)
 add_executable(test_pq_signatures tests/test_pq_signatures.cpp)
 target_link_libraries(test_pq_signatures PRIVATE vx_core gtest gtest_main)
 
+# ASERT PoGW difficulty retarget test suite (BACKLOG 0.9 remainder)
+add_executable(test_retarget tests/test_retarget.cpp)
+target_link_libraries(test_retarget PRIVATE vx_core gtest gtest_main)
+
 # Test executables must keep assertions live in every configuration.
 # Release defines NDEBUG, which silently compiles every assert() in the
 # custom-main suites out of existence — a green lane then proves only
 # "did not crash" (found 2026-11-04; zero-trust review discipline).
 foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
-            test_mempool test_vm test_reorg test_vault_memory test_zk_matrix
-            test_tensor_v6 test_swarm_p2p test_galois_trie test_landauer_vm_mev
-            test_gqc_ring_stealth test_vault_htlc test_chaos_fuzzer
-            test_pq_signatures)
+            test_mempool test_vm test_reorg
+            test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
+            test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
+            test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
+           )
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -205,6 +210,7 @@ add_test(NAME VortexGqcRingStealthTest COMMAND test_gqc_ring_stealth)
 add_test(NAME VortexVaultHtlcTest COMMAND test_vault_htlc)
 add_test(NAME VortexChaosFuzzerTest COMMAND test_chaos_fuzzer)
 add_test(NAME VortexPqSignatureTest COMMAND test_pq_signatures)
+add_test(NAME VortexRetargetTest COMMAND test_retarget)
 
 # ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────
 # Standalone fuzz harnesses for the three highest-risk parse/verify surfaces:

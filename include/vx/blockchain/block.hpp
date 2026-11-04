@@ -240,9 +240,11 @@ void hash_block(const RawBlock& raw, uint8_t out[32]) noexcept;
 
 // ── PoGW work: one definition for miner and intake gate ─────────────────────
 
-/// Default live-intake PoGW difficulty: required leading zero bits of the
-/// full-frame VortexSponge256 commitment. Dev-mode value matching the miner's
-/// ASERT base difficulty; dynamic retargeting is BACKLOG 0.6 follow-up.
+/// Default PoGW difficulty: required leading zero bits of the full-frame
+/// VortexSponge256 commitment. This is the ASERT anchor/genesis difficulty
+/// (BACKLOG 0.9 remainder): BlockStore derives the retargeted requirement
+/// for each height from it and the retarget half-life (see
+/// vx/consensus/retarget.hpp). Height-derived, never stored in any frame.
 inline constexpr uint64_t DEFAULT_POGW_DIFFICULTY_BITS = 16;
 
 /// PoGW target check, single source of truth (BACKLOG 0.9): the miner's

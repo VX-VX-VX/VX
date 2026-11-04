@@ -37,11 +37,9 @@ void PoGWMiner::mining_loop() {
 
 void PoGWMiner::mine_one() {
     uint64_t height = store_.chain_height();
-    // The search target must never sit below the store's live-intake gate
-    // (BACKLOG 0.9): a block mined to less work than the gate requires would
-    // be rejected at append and waste the sealing work. In dev mode ASERT
-    // hovers around 16 anyway; the max() keeps the two honest if they drift.
-    uint64_t diff = std::max(calculate_difficulty(), store_.required_pogw_bits());
+    // The search target IS the store's live-intake gate (BACKLOG 0.9): the
+    // height-derived ASERT curve is the single source of difficulty truth.
+    uint64_t diff = calculate_difficulty();
 
     uint8_t tip[32];
     store_.tip_hash(tip);
@@ -198,29 +196,12 @@ void PoGWMiner::mine_one() {
 }
 
 uint64_t PoGWMiner::calculate_difficulty() const {
-    // ASERT difficulty adjustment: D_h = D_{h-1} * 2^((t_target - t_solve)/tau)
-    // target = 5 seconds dev mode, tau = 130 (half-life)
-    if (store_.chain_height() <= 1) return 16; // Genesis difficulty
-
-    auto* prev_block = store_.get_block(store_.chain_height() - 1);
-    if (!prev_block) return 16;
-
-    uint64_t prev_difficulty = 16; // Could store in tail
-
-    uint64_t prev_timestamp = prev_block->header.timestamp;
-    uint64_t current_timestamp = std::chrono::system_clock::now().time_since_epoch().count() / 1000000000;
-    int64_t solve_time = static_cast<int64_t>(current_timestamp - prev_timestamp);
-
-    // ASERT: diff_new = diff_prev * 2^((target_time - solve_time) / tau)
-    // target_time = 5 seconds, tau = 130 (half-life for ASERT)
-    double target_time = 5.0;
-    double tau = 130.0;
-    double exponent = (target_time - static_cast<double>(solve_time)) / tau;
-
-    double new_diff_double = static_cast<double>(prev_difficulty) * std::pow(2.0, exponent);
-    uint64_t new_diff = static_cast<uint64_t>(std::max(1.0, std::min(new_diff_double, 256.0)));
-
-    return new_diff;
+    // Single difficulty curve (found 2026-11-04, security review of the
+    // ASERT retarget): the previous float-based time heuristic carried a
+    // hardcoded anchor (16) and tau in seconds — a different curve in
+    // different units from the real retarget. The height-derived store gate
+    // is the one curve; the miner must aim exactly where the gate checks.
+    return store_.required_pogw_bits();
 }
 
 void PoGWMiner::coinbase_tx(blockchain::Transaction& tx, uint64_t height, const state::U128& miner_reward,

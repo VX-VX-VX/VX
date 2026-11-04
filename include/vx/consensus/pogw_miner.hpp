@@ -29,6 +29,7 @@ public:
 
 private:
     void mining_loop();
+    // The height-derived ASERT gate (store). Single difficulty curve.
     uint64_t calculate_difficulty() const;
     void coinbase_tx(blockchain::Transaction& tx, uint64_t height, const state::U128& miner_reward,
                      const uint8_t prev_tip_hash[32]);
