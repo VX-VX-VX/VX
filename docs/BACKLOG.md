@@ -450,6 +450,62 @@ including a not-yet-written entry (reads a default Transaction).
   admission wiring (nothing feeds `submit()` from the network stack yet)
   is part of the swarm-intake work.
 
+### 0.16 GQC sidecar v2 (delivered 2026-11-04) — residual hardening
+
+The v2 record (52 B, CRC32C over height+aggregate) closes the
+height-byte-flip inflation hole found by crash torture. Zero-trust review
+left three documented residuals, none exploitable under the stated
+adversary (single-byte-flip / torn-write; no arbitrary file write):
+
+- [ ] The CRC is unkeyed: it defends against accidental corruption and
+  torn writes only. An adversary with arbitrary write access to the
+  sidecar can recompute it — the finality guard stays advisory by design
+  (consensus never derives from it; the guard is a self-imposed brake).
+  If the sidecar ever becomes consensus-load-bearing, upgrade to a
+  keyed MAC over the whole record.
+- [ ] Mixed RT1/RT2 files fail closed forever (loud stderr, operator
+  action required). A friendlier auto-resolution (preserve intact v2
+  records, re-stamp the rest) was deliberately NOT built: silent healing
+  of a certification store is the unsafe direction.
+- [ ] Migration validates every legacy block (tag == VXGQCRT1 and
+  height < chain_height) before blessing it with a CRC — the one-time
+  bootstrap trusts strictly less than a v1 writer could have produced.
+
+### 0.15 Post-quantum margin: parameterized sponge width (standing principle 2026-11-04)
+
+Owner's standing principle: the margin must be such that even an ideal
+quantum computer running Grover's algorithm hits the same wall a
+classical computer hits today. Grover's square root halves the exponent:
+a 256-bit preimage costs 2^128 quantum operations (the NIST baseline
+floor, badly parallelizable), a 512-bit preimage costs 2^256 — the
+same wall classical 256-bit work is today. The VX sponge is a custom
+construction, so Grover optimality is only a LOWER bound on attacker
+power there; width is the insurance against our own assumptions.
+
+- [ ] Parameterize the sponge output width (256/512/1024) behind an
+  address version: v1 = 256 (current, frozen wire), v2 = 512 (the
+  standing target), 1024 documented as the paranoid maximum (no
+  standard requires deeper than a 2^256 preimage class).
+- [ ] Extend the wire frame and address derivation for v2 with a soft
+  migration (both versions verified in parallel; v1 never invalidated).
+- [ ] Fold into the same work: PQ key rollover (a key signs at most 16
+  times today — XMSS H=4 leaves 0..15, `pq_sign_transaction` refuses
+  nonce >= 16; three independent test waves hit this on 2026-11-04).
+  Rollover derives tree #N from the same master seed deterministically
+  and publishes a fresh root per binding, so one key never dies after
+  16 transfers; the leaf discipline (nonce counter, no double-sign)
+  must stay consensus-visible.
+- [ ] Retarget parameter lock (found by the 2026-11-04 ASERT review,
+  F2): the ASERT anchor and half-life are code constants not covered by
+  the genesis frame hash — "same genesis" enforces nothing about the
+  curve. Commit a hash of the retarget params into the genesis domain
+  and refuse non-default params outside test builds.
+- [ ] Time-anchored retarget exponent (ASERT review F3): the current
+  height-only curve is monotone forever — a work escalator with a
+  finite lifetime (bounded producers deterministically fail above ~26
+  bits). Honest eventual fix: exponent from (now - genesis_time) so the
+  curve can go down as well as up.
+
 ### External review round 5 — ledger/rollback hardening (CLOSED 2026-11-03)
 
 Adversarial review of the post-0.14 tree found two P1s and a set of

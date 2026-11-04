@@ -796,7 +796,7 @@ void trial_gqc_middle_corrupt(const GqcTemplate& t, int index) {
     // reader must fail closed -- no trusted height, no per-height aggregate.
     const size_t recs = t.stamped_heights.size();
     const size_t rec = 1 + rng.below(recs - 2); // strictly middle: 1..recs-2
-    const size_t off = rec * 48 + rng.below(8);
+    const size_t off = rec * 52 + rng.below(8);
     const uint8_t mask = static_cast<uint8_t>(1 + rng.below(255));
     flip_byte(gpath, off, mask);
 
@@ -828,11 +828,11 @@ void trial_gqc_tail_heal(const GqcTemplate& t, int index) {
     Rng& rng = trial_rng();
     const std::string dir = fresh_trial_dir(t.dir, index);
     const std::string gpath = dir + "/ledger.vxb.gqc";
-    const size_t side_size = t.stamped_heights.size() * 48;
+    const size_t side_size = t.stamped_heights.size() * 52;
 
     const size_t cut = 1 + rng.below(side_size - 1); // [1, side_size)
     truncate_file(gpath, cut);
-    const size_t complete = cut / 48;
+    const size_t complete = cut / 52;
 
     auto store = try_open(dir + "/ledger.vxb", nullptr);
     ASSERT_NE(store, nullptr);
@@ -842,7 +842,7 @@ void trial_gqc_tail_heal(const GqcTemplate& t, int index) {
     EXPECT_TRUE(clean) << "trial " << index << ": torn sidecar tail not clean";
     EXPECT_EQ(highest, complete) << "trial " << index << ": wrong healed stamp";
     // Healed on disk to the last complete record.
-    EXPECT_EQ(std::filesystem::file_size(gpath), complete * 48ULL)
+    EXPECT_EQ(std::filesystem::file_size(gpath), complete * 52ULL)
         << "trial " << index << ": sidecar tail not truncated";
 
     vx::state::LedgerState ledger;
@@ -1144,6 +1144,220 @@ TEST(VxCrashTortureTest, Level1GqcTailHeals) {
         trial_gqc_tail_heal(t, 500 + i);
     }
     SUCCEED() << "10 GQC tail-heal trials done";
+}
+
+// Regression (crash-torture finding 1, fixed 2026-11-04): the v2 record
+// carries a CRC32C over height+aggregate, so flipping a HEIGHT byte in a
+// middle record must fail closed -- the old v1 reader accepted it clean and
+// would have inflated the finality guard.
+TEST(VxCrashTortureTest, GqcHeightByteFlipFailsClosed) {
+    const GqcTemplate& t = gqc_template();
+    Rng& rng = trial_rng();
+    const std::string dir = fresh_trial_dir(t.dir, 990);
+    const std::string gpath = dir + "/ledger.vxb.gqc";
+
+    const size_t recs = t.stamped_heights.size();
+    const size_t rec = 1 + rng.below(recs - 2); // strictly middle
+    const size_t off = rec * 52 + 8 + rng.below(8); // height bytes
+    const uint8_t mask = static_cast<uint8_t>(1 + rng.below(255));
+    flip_byte(gpath, off, mask);
+
+    auto store = try_open(dir + "/ledger.vxb", nullptr);
+    ASSERT_NE(store, nullptr);
+
+    bool clean = true;
+    store->highest_gqc_stamp(clean);
+    EXPECT_FALSE(clean) << "a flipped height byte read clean";
+    for (const uint64_t h : t.stamped_heights) {
+        uint8_t out[32];
+        EXPECT_FALSE(store->gqc_stamp(h, out))
+            << "corrupt sidecar served height " << h;
+    }
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(dir, *store, ledger);
+    EXPECT_FALSE(undo.finalized_sidecar_trusted());
+    EXPECT_EQ(undo.finalized_checkpoint_height(), 0u);
+    std::filesystem::remove_all(dir);
+}
+
+// Regression: a legacy v1 sidecar (no checksum) migrates to v2 on first open
+// and stays trusted, with every aggregate intact and the file rewritten to
+// 52-byte records.
+TEST(VxCrashTortureTest, LegacyGqcSidecarMigratesToV2) {
+    const GqcTemplate& t = gqc_template();
+    const std::string dir = fresh_trial_dir(t.dir, 991);
+    const std::string gpath = dir + "/ledger.vxb.gqc";
+
+    // Overwrite the (now v2) sidecar with a hand-written legacy v1 file.
+    std::string legacy;
+    for (const uint64_t h : t.stamped_heights) {
+        uint8_t agg[32];
+        const std::string tag = "VX_GQC_TORTURE_AGG_" + std::to_string(h);
+        VortexSponge256::compute(reinterpret_cast<const uint8_t*>(tag.data()),
+                                 tag.size(), agg);
+        legacy.append("VXGQCRT1", 8);
+        legacy.append(reinterpret_cast<const char*>(&h), 8);
+        legacy.append(reinterpret_cast<const char*>(agg), 32);
+    }
+    {
+        std::ofstream f(gpath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(f.good());
+        f.write(legacy.data(), static_cast<std::streamsize>(legacy.size()));
+    }
+
+    auto store = try_open(dir + "/ledger.vxb", nullptr);
+    ASSERT_NE(store, nullptr);
+
+    bool clean = false;
+    const uint64_t highest = store->highest_gqc_stamp(clean);
+    EXPECT_TRUE(clean) << "legacy sidecar migration failed";
+    EXPECT_EQ(highest, t.stamped_heights.size());
+    for (size_t i = 0; i < t.stamped_heights.size(); ++i) {
+        const uint64_t h = t.stamped_heights[i];
+        uint8_t out[32];
+        uint8_t want[32];
+        const std::string tag = "VX_GQC_TORTURE_AGG_" + std::to_string(h);
+        VortexSponge256::compute(reinterpret_cast<const uint8_t*>(tag.data()),
+                                 tag.size(), want);
+        EXPECT_TRUE(store->gqc_stamp(h, out))
+            << "height " << h << " not served after migration";
+        EXPECT_EQ(std::memcmp(out, want, 32), 0)
+            << "aggregate mismatch after migration for height " << h;
+    }
+    // Migrated on disk to v2 52-byte records.
+    EXPECT_EQ(std::filesystem::file_size(gpath), t.stamped_heights.size() * 52ULL)
+        << "sidecar not rewritten to v2";
+    std::filesystem::remove_all(dir);
+}
+
+// Regression (review F3): a sidecar that mixes v1 and v2 records can never
+// be legitimately written — the realistic accident is a v2 record appended
+// (at the 48-aligned tip) onto a not-yet-migrated v1 file. The engine must
+// refuse it loudly, fail closed, and leave the file untouched.
+TEST(VxCrashTortureTest, GqcMixedSidecarFailsClosed) {
+    const GqcTemplate& t = gqc_template();
+    const std::string dir = fresh_trial_dir(t.dir, 992);
+    const std::string gpath = dir + "/ledger.vxb.gqc";
+    // v1 file, then one 52-byte v2 record appended at the 48-aligned tip —
+    // exactly what a second writer would produce before migration ran.
+    {
+        std::ofstream f(gpath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(f.good());
+        std::string legacy;
+        for (const uint64_t h : t.stamped_heights) {
+            legacy.append("VXGQCRT1", 8);
+            legacy.append(reinterpret_cast<const char*>(&h), 8);
+            legacy.append(32, '\x22');
+        }
+        std::string rec;
+        rec.append("VXGQCRT2", 8);
+        const uint64_t h = 1;
+        rec.append(reinterpret_cast<const char*>(&h), 8);
+        rec.append(32, '\x33');
+        rec.append(4, '\x00'); // CRC placeholder
+        f.write((legacy + rec).data(), static_cast<std::streamsize>(legacy.size() + rec.size()));
+    }
+
+    auto store = try_open(dir + "/ledger.vxb", nullptr);
+    ASSERT_NE(store, nullptr);
+
+    bool clean = true;
+    store->highest_gqc_stamp(clean);
+    EXPECT_FALSE(clean) << "mixed RT1/RT2 sidecar read clean";
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(dir, *store, ledger);
+    EXPECT_FALSE(undo.finalized_sidecar_trusted());
+    EXPECT_EQ(undo.finalized_checkpoint_height(), 0u);
+    // Untouched on disk: the v1 records plus the offending v2 record.
+    EXPECT_EQ(std::filesystem::file_size(gpath), t.stamped_heights.size() * 48ULL + 52ULL);
+    std::filesystem::remove_all(dir);
+}
+
+// Regression (review F1): migration may trust only what a legitimate v1
+// writer could have produced. A garbage tag mid-file must fail the whole
+// migration closed — no rewrite, no CRC blessing of corrupt content.
+TEST(VxCrashTortureTest, GqcMigrationRejectsGarbageTags) {
+    const GqcTemplate& t = gqc_template();
+    const std::string dir = fresh_trial_dir(t.dir, 993);
+    const std::string gpath = dir + "/ledger.vxb.gqc";
+
+    std::string legacy;
+    for (const uint64_t h : t.stamped_heights) {
+        uint8_t agg[32];
+        const std::string tag = "VX_GQC_TORTURE_AGG_" + std::to_string(h);
+        VortexSponge256::compute(reinterpret_cast<const uint8_t*>(tag.data()),
+                                 tag.size(), agg);
+        legacy.append("VXGQCRT1", 8);
+        legacy.append(reinterpret_cast<const char*>(&h), 8);
+        legacy.append(reinterpret_cast<const char*>(agg), 32);
+    }
+    // Corrupt the tag of the middle record (same length, unknown version).
+    const size_t mid = (t.stamped_heights.size() / 2) * 48;
+    std::memcpy(legacy.data() + mid, "VXGQCRT9", 8);
+    {
+        std::ofstream f(gpath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(f.good());
+        f.write(legacy.data(), static_cast<std::streamsize>(legacy.size()));
+    }
+
+    auto store = try_open(dir + "/ledger.vxb", nullptr);
+    ASSERT_NE(store, nullptr);
+
+    bool clean = true;
+    store->highest_gqc_stamp(clean);
+    EXPECT_FALSE(clean) << "v1 file with a garbage-tagged block migrated clean";
+    // File untouched: still the original 48-byte-stride content.
+    EXPECT_EQ(std::filesystem::file_size(gpath), t.stamped_heights.size() * 48ULL)
+        << "migration rewrote a file it should have refused";
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(dir, *store, ledger);
+    EXPECT_FALSE(undo.finalized_sidecar_trusted());
+    EXPECT_EQ(undo.finalized_checkpoint_height(), 0u);
+    std::filesystem::remove_all(dir);
+}
+
+// Regression (review F1): a v1 record claiming a height the chain never had
+// cannot be a legitimate legacy record — stamp_gqc has always enforced
+// height < chain_height. Migration must refuse instead of inflating the
+// finality guard.
+TEST(VxCrashTortureTest, GqcMigrationRejectsInflatedHeight) {
+    const GqcTemplate& t = gqc_template();
+    const std::string dir = fresh_trial_dir(t.dir, 994);
+    const std::string gpath = dir + "/ledger.vxb.gqc";
+
+    std::string legacy;
+    for (const uint64_t h : t.stamped_heights) {
+        uint8_t agg[32];
+        const std::string tag = "VX_GQC_TORTURE_AGG_" + std::to_string(h);
+        VortexSponge256::compute(reinterpret_cast<const uint8_t*>(tag.data()),
+                                 tag.size(), agg);
+        legacy.append("VXGQCRT1", 8);
+        legacy.append(reinterpret_cast<const char*>(&h), 8);
+        legacy.append(reinterpret_cast<const char*>(agg), 32);
+    }
+    // Inflate the height of the first record far beyond any real height.
+    const uint64_t bogus = 0x00000000FFFFFFFEull;
+    std::memcpy(legacy.data() + 8, &bogus, 8);
+    {
+        std::ofstream f(gpath, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(f.good());
+        f.write(legacy.data(), static_cast<std::streamsize>(legacy.size()));
+    }
+
+    auto store = try_open(dir + "/ledger.vxb", nullptr);
+    ASSERT_NE(store, nullptr);
+
+    bool clean = true;
+    const uint64_t highest = store->highest_gqc_stamp(clean);
+    EXPECT_FALSE(clean) << "inflated-height v1 record migrated clean";
+    EXPECT_EQ(highest, 0u) << "inflated height leaked into the guard";
+    EXPECT_EQ(std::filesystem::file_size(gpath), t.stamped_heights.size() * 48ULL)
+        << "migration rewrote a file it should have refused";
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(dir, *store, ledger);
+    EXPECT_FALSE(undo.finalized_sidecar_trusted());
+    EXPECT_EQ(undo.finalized_checkpoint_height(), 0u);
+    std::filesystem::remove_all(dir);
 }
 
 // LEVEL 1 (f): 15 garbage-append trials (reject-or-migrate).

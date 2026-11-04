@@ -98,11 +98,19 @@ public:
     /// (fail closed).
     bool gqc_stamp(uint64_t height, uint8_t out[32]) const;
 
+    /// One-time migration of a legacy v1 sidecar ("VXGQCRT1", 48 B, no
+    /// integrity) to v2 ("VXGQCRT2", 52 B with a CRC32C over height+
+    /// aggregate). No-op when the file is empty, absent or already v2;
+    /// false only when the rewrite fails or the file mixes versions.
+    /// The rewrite trusts the pre-migration content exactly once — the
+    /// documented bootstrap (crash-torture finding 1, 2026-11-04).
+    bool gqc_ensure_integrity() const;
+
     /// Highest height stamped in the GQC sidecar (BACKLOG 0.13: the
     /// finalized checkpoint must outlive the process — on open the rollback
     /// guard restores it, fail-closed and monotonic). clean=false when the
     /// sidecar contains a corrupt record — the caller must NOT trust the
-    /// returned height then; a torn tail (fewer than 48 trailing bytes) is
+    /// returned height then; a torn tail (fewer than 52 trailing bytes) is
     /// healed by truncation instead.
     uint64_t highest_gqc_stamp(bool& clean) const;
     const std::string& path() const noexcept { return path_; }

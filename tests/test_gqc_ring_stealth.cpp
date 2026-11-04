@@ -195,7 +195,11 @@ TEST(VortexGqcRingStealthTest, GqcCheckpointSurvivesRestart) {
     {
         std::ofstream f(tmp_dir + "/gqc_restart.vxb.gqc",
                         std::ios::binary | std::ios::app);
-        f << std::string(48, '\xFF'); // corrupt record after the valid ones
+        // A full-size garbage record: with 52-byte v2 records, appending
+        // fewer bytes presents as a torn TAIL (healed conservatively —
+        // truncation can only lower the guard), while a complete record
+        // with a bad magic tag must fail the read closed.
+        f << std::string(52, '\xFF'); // corrupt record after the valid ones
     }
     {
         vx::state::LedgerState ledger3;

@@ -112,9 +112,6 @@ public:
     // Emergency rollback to genesis
     bool emergency_rollback();
 
-    // Get current height
-    uint64_t current_height() const;
-
 private:
     std::string data_dir_;
     storage::BlockStore* store_;

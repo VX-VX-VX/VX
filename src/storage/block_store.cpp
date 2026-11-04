@@ -1,5 +1,6 @@
 #include "vx/storage/block_store.hpp"
 #include "vx/blockchain/genesis.hpp"
+#include "vx/net/swarm_node.hpp" // compute_wire_crc32c (GQC record integrity)
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -7,6 +8,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -125,6 +127,8 @@ BlockStore::BlockStore(const std::string& path, const std::string& genesis_path,
     }
 
     if (!validate_region(static_cast<const uint8_t*>(mapped_), 0, count_)) {
+        ::close(fd_);
+        fd_ = -1;
         throw std::runtime_error("BlockStore: ledger '" + path +
                                  "' contains frames with bad magic, non-sequential heights, "
                                  "oversized tx_count or a broken merkle commitment");
@@ -249,8 +253,176 @@ void BlockStore::tip_hash(uint8_t out[32]) const noexcept {
     blockchain::hash_block(*tip, out);
 }
 
+// ── GQC sidecar record integrity (crash-torture finding 1, 2026-11-04) ──────
+// The v1 record ("VXGQCRT1", 48 B) carried no integrity over the height and
+// aggregate bytes: a flipped height byte read back clean and INFLATED the
+// finality guard, a flipped aggregate byte was served as a valid certificate.
+// The v2 record ("VXGQCRT2", 52 B) appends a CRC32C over height+aggregate.
+// Legacy v1 files are migrated once on first open (the rewrite trusts the
+// existing content a single time — documented bootstrap); afterwards any
+// checksum mismatch fails the whole read closed, like a bad magic tag.
+namespace {
+
+constexpr uint8_t kGqcRec = 52;
+constexpr size_t kGqcBody = 48; // tag(8) + height(8) + aggregate(32)
+constexpr size_t kGqcCrcOff = 48;
+
+uint32_t gqc_body_crc(const uint8_t* rec) {
+    return vx::net::compute_wire_crc32c(rec + 8, kGqcBody - 8);
+}
+
+void gqc_fsync_file(const std::string& path) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return;
+    ::fsync(fd);
+    ::close(fd);
+}
+
+void gqc_fsync_dir_of(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return;
+    ::fsync(fd);
+    ::close(fd);
+}
+
+bool gqc_migrate_rt1_locked(const std::string& path, const std::vector<uint8_t>& buf,
+                            uint64_t chain_height) {
+    // Security review F1 (2026-11-04): the migration may trust only what a
+    // legitimate v1 writer could have produced. stamp_gqc has always
+    // enforced height < chain_height, and the v1 writer only ever wrote the
+    // RT1 tag — any 48-byte block that violates either is not a legacy
+    // record but corruption (or a crafted file), and blessing it with a
+    // fresh CRC would fabricate an inflated finality guard. Fail closed
+    // instead: no rewrite, the callers report an untrusted sidecar.
+    const size_t records = buf.size() / 48;
+    for (size_t r = 0; r < records; ++r) {
+        const uint8_t* blk = buf.data() + r * 48;
+        if (std::memcmp(blk, "VXGQCRT1", 8) != 0) return false;
+        uint64_t h = 0;
+        std::memcpy(&h, blk + 8, 8);
+        if (h >= chain_height) return false;
+    }
+    // Rewrite every 48-byte v1 record as a 52-byte v2 record with a CRC.
+    // The file is rewritten atomically enough for a sidecar: write the new
+    // content to a temp file, fsync, rename over the original.
+    std::vector<uint8_t> out;
+    out.reserve(records * kGqcRec);
+    for (size_t r = 0; r < records; ++r) {
+        const uint8_t* blk = buf.data() + r * 48;
+        uint8_t rec[kGqcRec] = {};
+        std::memcpy(rec, "VXGQCRT2", 8);
+        std::memcpy(rec + 8, blk + 8, 40); // height + aggregate
+        const uint32_t crc = gqc_body_crc(rec);
+        std::memcpy(rec + kGqcCrcOff, &crc, 4);
+        out.insert(out.end(), rec, rec + kGqcRec);
+    }
+    const std::string tmp = path + ".gqc.mig";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return false;
+    size_t written = 0;
+    while (written < out.size()) {
+        const ssize_t n = ::write(fd, out.data() + written, out.size() - written);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { ::close(fd); return false; }
+        written += static_cast<size_t>(n);
+    }
+    if (::fsync(fd) != 0) { ::close(fd); return false; }
+    ::close(fd);
+    std::error_code ec;
+    std::filesystem::rename(tmp, path + ".gqc", ec);
+    if (ec) return false;
+    // Durability (review F7): the rename itself must survive a power cut,
+    // or the next boot re-runs an idempotent migration on the still-v1 file.
+    gqc_fsync_dir_of(path + ".gqc");
+    return true;
+}
+
+} // namespace
+
+bool BlockStore::gqc_ensure_integrity() const {
+    const int gfd = ::open((path_ + ".gqc").c_str(), O_RDONLY);
+    if (gfd < 0) return true; // no sidecar: nothing to migrate
+    struct stat st{};
+    if (::fstat(gfd, &st) < 0 || st.st_size == 0) {
+        ::close(gfd);
+        return true;
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(st.st_size));
+    const ssize_t got = ::read(gfd, buf.data(), buf.size());
+    ::close(gfd);
+    if (got != static_cast<ssize_t>(buf.size())) return false;
+
+    bool has_rt1 = false;
+    bool has_rt2 = false;
+    bool has_unknown = false;
+    size_t off = 0;
+    while (off + 48 <= buf.size()) {
+        if (std::memcmp(buf.data() + off, "VXGQCRT1", 8) == 0) has_rt1 = true;
+        else if (std::memcmp(buf.data() + off, "VXGQCRT2", 8) == 0) has_rt2 = true;
+        else has_unknown = true;
+        off += 48;
+    }
+    if (!has_rt1) return true;   // already v2 (validated per-record by the callers)
+    if (has_rt2) {
+        // Mixed versions can never be a legitimately written file (review
+        // F3): it means v1 records appeared after a v2 migration — a
+        // rolling-upgrade or two-writers-on-one-dir accident. Fail closed
+        // loudly; only an operator can resolve it.
+        std::fprintf(stderr,
+                     "[VX][GQC] %s.gqc: mixed RT1/RT2 records — refusing to "
+                     "read or migrate; remove the sidecar or restore a "
+                     "consistent version\n",
+                     path_.c_str());
+        return false;
+    }
+    if (has_unknown) {
+        // v1-classified file with a block that is neither RT1 nor RT2: not
+        // a record the v1 writer could have produced (review F1). Migration
+        // must not bless it — fail closed like every other reader path.
+        return false;
+    }
+    if (has_rt2) {
+        // Mixed versions can never be a legitimately written file (review
+        // F3): it means v1 records appeared after a v2 migration — a
+        // rolling-upgrade or two-writers-on-one-dir accident. Fail closed
+        // loudly; only an operator can resolve it.
+        std::fprintf(stderr,
+                     "[VX][GQC] %s.gqc: mixed RT1/RT2 records — refusing to "
+                     "read or migrate; remove the sidecar or restore a "
+                     "consistent version\n",
+                     path_.c_str());
+        return false;
+    }
+    // All-v1 file: drop a torn tail to the record boundary, then rewrite.
+    if (buf.size() % 48 != 0) {
+        std::error_code ec;
+        std::filesystem::resize_file(path_ + ".gqc", static_cast<uintmax_t>(off), ec);
+        if (ec) return false;
+        gqc_fsync_file(path_ + ".gqc");
+    }
+    return gqc_migrate_rt1_locked(path_, buf, count_);
+}
+
 bool BlockStore::stamp_gqc(uint64_t height, const uint8_t agg[32]) {
     if (height >= count_ || fd_ < 0) return false;
+    // The sidecar carries integrity metadata, so stamping must never mix
+    // record generations on one file (review F2/F3): migrate any legacy
+    // v1 content first, then refuse to append to anything that is not a
+    // clean 52-stride v2 file (a torn tail is healed here too — healing
+    // can only lower what the readers trust, never inflate it).
+    if (!gqc_ensure_integrity()) return false;
+    {
+        std::error_code ec;
+        const uintmax_t sz = std::filesystem::file_size(path_ + ".gqc", ec);
+        if (!ec && sz % kGqcRec != 0) {
+            std::error_code tec;
+            std::filesystem::resize_file(path_ + ".gqc", sz - (sz % kGqcRec), tec);
+            if (tec) return false;
+            gqc_fsync_file(path_ + ".gqc");
+        }
+    }
     // Sidecar certificate record (external review round 5): the 104-byte
     // tail has no free bytes — vm_state_root, vm_gas_used, pogw_nonce and
     // vm_bytecode occupy all of them — so stamping into the frame would
@@ -259,13 +431,15 @@ bool BlockStore::stamp_gqc(uint64_t height, const uint8_t agg[32]) {
     // the frame itself never changes after append.
     const int gfd = ::open((path_ + ".gqc").c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (gfd < 0) return false;
-    uint8_t rec[48];
-    std::memcpy(rec, "VXGQCRT1", 8);
-    const uint64_t h = height; // little-endian on LE hosts; read back via memcmp of height bytes
+    uint8_t rec[kGqcRec] = {};
+    std::memcpy(rec, "VXGQCRT2", 8);
+    const uint64_t h = height; // host-order memcpy; read back via memcpy + numeric compare
     std::memcpy(rec + 8, &h, 8);
     std::memcpy(rec + 16, agg, 32);
-    // Full-write loop (review round 5, P2): a partial ::write of the 48-byte
-    // record left corrupt bytes mid-file, which the reader can never heal
+    const uint32_t crc = gqc_body_crc(rec);
+    std::memcpy(rec + kGqcCrcOff, &crc, 4);
+    // Full-write loop (review round 5, P2): a partial ::write of the record
+    // left corrupt bytes mid-file, which the reader can never heal
     // (it only truncates a torn TAIL) — every later restart then took the
     // fail-closed branch and silently reset the finality guard to 0. A
     // complete record (or none) is the only durable outcome.
@@ -282,18 +456,26 @@ bool BlockStore::stamp_gqc(uint64_t height, const uint8_t agg[32]) {
     return ok;
 }
 
-bool BlockStore::gqc_stamp(uint64_t height, uint8_t out[32]) const {    if (height >= count_) return false;
+bool BlockStore::gqc_stamp(uint64_t height, uint8_t out[32]) const {
+    if (height >= count_) return false;
+    if (!gqc_ensure_integrity()) return false;
     const int gfd = ::open((path_ + ".gqc").c_str(), O_RDONLY);
     if (gfd < 0) return false;
     bool found = false;
     bool corrupt = false;
-    uint8_t rec[48];
+    uint8_t rec[kGqcRec];
     // Records are appended in certification order; the LAST record for a
     // height wins (re-certification after a re-stamp is legitimate). A
     // corrupt record fails the whole read closed — a partially trusted
     // certificate store is worse than none.
     while (::read(gfd, rec, sizeof(rec)) == static_cast<ssize_t>(sizeof(rec))) {
-        if (std::memcmp(rec, "VXGQCRT1", 8) != 0) {
+        if (std::memcmp(rec, "VXGQCRT2", 8) != 0) {
+            corrupt = true;
+            break;
+        }
+        uint32_t crc = 0;
+        std::memcpy(&crc, rec + kGqcCrcOff, 4);
+        if (crc != gqc_body_crc(rec)) {
             corrupt = true;
             break;
         }
@@ -310,6 +492,10 @@ bool BlockStore::gqc_stamp(uint64_t height, uint8_t out[32]) const {    if (heig
 
 uint64_t BlockStore::highest_gqc_stamp(bool& clean) const {
     clean = true;
+    if (!gqc_ensure_integrity()) {
+        clean = false;
+        return 0;
+    }
     const int gfd = ::open((path_ + ".gqc").c_str(), O_RDONLY);
     if (gfd < 0) return 0; // no sidecar yet: nothing was ever cemented
 
@@ -326,26 +512,39 @@ uint64_t BlockStore::highest_gqc_stamp(bool& clean) const {
         return 0;
     }
 
-    // Records are fixed 48 bytes ("VXGQCRT1" + u64 height + 32 B aggregate).
-    // The highest complete record wins; a bad magic anywhere is corruption
-    // (fail closed: the caller must not trust the result); a torn TAIL of
-    // fewer than 48 bytes is healed by truncation, like the undo journal.
-    constexpr size_t kRec = 48;
+    // Records are fixed 52 bytes ("VXGQCRT2" + u64 height + 32 B aggregate
+    // + CRC32C over height+aggregate). The highest complete record wins;
+    // a bad magic, a checksum mismatch, or a torn tail that does not land
+    // on a record boundary is corruption (fail closed: the caller must not
+    // trust the result); a torn TAIL is healed by truncation, like the
+    // undo journal.
+    constexpr size_t kRec = kGqcRec;
     uint64_t highest = 0;
     size_t off = 0;
     while (off + kRec <= buf.size()) {
-        if (std::memcmp(buf.data() + off, "VXGQCRT1", 8) != 0) {
+        const uint8_t* rec = buf.data() + off;
+        if (std::memcmp(rec, "VXGQCRT2", 8) != 0) {
+            clean = false;
+            return highest;
+        }
+        uint32_t crc = 0;
+        std::memcpy(&crc, rec + kGqcCrcOff, 4);
+        if (crc != gqc_body_crc(rec)) {
             clean = false;
             return highest;
         }
         uint64_t h = 0;
-        std::memcpy(&h, buf.data() + off + 8, 8);
+        std::memcpy(&h, rec + 8, 8);
         if (h > highest) highest = h;
         off += kRec;
     }
     if (off != buf.size()) {
         // Torn tail: heal by truncating to the last complete record.
         std::filesystem::resize_file(path_ + ".gqc", static_cast<uintmax_t>(off));
+        // Durability (review F7): an unfsynced heal can resurrect after a
+        // power cut behind records appended later, shifting the record
+        // grid — sync the truncation before returning.
+        gqc_fsync_file(path_ + ".gqc");
     }
     return highest;
 }
