@@ -458,7 +458,13 @@ same-origin policy; cross-origin RPC to a user-selected node now runs in the
 main process over an IPC bridge (`vx:rpc`, GET/POST of JSON bodies only,
 redirects refused, 30 s abort). SSE (`/api/events`) is skipped under Electron
 when the RPC host is cross-origin — the 10 s polling refresh covers push
-reactions. Residual: a proper SSE-over-IPC relay in the main process so
+reactions. Review follow-ups folded in: the bridge handler registers once at
+`app.whenReady` (a second registration from macOS re-activation would throw),
+the bridge allowlists method GET|POST and only Accept/Content-Type headers —
+undici has no Chromium-style forbidden-header list, so without the allowlist a
+compromised renderer could forge Cookie/Host/Content-Length — and 204/205/304
+responses reconstruct with a null body (the Response constructor throws
+otherwise). Residual: a proper SSE-over-IPC relay in the main process so
 push immediacy returns to the desktop client without re-opening the renderer.
 
 ### 0.16 GQC sidecar v2 (delivered 2026-11-04) — residual hardening

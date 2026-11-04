@@ -170,7 +170,9 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
       headers: init?.headers,
       body: typeof init?.body === 'string' ? init.body : undefined,
     }).then((r: { ok: boolean; status: number; statusText: string; text: string }) =>
-      new Response(r.text, { status: r.status, statusText: r.statusText })
+      // 204/205/304 forbid a body — the Response constructor throws on one.
+      new Response(r.status === 204 || r.status === 205 || r.status === 304 ? null : r.text,
+        { status: r.status, statusText: r.statusText })
     )
   }, [])
 
@@ -333,7 +335,7 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
     }
 
     // Under Electron with a cross-origin absolute RPC host, EventSource would
-    // need CORS the node does not send. The 10s polling refresh already
+    // need CORS the node does not send. The polling refresh (3–10 s) already
     // covers push reactions (block_sealed → refreshAll), so skip SSE there;
     // an SSE-over-IPC relay is BACKLOG 0.17.
     const sseUrl = resolveUrl('/api/events')

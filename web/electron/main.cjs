@@ -45,31 +45,6 @@ function createWindow() {
     mainWindow = null;
   });
 
-  // RPC bridge: renderer asks the main process to fetch an absolute http(s)
-  // URL. Node's fetch has no CORS, so cross-origin RPC works without
-  // weakening the renderer. GET/POST of JSON bodies only, no redirects.
-  const RPC_TIMEOUT_MS = 30000;
-  ipcMain.handle('vx:rpc', async (_event, url, options = {}) => {
-    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
-      throw new Error('vx:rpc: absolute http(s) URL required');
-    }
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
-    try {
-      const res = await fetch(url, {
-        method: typeof options.method === 'string' ? options.method : 'GET',
-        headers: options.headers && typeof options.headers === 'object' ? options.headers : {},
-        body: typeof options.body === 'string' ? options.body : undefined,
-        signal: controller.signal,
-        redirect: 'error',
-      });
-      const text = await res.text();
-      return { ok: res.ok, status: res.status, statusText: res.statusText, text };
-    } finally {
-      clearTimeout(timer);
-    }
-  });
-
   // Handle window controls
   ipcMain.on('window-minimize', () => mainWindow.minimize());
   ipcMain.on('window-maximize', () => {
@@ -99,6 +74,48 @@ function startVxNode() {
 }
 
 app.whenReady().then(() => {
+  // RPC bridge: renderer asks the main process to fetch an absolute http(s)
+  // URL. Node's fetch has no CORS, so cross-origin RPC works without
+  // weakening the renderer. Registered once (NOT inside createWindow —
+  // macOS re-activation would throw "second handler"). Hardening from the
+  // security review: undici has no forbidden-header list, so the bridge
+  // allowlists method GET|POST and only Accept/Content-Type — a compromised
+  // renderer cannot forge Cookie/Host/Content-Length or send DELETE et al.
+  const RPC_TIMEOUT_MS = 30000;
+  ipcMain.handle('vx:rpc', async (_event, url, options = {}) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+      throw new Error('vx:rpc: absolute http(s) URL required');
+    }
+    const method = typeof options.method === 'string' ? options.method.toUpperCase() : 'GET';
+    if (method !== 'GET' && method !== 'POST') {
+      throw new Error('vx:rpc: only GET and POST are allowed');
+    }
+    const headers = {};
+    if (options.headers && typeof options.headers === 'object') {
+      for (const key of Object.keys(options.headers)) {
+        const lower = String(key).toLowerCase();
+        if (lower === 'accept' || lower === 'content-type') {
+          headers[lower] = String(options.headers[key]);
+        }
+      }
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        method,
+        headers,
+        body: typeof options.body === 'string' ? options.body : undefined,
+        signal: controller.signal,
+        redirect: 'error',
+      });
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, statusText: res.statusText, text };
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
   startVxNode();
   createWindow();
 
