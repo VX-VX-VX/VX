@@ -147,6 +147,51 @@ std::array<uint8_t, 32> wots_leaf_pk_root(uint32_t global_leaf,
     return root;
 }
 
+// ── Per-window leaf cache (BACKLOG 1.5) ──────────────────────────────────────
+// Every signature and every tree root used to recompute all 16 leaves of the
+// window from scratch (~16k chain steps each). The leaf public-key roots are
+// PUBLIC, deterministic data (chain ends of the WOTS public keys), so caching
+// one window's 16 digests (512 bytes) is safe: a stale hit can only produce a
+// signature that fails verification (fail-visible), never a wrong-but-valid
+// one, and the cache is always checkable by recomputation. thread_local: no
+// locks, no cross-thread sharing, no false sharing. Never persisted.
+struct LeafCacheSlot {
+    bool valid = false;
+    uint32_t window = 0;
+    std::array<uint8_t, 32> master{};
+    std::array<uint8_t, 32> seed{};
+    std::array<std::array<uint8_t, 32>, XMSS_LEAVES> leaves{};
+};
+thread_local LeafCacheSlot g_leaf_cache[2];
+thread_local unsigned g_leaf_cache_turn = 0;
+
+std::array<uint8_t, 32> window_leaf_root(uint32_t window, uint32_t leaf_in_window,
+                                         const std::array<uint8_t, 32>& master_sk,
+                                         const std::array<uint8_t, 32>& pub_seed) noexcept {
+    for (const auto& slot : g_leaf_cache) {
+        if (slot.valid && slot.window == window &&
+            std::memcmp(slot.master.data(), master_sk.data(), 32) == 0 &&
+            std::memcmp(slot.seed.data(), pub_seed.data(), 32) == 0) {
+            return slot.leaves[leaf_in_window];
+        }
+    }
+    // Miss: fill a slot with the WHOLE window (every caller needs all 16 —
+    // the auth path or the root build). Two direct-mapped slots so the
+    // rollover's from/to root pair stops thrashing a single slot.
+    LeafCacheSlot& s = g_leaf_cache[g_leaf_cache_turn];
+    g_leaf_cache_turn = (g_leaf_cache_turn + 1) % 2;
+    s.valid = true;
+    s.window = window;
+    s.master = master_sk;
+    s.seed = pub_seed;
+    const uint32_t window_base = window << XMSS_H;
+    for (size_t j = 0; j < XMSS_LEAVES; ++j) {
+        s.leaves[j] = wots_leaf_pk_root(window_base | static_cast<uint32_t>(j),
+                                        master_sk, pub_seed);
+    }
+    return s.leaves[leaf_in_window];
+}
+
 std::array<uint8_t, 32> xmss_node_hash(uint8_t level, uint16_t node_idx,
                                        const std::array<uint8_t, 32>& pub_seed,
                                        const std::array<uint8_t, 32>& left,
@@ -202,11 +247,10 @@ std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
 std::array<uint8_t, 32> xmss_root_tree(const std::array<uint8_t, 32>& master_sk,
                                        const std::array<uint8_t, 32>& pub_seed,
                                        uint32_t tree_index) noexcept {
-    const uint32_t window_base = tree_index << XMSS_H;
     std::array<std::array<uint8_t, 32>, XMSS_LEAVES> level{};
     for (size_t j = 0; j < XMSS_LEAVES; ++j) {
-        level[j] = wots_leaf_pk_root(window_base | static_cast<uint32_t>(j),
-                                     master_sk, pub_seed);
+        level[j] = window_leaf_root(tree_index, static_cast<uint32_t>(j),
+                                    master_sk, pub_seed);
     }
     size_t count = XMSS_LEAVES;
     uint8_t lvl = 0;
@@ -346,7 +390,7 @@ PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
     // leaf is one of them.
     std::array<std::array<uint8_t, 32>, XMSS_LEAVES> level{};
     for (size_t j = 0; j < XMSS_LEAVES; ++j) {
-        level[j] = wots_leaf_pk_root(window_base | static_cast<uint32_t>(j),
+        level[j] = window_leaf_root(subtree_index, static_cast<uint32_t>(j),
                                      master_sk, pub_seed);
     }
     size_t count = XMSS_LEAVES;
@@ -513,13 +557,13 @@ bool pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_
     //     already signed is never handed out twice: the ledger assigns the
     //     lowest free leaf instead, and exhausting the allowed leaves fails
     //     the call. Kernel invariant (owner directive, 2026-11-05): leaf 15
-    //     is reserved EXCLUSIVELY for rollover certificates — in the
-    //     tracked path a regular signature may not request it and the
-    //     lowest-free search never assigns it. The untracked legacy path
-    //     (no ledger, no reuse protection by definition) is unchanged.
+    //     is reserved EXCLUSIVELY for rollover certificates — a regular
+    //     transaction may NEVER sign on it, with or without a ledger, so
+    //     local mock tests and production nodes observe identical core
+    //     behavior (owner directive, Principle of Least Surprise, v0.0.16).
     uint32_t use_leaf = leaf_idx;
+    if (leaf_idx == PqLeafLedger::kReservedCertLeaf) return false;
     if (leaf_ledger) {
-        if (leaf_idx == PqLeafLedger::kReservedCertLeaf) return false;
         const int assigned = leaf_ledger->reserve_for_tx(root, leaf_idx);
         if (assigned < 0) return false; // exhausted or log untrusted
         use_leaf = static_cast<uint32_t>(assigned);

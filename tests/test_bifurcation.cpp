@@ -87,14 +87,15 @@ constexpr uint64_t BLOCKS_PER_SEED[5] = {40, 40, 40, 40, 40};
 
 // Economy shape constants (all deterministic; no floats anywhere).
 //
-// LEAF ECONOMY: every PQ key signs at most 16 transactions in its lifetime
-// (the XMSS tree spans exactly leaves 0..15; pq_sign_transaction refuses
-// nonce >= 16 as an unspanned subtree). So the chain is funded through a
+// LEAF ECONOMY: every PQ key signs at most 15 transactions in its lifetime
+// (the XMSS tree spans leaves 0..15 but leaf 15 is RESERVED for rollover
+// certificates — pq_sign_transaction refuses nonce >= 15 as the kernel
+// invariant). So the chain is funded through a
 // three-tier tree whose leaf budgets are checked by the builder:
 //
 //   demo spender (100,000 VX mint) -- 12 funding txs (leaves 0..11)
 //     -> 12 tier-A accounts, 800 VX each -- 14 funding txs each
-//        -> up to 168 tier-B accounts, 50 VX each -- 16 transfer leaves each
+//        -> up to 168 tier-B accounts, 50 VX each -- 15 transfer leaves each
 //
 // Transfer capacity ~2,700 + funding txs ~180 -- ample even for a
 // 1000-block seed (average 2.5 transfers/block); what caps the seed length
@@ -352,8 +353,9 @@ BuildOutcome build_chain(uint64_t seed, uint64_t blocks,
     // their funder pays them; the first witnessed spend binds their key).
     // Tier A is funded by the demo spender, tier B by a tier-A account.
     // A tier-A account funds at most MAX_B_PER_A children and keeps its
-    // remaining leaves unused; tier-B accounts spend their 16 leaves on
-    // user transfers. All leaf budgets respect the 16-leaf XMSS tree.
+    // remaining leaves unused; tier-B accounts spend their 15 tx leaves on
+    // user transfers. All leaf budgets respect the 15-leaf tx economy
+    // (leaf 15 is the reserved rollover-cert leaf).
     std::vector<PqAccount> tier_a;
     std::vector<PqAccount> tier_b;
     auto tier_a_tag = [](size_t i) {
@@ -476,9 +478,10 @@ BuildOutcome build_chain(uint64_t seed, uint64_t blocks,
 
             // A PQ-signed user transfer from a tier-B account. The sender
             // scan starts at a PRNG index and walks forward, skipping
-            // accounts that exhausted their 16 leaves or their balance --
-            // deterministic either way. With no usable sender the slot is
-            // skipped (still deterministic; the digest barely notices).
+            // accounts that exhausted their 15 tx leaves or their
+            // balance -- deterministic either way. With no usable sender
+            // the slot is skipped (still deterministic; the digest
+            // barely notices).
             if (!tier_b.empty()) {
                 const uint64_t amount =
                     TX_MIN_ATOMICS + splitmix64(rng) % TX_SPREAD_ATOMICS;
@@ -487,7 +490,7 @@ BuildOutcome build_chain(uint64_t seed, uint64_t blocks,
                     static_cast<size_t>(splitmix64(rng) % tier_b.size());
                 for (size_t scan = 0; scan < tier_b.size(); ++scan) {
                     const PqAccount& sender = tier_b[(start + scan) % tier_b.size()];
-                    if (next_nonce(sender.addr) >= 16) continue; // leaves spent
+                    if (next_nonce(sender.addr) >= 15) continue; // leaves spent
                     if (ledger.balance_of(sender.addr) < U128(amount + 100)) {
                         continue; // balance spent
                     }

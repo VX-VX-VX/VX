@@ -30,11 +30,12 @@
 //      overflow is the u64-bounded per-sender intra-block DEBIT accumulator,
 //      which the checked add refuses pre-commit ("debit accumulator
 //      overflow") with zero mutation.
-//   [FINDING] 6. One PQ key signs at most 16 transactions EVER: the WOTS+
-//      leaf is the tx nonce's low 4 bits and pq_sign_transaction refuses
-//      nonce >= 16 (XMSS subtree rollover unimplemented). "580 txs from one
-//      sender" is unproducible; the 580-tx maximum is exercised with 37
-//      keys instead. The ledger itself has no such limit.
+//   [FINDING] 6. One PQ key signs at most 15 transactions EVER: the WOTS+
+//      leaf is the tx nonce's low 4 bits, leaf 15 is RESERVED for rollover
+//      certificates (kernel invariant, v0.0.15/v0.0.16), and
+//      pq_sign_transaction refuses nonce >= 15. "580 txs from one sender"
+//      is unproducible; the 580-tx maximum is exercised with 39 keys
+//      instead. The ledger itself has no such limit.
 //   [FINDING] 7. The public invariant helper total_supply() SATURATES at
 //      2^64-1 (its treat-as-anomaly sentinel) once balances cross 2^64 in
 //      sum; per-address math stays exact.
@@ -1123,21 +1124,22 @@ TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
     constexpr uint64_t AMOUNT = 10'000'000ull; // 0.1 VX each
     constexpr uint32_t FEE = 100;
 
-    // 37 fresh senders, staged 2 VX each (test-only funding helper).
+    // 39 fresh senders, staged 2 VX each (test-only funding helper).
     std::vector<PqAccount> senders;
-    senders.reserve(37);
-    for (int i = 0; i < 37; ++i) {
+    senders.reserve(39);
+    for (int i = 0; i < 39; ++i) {
         senders.push_back(
             make_pq_account(("VX_BT_MAXTX_S" + std::to_string(i)).c_str()));
         ledger.adjust_balance(senders.back().addr, U128(200'000'000ull), true);
     }
 
-    // The full 580-tx block: 36 senders x 16 txs + 1 sender x 4 txs.
+    // The full 580-tx block: 38 senders x 15 txs + 1 sender x 10 txs.
+    // (15 txs per key: leaves 0..14; leaf 15 is the reserved cert leaf.)
     BlockBuilder b = next_block(store, ts + 1);
     uint32_t added = 0;
     for (size_t s = 0; s < senders.size() && added < MAX_TX_PER_BLOCK; ++s) {
         const uint32_t txs_for_this_sender =
-            (s + 1 < senders.size()) ? 16u : (MAX_TX_PER_BLOCK - added);
+            (s + 1 < senders.size()) ? 15u : (MAX_TX_PER_BLOCK - added);
         for (uint32_t n = 0; n < txs_for_this_sender; ++n) {
             Transaction t = mk_tx(senders[s].addr, sink, AMOUNT, FEE, n);
             ASSERT_TRUE(pq_sign(t, senders[s])) << "sign failed at " << added;
@@ -1148,8 +1150,8 @@ TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
     ASSERT_EQ(added, MAX_TX_PER_BLOCK);
     // The 581st cannot enter the frame.
     {
-        Transaction t581 = mk_tx(senders[36].addr, sink, AMOUNT, FEE, 4);
-        ASSERT_TRUE(pq_sign(t581, senders[36]));
+        Transaction t581 = mk_tx(senders[38].addr, sink, AMOUNT, FEE, 10);
+        ASSERT_TRUE(pq_sign(t581, senders[38]));
         EXPECT_FALSE(b.add_transaction(t581));
     }
     const auto res = push_block(store, ledger, b);
@@ -1162,23 +1164,25 @@ TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
               U128(254'000'000'000'000ULL + GENESIS_2_MINT_ATOMICS))
         << "a pure-transfer block must not issue";
     EXPECT_EQ(store.chain_height(), 3u);
-    // Every sender drained to the atom: 16 x (amount + fee) or 4 x (...).
+    // Every sender drained to the atom: 15 x (amount + fee) or 10 x (...).
     for (size_t s = 0; s + 1 < senders.size(); ++s) {
         EXPECT_EQ(ledger.balance_of(senders[s].addr),
-                  U128(200'000'000ull - 16ull * (AMOUNT + FEE))) << s;
+                  U128(200'000'000ull - 15ull * (AMOUNT + FEE))) << s;
     }
-    EXPECT_EQ(ledger.balance_of(senders[36].addr),
-              U128(200'000'000ull - 4ull * (AMOUNT + FEE)));
+    EXPECT_EQ(ledger.balance_of(senders[38].addr),
+              U128(200'000'000ull - 10ull * (AMOUNT + FEE)));
 
     std::filesystem::remove_all(dir);
 }
 
-// [FINDING 6] pinned exactly: the 16th signature is the last one a PQ key
-// can ever produce. Nonces 0..15 sign; nonce 16 (subtree 1) is refused by
-// the signer itself, so the 17th tx from one key cannot exist on the wire
-// (the ledger's nonce accounting would accept it -- the limit is in the
-// signature engine, not in apply_block).
-TEST(VxBoundaryTortureTest, PqKeySignsAtMostSixteenNonces) {
+// [FINDING 6] pinned exactly: the 15th signature is the last one a PQ key
+// can ever produce. Nonces 0..14 sign (leaves 0..14); leaf 15 is RESERVED
+// for rollover certificates, so nonce 15 is refused by the signer itself
+// with or without a ledger (kernel invariant, v0.0.16 hard block), and the
+// 16th tx from one key cannot exist on the wire (the ledger's nonce
+// accounting would accept it -- the limit is in the signature engine, not
+// in apply_block).
+TEST(VxBoundaryTortureTest, PqKeySignsAtMostFifteenNonces) {
     const std::string dir = temp_dir("vx_bt_16leaf");
     vx::storage::BlockStore store(dir + "/bt.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
@@ -1189,8 +1193,8 @@ TEST(VxBoundaryTortureTest, PqKeySignsAtMostSixteenNonces) {
     const uint64_t ts = std::time(nullptr);
     ASSERT_TRUE(push_mint(store, ledger, ts).ok);
 
-    // Fund the fresh account, then spend from it 16 times in one block
-    // (nonces 0..15): accepted, intra-block sequential nonces.
+    // Fund the fresh account, then spend from it 15 times in one block
+    // (nonces 0..14): accepted, intra-block sequential nonces.
     {
         BlockBuilder b = next_block(store, ts + 1);
         Transaction f = mk_tx(spender.addr, acc.addr, 1'000'000'000ull, 100, 0);
@@ -1201,21 +1205,22 @@ TEST(VxBoundaryTortureTest, PqKeySignsAtMostSixteenNonces) {
     }
     {
         BlockBuilder b = next_block(store, ts + 2);
-        for (uint32_t n = 0; n < 16; ++n) {
+        for (uint32_t n = 0; n < 15; ++n) {
             Transaction t = mk_tx(acc.addr, sink, 1'000'000ull, 100, n);
             ASSERT_TRUE(pq_sign(t, acc)) << "sign failed at " << n;
             ASSERT_TRUE(b.add_transaction(t));
         }
         const auto res = push_block(store, ledger, b);
         EXPECT_TRUE(res.ok) << res.error;
-        EXPECT_EQ(ledger.balance_of(acc.addr), U128(983'998'400ull));
-        EXPECT_EQ(ledger.get_next_nonce(acc.addr), 16u);
+        EXPECT_EQ(ledger.balance_of(acc.addr), U128(984'998'500ull));
+        EXPECT_EQ(ledger.get_next_nonce(acc.addr), 15u);
     }
-    // The 17th tx: the signer refuses the nonce BEFORE any key work.
+    // The 16th tx (nonce 15 = the reserved certificate leaf): the signer
+    // refuses BEFORE any key work -- ledger or no ledger.
     {
-        Transaction t17 = mk_tx(acc.addr, sink, 1'000'000ull, 100, 16);
-        EXPECT_FALSE(pq_sign(t17, acc));
-        // And the ledger itself would have accepted nonce 16 -- the state
+        Transaction t16 = mk_tx(acc.addr, sink, 1'000'000ull, 100, 15);
+        EXPECT_FALSE(pq_sign(t16, acc));
+        // And the ledger itself would have accepted nonce 15 -- the state
         // layer has no such limit; the engine cannot produce the witness.
     }
 

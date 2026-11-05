@@ -80,14 +80,14 @@ constexpr uint64_t kPogwBits = 8;
 
 constexpr uint64_t kBlocks = 1000;          // heights 1..1000 above genesis
 constexpr uint64_t kCheckpointEvery = 100;  // invariant sweep cadence
-// Signer capacity: pq_sign_transaction refuses nonce >= 16 (the XMSS subtree
-// guard — the published root spans exactly leaves 0..15), so EVERY account
-// can spend at most 16 times, ever. The pool is sized so its 16-leaf budget
-// covers the ~2,500 transfers of the build with margin; the demo spender is
-// capped at 8 build spends so phase 2e's funding block (6 spends) always
-// fits its remaining leaves.
+// Signer capacity: pq_sign_transaction refuses nonce >= 15 (leaf 15 is
+// RESERVED for rollover certificates — the kernel invariant), so EVERY
+// account can spend at most 15 times, ever. The pool is sized so its
+// 15-leaf budget covers the ~2,500 transfers of the build with margin; the
+// demo spender is capped at 8 build spends so phase 2e's funding block
+// (6 spends) always fits its remaining leaves.
 constexpr size_t kAccPoolSize = 240;        // pre-created PQA accounts
-constexpr uint64_t kLeafBudgetPerAccount = 16;
+constexpr uint64_t kLeafBudgetPerAccount = 15;
 constexpr uint64_t kDemoBuildSpendCap = 8;
 constexpr size_t kSinks = 8;                // never-spending receiver tags
 constexpr size_t kMiners = 8;               // MINER_ coinbase receivers
@@ -469,9 +469,10 @@ void build_blocks(ChainCtx& ctx, UndoEngine& undo, ChainRecord& rec,
             const uint32_t n_tx = static_cast<uint32_t>(rng.below(6));
             const uint64_t kEligible = kTdiDustAtoms112B + kMaxFee;
             for (uint32_t t = 0; t < n_tx; ++t) {
-                // Leaf-budget-aware eligibility: an account whose 16 XMSS
-                // leaves are spent can never sign again (the subtree guard
-                // refuses nonce >= 16), so it leaves the sender rotation.
+                // Leaf-budget-aware eligibility: an account whose 15 tx
+                // leaves are spent can never sign again (leaf 15 is the
+                // reserved cert leaf; the signer refuses nonce >= 15), so
+                // it leaves the sender rotation.
                 // The demo spender keeps 8 of its leaves for phase 2e.
                 bool demo_eligible =
                     rec.model.bal(demo.addr) >= U128(kEligible) &&

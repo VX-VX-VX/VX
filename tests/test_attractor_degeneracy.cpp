@@ -206,7 +206,10 @@ int main() {
 
     // ── 10. Algebraic degeneracy classes (v0.0.15, audit item I.2) ──────
     {
-        const auto moduli = vx::core::AttractorModuli::classic();
+        // v0.0.16: the production gate interrogates active_default()
+        // (secure_crt proven primes) — the same moduli run() derives with.
+        // The classic set is composite and no longer pins any surface.
+        const auto moduli = vx::core::AttractorModuli::secure_crt();
         const std::string f256(256, 'f');
 
         // Per-trunk zero: X half zero (string not all-zero -> passed the

@@ -8,7 +8,13 @@
 namespace vx::math {
 
 std::string VortexAttractor::canonicalSeedError(std::string_view seedHex) {
-    return canonicalSeedError(seedHex, core::AttractorModuli::classic());
+    // The gate MUST interrogate the same moduli the derivation will use:
+    // active_default() is secure_crt (proven primes). The historic classic()
+    // delegate interrogated COMPOSITE moduli (all three classic values are
+    // composite — verified 2026-11-05), so a seed could pass a congruence
+    // check against classic and still derive a degenerate trunk under the
+    // real prime moduli (surface/derivation mismatch, fixed in v0.0.16).
+    return canonicalSeedError(seedHex, core::AttractorModuli::active_default());
 }
 
 std::string VortexAttractor::canonicalSeedError(

@@ -1317,22 +1317,69 @@ outside this repo by design (build tools are not consensus code).
 
 ### 2.12 Orbit-length proof work for the trunk dynamics (fundamental Q1)
 
-- Status: NOT proven. The per-step X/Y trunk map is injective step-by-step
-  (XOR/rotl are injective as integer maps, x*7 and x+13 are bijective over
-  the prime moduli), so there is no per-step phase-space contraction on
-  X/Y. But a formal conservation theorem over F_P x F_Q x F_R does NOT
-  exist: the order of 7 mod P (which upper-bounds affine cycle lengths) is
-  unknown, and ACT I's Z_0 derivation is deliberately non-injective
-  (cubing is 3-to-1 since 3 | R-1, verified 2026-11-05).
-- Work items: (a) compute ord_P(7) and ord_Q(11), ord_Q(17), ord_Q(19),
-  ord_Q(23) exactly; (b) empirical orbit-length probes over random starts,
-  hunt for cycles below 2^64; (c) if any short cycle is found, the
-  derivation must be re-pinned; (d) document Pollard-rho O(sqrt|F|) as the
-  generic bound, not a guarantee.
+- Status: NOT proven. Owner-verified corrections (2026-11-05, late
+  evening) are folded in; the system is formally DISSIPATIVE, not
+  conservative.
+- Conservative-claim corrections:
+  - (a) The reference set matters. secure_crt() (the production set,
+    proven primes) has v2(P-1) = 2, v2(Q-1) = v2(R-1) = 3 — i.e. P-1 =
+    4 x odd for P, 8 x odd for Q and R. The classic() set has v2 = 1
+    everywhere. Any cycle-length work computes orders over the ODD part
+    of the relevant (M-1)/2^k.
+  - (b) The step state is a raw 1024-bit vector; XOR/rotl/add keep it
+    there bijectively. The dissipation seam is the mod-M REDUCTION
+    inside each step's cube (pow3_mod): values in the tail
+    [M, 2^1024) fold back into [0, D-1), D = 2^1024 - M (~2^64 wide),
+    colliding with resident values - a weakly-contracting 2-to-1 seam
+    with per-step probability ~2^-960. No strict phase-volume
+    conservation theorem is possible; Pollard-rho O(sqrt|space|)
+    remains the generic bound.
+  - (c) SUPERSEDED, honest correction: the release-note spelling
+    (x^Phi_lock)*7+13 reads like a power map, but ^ in the code is
+    bitwise XOR (one AST, one language). There is NO exponent in the
+    step or the lock - only ACT I's Z_0 cubing. XOR with Phi_lock is a
+    bijection on Z_2^1024; the gcd(PHI, M-1) numbers are therefore
+    irrelevant to the dynamics. The real dissipation is the mod-M
+    REDUCTION seam, and the owner's constructive collision on it is
+    CONFIRMED (see (e)).
+  - (d) The classic() moduli set is COMPOSITE (all three, verified
+    with a strong probable-prime test, 2026-11-05). Production
+    derivation (run(), genesis, PoGW) uses secure_crt and was never
+    affected; the v0.0.16 release moved the seed gate off classic()
+    onto active_default() so the validation surface interrogates the
+    same moduli as the derivation (surface/derivation mismatch fixed).
+  - (e) P0-CANDIDATE (confirmed by verification, not fixed yet):
+    CONSTRUCTIVE COLLISION at every mod-M reduction seam. For any
+    u in [M, 2^1024) with x1 = u ^ Phi_lock < M and
+    x2 = (u - M) ^ Phi_lock < M (both canonical, distinct - holds for
+    every Phi_lock variant sampled, 10/10), the lock computes
+    (x1 ^ Phi_lock)*7+13 == (x2 ^ Phi_lock)*7+13 (mod M): exactly
+    D = 2^1024 - M pairs glue per call. The same seam exists INSIDE
+    every step through pow3_mod's mod-M reduction of the full-range
+    arx inputs (the step itself never reduces mod M after XOR/rotl;
+    states live bijectively in Z_2^1024 until the cube). Practical
+    severity is LOW today - steering the attractor to a chosen state
+    pair requires inverting 1000 rounds (preimage-hard), and sponge
+    preimage resistance keeps mining unexploitable - but the
+    "derivation is injective" claim is formally DEAD: the derivation
+    is many-to-one at every reduction seam (~2^-960 per step).
+    Fix candidate (owner): Conditional Involution Guard -
+    candidate = x ^ Phi_lock; mixed = (candidate < M) ? candidate : x;
+    next = (mixed*7+13) % M - a cmov bijection, plus the same
+    canonicalization inside pow3_mod. Migration discipline applies
+    (BACKLOG 2.9): the derivation is frozen, the guard changes outputs
+    only on the ~2^-960 tail, genesis vectors must be re-pinned
+    byte-identical before any adoption. Decision + tests = next
+    session; do not rush the fix.
+- Work items: (a) compute ord_P(7) and the affine-coefficient orders
+  over the odd part of each (M-1); (b) empirical orbit-length probes
+  over random starts, hunt for cycles below 2^64; (c) if any short
+  cycle is found, the derivation must be re-pinned; (d) document
+  Pollard-rho O(sqrt|F|) as the generic bound, not a guarantee.
 - Mining impact: PoGW search enumerates seeds (sponge), not step-map
-  iterations; a short step cycle would collapse address diversity rather
-  than enable free blocks. 100/100 distinct top-384 projections measured
-  (fold probe, this session).
+  iterations; sponge preimage resistance keeps short attractor cycles
+  unexploitable for block difficulty. 100/100 distinct top-384
+  projections measured (fold probe, this session).
 
 ### 2.13 Gas model design note (fundamental Q2)
 
@@ -1348,11 +1395,12 @@ outside this repo by design (build tools are not consensus code).
 
 ### 2.14 ZK aggregation path decision (fundamental Q3)
 
-- Verified 2026-11-05: v2(P-1) = v2(Q-1) = v2(R-1) = 1 (owner's copied
-  constants differed slightly; the conclusion is stronger than stated).
-  No NTT subgroup beyond order 2 exists in any of the three fields:
-  classic multiplicative-subgroup STARK/FRI is algebraically dead on
-  them, naively O(N^2).
+- Verified 2026-11-05 against the production secure_crt() set:
+  v2(P-1) = 2, v2(Q-1) = v2(R-1) = 3. No NTT subgroup beyond order 8
+  exists in any of the three fields: classic multiplicative-subgroup
+  STARK/FRI is algebraically dead on them, naively O(N^2). (The
+  classic() set has v2 = 1 everywhere but is composite - see 2.12(d);
+  it is not a design target.)
 - Decision point for any future witness/state aggregation (ties into
   2.11): prefer (a) Circle-STARK-style construction over these same
   low-2-adicity fields (that regime is exactly what Circle STARKs were
