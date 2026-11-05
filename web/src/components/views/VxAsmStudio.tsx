@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback } from 'react'
 import { Code2, Play, ChevronRight, ChevronLeft, RotateCcw, Zap, Thermometer, Cpu } from 'lucide-react'
+import { useToken } from '../../contexts/TokenContext'
 
 // ── Wire types mirroring /api/vm/execute_trace and /api/vm/htlc_swap ────────
 
@@ -109,6 +110,7 @@ function popcount(bigVal: number): number {
 }
 
 export default function VxAsmStudio() {
+  const { vxFetch } = useToken()
   const [source, setSource] = useState(TEMPLATES.htlc.source)
   const [result, setResult] = useState<ExecuteTraceResult | null>(null)
   const [pc, setPc] = useState(0) // current trace cursor
@@ -127,7 +129,7 @@ export default function VxAsmStudio() {
     setBusy(true)
     setHtlc(null)
     try {
-      const res = await fetch('/api/vm/execute_trace', {
+      const res = await vxFetch('/api/vm/execute_trace', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ asm: source, max_steps: 1000 }),
@@ -145,7 +147,7 @@ export default function VxAsmStudio() {
   const runHtlcSwap = useCallback(async () => {
     setBusy(true)
     try {
-      const res = await fetch('/api/vm/htlc_swap', {
+      const res = await vxFetch('/api/vm/htlc_swap', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode: 'claim', preimage: 777, height: 99 }),

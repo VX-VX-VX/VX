@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { RefreshCw, Check, X, Shield } from 'lucide-react'
+import { useToken } from '../../contexts/TokenContext'
 
 interface KeyTier {
   tier_index: number
@@ -46,6 +47,7 @@ interface PoLResult {
 }
 
 export default function ZKMatrixPanel() {
+  const { vxFetch } = useToken()
   const [deriveResult, setDeriveResult] = useState<ZKDeriveResult | null>(null)
   const [shamirResult, setShamirResult] = useState<ShamirResult | null>(null)
   const [polResult, setPolResult] = useState<PoLResult | null>(null)
@@ -57,7 +59,7 @@ export default function ZKMatrixPanel() {
     try {
       const body: any = {}
       if (seedInput) body.seed_hex = seedInput
-      const res = await fetch('/api/zk/derive_matrix', {
+      const res = await vxFetch('/api/zk/derive_matrix', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -73,7 +75,7 @@ export default function ZKMatrixPanel() {
     try {
       const shards: number[] = []
       selectedShards.forEach(i => shards.push(i))
-      const res = await fetch('/api/zk/recover_shamir', {
+      const res = await vxFetch('/api/zk/recover_shamir', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ shards }),
@@ -87,7 +89,7 @@ export default function ZKMatrixPanel() {
 
   const generatePoL = async () => {
     try {
-      const res = await fetch('/api/zk/proof_of_life', {
+      const res = await vxFetch('/api/zk/proof_of_life', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}',

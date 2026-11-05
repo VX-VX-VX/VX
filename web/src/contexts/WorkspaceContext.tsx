@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode } from 'react'
 import { useRpcHost } from './RpcHostContext'
+import { useToken } from './TokenContext'
 
 export interface StatusResponse {
   chain_height: number
@@ -107,6 +108,7 @@ const SSE_EVENTS = ['block_sealed', 'mempool_updated', 'miner_tick', 'security_v
 
 export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const { resolveUrl } = useRpcHost()
+  const { authHeaders, setAuthRequired } = useToken()
 
   const [status, setStatus] = useState<StatusResponse | null>(null)
   const [blocks, setBlocks] = useState<Block[]>([])
@@ -195,13 +197,24 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
     const promise = (async () => {
       try {
         const init: RequestInit = {
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            ...authHeaders(), // Bearer token for gated endpoints (never logged)
+            ...(options?.headers as Record<string, string> | undefined)
+          },
           ...options
         }
         const res = (await bridgeFetch(url, init)) ?? await fetch(url, init)
 
         const elapsed = performance.now() - start
         if (!res.ok) {
+          // A 401 means the node runs token-gated and this console is
+          // unauthenticated (or the token is stale) — surface the prompt.
+          if (res.status === 401) {
+            setAuthRequired(true)
+            addRpcLog(`${method} ${endpoint} -> 401 (RPC token required)`)
+          }
           const err = await res.json().catch(() => ({ error: res.statusText }))
           throw new Error(err.error || `HTTP ${res.status}`)
         }
@@ -225,7 +238,7 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
     }
 
     return promise
-  }, [addRpcLog, resolveUrl, bridgeFetch])
+  }, [addRpcLog, resolveUrl, bridgeFetch, authHeaders, setAuthRequired])
 
   const fetchStatus = useCallback(async () => {
     try {

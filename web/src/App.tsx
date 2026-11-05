@@ -1,4 +1,5 @@
 import { ThemeProvider, useTheme } from './contexts/ThemeContext'
+import { TokenProvider } from './contexts/TokenContext'
 import { WorkspaceProvider } from './contexts/WorkspaceContext'
 import { RpcHostProvider } from './contexts/RpcHostContext'
 import KernelRibbon from './components/layout/KernelRibbon'
@@ -57,11 +58,13 @@ function AppContent() {
 export default function App() {
   return (
     <ThemeProvider>
-      <RpcHostProvider>
-        <WorkspaceProvider>
-          <AppContent />
-        </WorkspaceProvider>
-      </RpcHostProvider>
+      <TokenProvider>
+        <RpcHostProvider>
+          <WorkspaceProvider>
+            <AppContent />
+          </WorkspaceProvider>
+        </RpcHostProvider>
+      </TokenProvider>
     </ThemeProvider>
   )
 }

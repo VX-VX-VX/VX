@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Shield, Flame, Lock, Eye, EyeOff, Cpu, Key, AlertTriangle } from 'lucide-react'
 import { useWorkspace } from '../../contexts/WorkspaceContext'
+import { useToken } from '../../contexts/TokenContext'
 
 interface VaultMemoryStats {
   ok: boolean
@@ -27,6 +28,7 @@ interface VaultActionResult {
 }
 
 export default function VaultPanel() {
+  const { vxFetch } = useToken()
   const { } = useWorkspace()
   const [stats, setStats] = useState<VaultMemoryStats | null>(null)
   const [actionResult, setActionResult] = useState<VaultActionResult | null>(null)
@@ -35,7 +37,7 @@ export default function VaultPanel() {
 
   const fetchStats = async () => {
     try {
-      const res = await fetch('/api/vault/memory')
+      const res = await vxFetch('/api/vault/memory')
       const data = await res.json()
       setStats(data)
     } catch (e) {
@@ -55,7 +57,7 @@ export default function VaultPanel() {
       if (action === 'commit' && payload) {
         body.payload = payload
       }
-      const res = await fetch('/api/vault/action', {
+      const res = await vxFetch('/api/vault/action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),

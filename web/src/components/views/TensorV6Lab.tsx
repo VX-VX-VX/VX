@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Activity, Zap, Cpu, TrendingUp, Dices } from 'lucide-react'
+import { useToken } from '../../contexts/TokenContext'
 
 // ── Wire types mirroring /api/neural/simulate and /api/crypto/canonical ─────
 
@@ -56,6 +57,7 @@ const hex64 = (h: string): bigint => {
 }
 
 export default function TensorV6Lab() {
+  const { vxFetch } = useToken()
   const [sim, setSim] = useState<NeuralSimResult | null>(null)
   const [profiles, setProfiles] = useState<CanonicalProfile[]>([])
   const [histVectors, setHistVectors] = useState<string[]>([])
@@ -64,7 +66,7 @@ export default function TensorV6Lab() {
   const run = useCallback(async (iteration: number) => {
     setBusy(true)
     try {
-      const res = await fetch('/api/neural/simulate', {
+      const res = await vxFetch('/api/neural/simulate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ iteration, steps: 1024 }),
@@ -79,7 +81,7 @@ export default function TensorV6Lab() {
 
   useEffect(() => {
     run(1)
-    fetch('/api/crypto/canonical')
+    vxFetch('/api/crypto/canonical')
       .then(r => r.json())
       .then((d: CanonicalResponse) => {
         setProfiles(Array.isArray(d.profiles) ? d.profiles : [])

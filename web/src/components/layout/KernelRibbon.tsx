@@ -1,8 +1,9 @@
 import { useWorkspace } from '../../contexts/WorkspaceContext'
 import { THEME_CONFIG_EXPORT } from '../../contexts/ThemeContext'
-import { Zap, Server, Settings, Globe, ChevronDown } from 'lucide-react'
+import { Zap, Server, Settings, Globe, ChevronDown, Lock, Unlock } from 'lucide-react'
 import type { Theme } from '../../contexts/ThemeContext'
 import { useRpcHost } from '../../contexts/RpcHostContext'
+import { useToken } from '../../contexts/TokenContext'
 
 function formatSupply(atomics: string): string {
   const n = BigInt(atomics)
@@ -20,6 +21,7 @@ export default function KernelRibbon({ onToggleThemeDrawer, activeTheme, onTheme
 }) {
   const { status, connectionStatus } = useWorkspace()
   const { rpcHost, presets, selectHost, isCustomOpen, toggleCustom } = useRpcHost()
+  const { hasToken, authRequired } = useToken()
 
   return (
     <header className="h-16 px-4 border-b border-[var(--border-subtle)] bg-[var(--bg-panel)]/90 backdrop-blur-xl flex items-center justify-between z-50 sticky top-0">
@@ -29,7 +31,12 @@ export default function KernelRibbon({ onToggleThemeDrawer, activeTheme, onTheme
             <Zap className="w-5 h-5 text-[var(--accent-primary)]" />
           </div>
           <div>
-            <div className="font-mono text-xs tabular-nums text-[var(--accent-primary)]">
+            <div className="font-mono text-xs tabular-nums text-[var(--accent-primary)] flex items-center gap-1.5">
+              {hasToken ? (
+                <span title="RPC token active"><Lock className="w-3 h-3" /></span>
+              ) : authRequired ? (
+                <span title="Node returned 401 — set the RPC token (UI Studio)"><Unlock className="w-3 h-3 text-amber-400 animate-pulse" /></span>
+              ) : null}
               ONLINE // POSIX SOCKET :{rpcHost.port || 8080} // MMAP ZERO-COPY
             </div>
             <div className="font-mono text-[10px] text-[var(--text-muted)]">

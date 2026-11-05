@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect } from 'react'
 import { Radar, Split, Magnet, TreePine, Cpu, ShieldCheck } from 'lucide-react'
+import { useToken } from '../../contexts/TokenContext'
 
 // ── Wire types ───────────────────────────────────────────────────────────────
 
@@ -149,6 +150,7 @@ interface PqVerifyReport {
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function WarRoomDeck() {
+  const { vxFetch } = useToken()
   const [split, setSplit] = useState<SplitReorgReport | null>(null)
   const [cocoon, setCocoon] = useState<DandelionReport | null>(null)
   const [gqc, setGqc] = useState<GqcReport | null>(null)
@@ -168,7 +170,7 @@ export default function WarRoomDeck() {
   const call = useCallback(async <T,>(url: string, method: 'GET' | 'POST', body?: object, tag?: string): Promise<T | null> => {
     setBusy(tag ?? url)
     try {
-      const res = await fetch(url, {
+      const res = await vxFetch(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
         body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
@@ -180,7 +182,7 @@ export default function WarRoomDeck() {
     } finally {
       setBusy(null)
     }
-  }, [])
+  }, [vxFetch])
 
   // Bare-metal telemetry refreshes live on mount.
   useEffect(() => {

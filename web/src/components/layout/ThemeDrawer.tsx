@@ -1,5 +1,8 @@
+import { useState } from 'react'
 import { useTheme } from '../../contexts/ThemeContext'
-import { X } from 'lucide-react'
+import { useToken } from '../../contexts/TokenContext'
+import { useRpcHost } from '../../contexts/RpcHostContext'
+import { X, KeyRound, Lock, Unlock, AlertTriangle } from 'lucide-react'
 
 export default function ThemeDrawer() {
   const {
@@ -7,6 +10,20 @@ export default function ThemeDrawer() {
     glow, setGlow, density, setDensity, cornerRadius, setCornerRadius,
     bgGrid, setBgGrid, scanlines, setScanlines, hashDisplay, setHashDisplay
   } = useTheme()
+  const { hasToken, setToken, clearToken, authRequired } = useToken()
+  const { rpcHost } = useRpcHost()
+  const [draft, setDraft] = useState('')
+
+  // Warn loudly if the token would leave the machine: a custom non-localhost
+  // host means the Bearer header rides to a remote server.
+  const remoteHost = (() => {
+    if (rpcHost.id === 'localhost') return false
+    if (rpcHost.id === 'proxy') return false // same-origin
+    try {
+      const u = new URL(rpcHost.url)
+      return !['localhost', '127.0.0.1', '[::1]'].includes(u.hostname) && !u.hostname.startsWith('192.168.') && !u.hostname.startsWith('10.')
+    } catch { return true } // unparsable custom URL: treat as remote
+  })()
 
   if (!showThemeDrawer) return null
 
@@ -189,6 +206,56 @@ export default function ThemeDrawer() {
                 }`}
               />
             </button>
+          </div>
+
+          {/* RPC access token (v0.0.7): mutating endpoints answer 401 without it */}
+          <div className="border border-[var(--border-subtle)] rounded p-3 space-y-2">
+            <h3 className="font-mono text-[10px] text-[var(--text-muted)] flex items-center gap-1.5">
+              {hasToken ? <Lock className="w-3 h-3 text-[var(--accent-primary)]" /> : <Unlock className="w-3 h-3" />}
+              RPC ACCESS TOKEN
+            </h3>
+            <p className="font-mono text-[9px] leading-relaxed text-[var(--text-muted)]">
+              {hasToken
+                ? 'TOKEN ACTIVE — attached as Authorization: Bearer to every /api call. Stored in this browser only, never logged.'
+                : 'Node runs with VX_RPC_TOKEN: mutating endpoints (transfer, mempool, vault, zk) answer 401 without the token.'}
+            </p>
+            {authRequired && !hasToken && (
+              <div className="flex items-start gap-1.5 text-[10px] font-mono text-amber-400">
+                <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                <span>NODE RESPONDED 401 — set the token below to unlock mutating endpoints.</span>
+              </div>
+            )}
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={draft}
+                onChange={e => setDraft(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && draft.trim()) { setToken(draft); setDraft('') } }}
+                placeholder={hasToken ? '•••••••••• (set) — paste to replace' : 'paste node token (VX_RPC_TOKEN)'}
+                className="flex-1 font-mono text-[10px] bg-[var(--bg-elevated)] border border-[var(--border-subtle)] rounded px-2 py-1.5 outline-none focus:border-[var(--accent-primary)]/60"
+                autoComplete="off"
+              />
+              <button
+                onClick={() => { if (draft.trim()) { setToken(draft); setDraft('') } }}
+                disabled={!draft.trim()}
+                className="btn-ghost px-2 py-1 text-[10px] font-mono disabled:opacity-40 flex items-center gap-1"
+              >
+                <KeyRound className="w-3 h-3" /> SET
+              </button>
+              <button
+                onClick={() => { clearToken(); setDraft('') }}
+                disabled={!hasToken}
+                className="btn-ghost px-2 py-1 text-[10px] font-mono disabled:opacity-40"
+              >
+                CLEAR
+              </button>
+            </div>
+            {hasToken && remoteHost && (
+              <div className="flex items-start gap-1.5 text-[10px] font-mono text-amber-400">
+                <AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                <span>REMOTE RPC HOST — the token is sent to {rpcHost.url}. Verify you trust this endpoint.</span>
+              </div>
+            )}
           </div>
         </div>
       </div>
