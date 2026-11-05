@@ -1470,3 +1470,44 @@ outside this repo by design (build tools are not consensus code).
   note: auth-path sibling hashes are still recomputed per signature,
   but they are cheap node hashes, not chains. Invalidate on any
   rollover window change; memory-only, never persisted.
+
+## Owner priority table for the next release (audit of v0.0.16, 2026-11-05 late)
+
+Verdict: positive on the architecture changes; praise for freezing the
+derivation instead of rushing the Guard ("the cost of an error in key
+material generation logic far exceeds the productivity loss"). Do NOT
+rush v0.0.17 - first XMSS state safety and CRT collision analysis.
+"31/31 tests is proof of passing 31 test suites, not proof of the
+system's cryptographic security."
+
+- P0 CRT-derivation collisions: formal analysis - collision condition,
+  minimal counterexample, the Guard's exact domain, proof the Guard
+  changes nothing outside its domain, impact on every canonical seed,
+  cross-platform determinism. The 2^-960 tail must be confirmed
+  MATHEMATICALLY, not statistically. (Ties into 2.12(e).)
+- P0 XMSS leaf uniqueness: crash/concurrency tests - (1) crash after
+  reserve+fsync before signing; (2) after signing before persisting;
+  (3) two parallel RPC calls racing one leaf; rollback must NEVER
+  return a reserved leaf to the pool.
+- P1 thread-local leaf cache: master_sk must NOT be part of the cache
+  key (a secret in a cache key contradicts the MemoryVault threat
+  model) - use an opaque generation identifier + pub_seed + window
+  instead; explicit invalidation on rollover; verify object-address
+  reuse cannot alias a slot; the cache must never serve a stale digest
+  as success.
+- P1 seed validation: a single secure set - prime certification with a
+  documented error probability; no path may mix classic validation /
+  secure derivation / a third set; classic is a test fixture only.
+- P1 genesis migration: byte-identical vectors via a dedicated
+  migration protocol - pin the old canonical vectors, generate new ones
+  under the Guard, compare all 3072 bits plus every derived address,
+  version the derivation algorithm, forbid silent switching, define
+  old/new node compatibility.
+- P2 XMSS benchmark: reproducible measurements with full precision
+  (the owner's arithmetic: 8.5/0.3 is ~28.3x, not 30.6x - publish exact
+  figures or rounded-quotient honesty).
+- Documentation drift: the README on main still describes Landauer-based
+  gas, an old test count and the old Vault model - sync
+  README/BACKLOG/release notes.
+- Note: the owner could not independently confirm the v0.0.16-alpha tag
+  contents; future reports must cite tag + commit hash + zip together.
