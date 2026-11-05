@@ -255,3 +255,9 @@ independent and must not be merged:
   Section 4.2).
 - A wire-format decision on machine binding (would make Section 5's
   migration transaction normative rather than preparatory).
+
+The structural claims above are anchored by
+`tests/test_fold_window.cpp` (ctest target `VortexFoldWindowTest`):
+it pins the 48-byte window (unsampled bits leave the digest unchanged),
+the exact two-byte movement of every sampled-byte flip on all three
+trunks, and the fold → base64url → `NFA_V6_` round-trip.
