@@ -584,6 +584,24 @@ Also P3, cosmetic: the Electron SSE relay decodes each network chunk as
 UTF-8 independently, so a multi-byte character split across chunk
 boundaries would garble one frame (all current payloads are ASCII JSON).
 
+Blocking-socket audit (owner package 2026-11-05, item I.4 — DELIVERED
+v0.0.14): the feared permanent wedge was already impossible for the
+steady state (SSE fds went O_NONBLOCK, sends ran outside sse_mutex_),
+but a REAL race remained: the fd was pushed into sse_clients_ BEFORE
+O_NONBLOCK was set, so a block sealed in that window made the miner
+thread issue send() on a still-BLOCKING socket — a zero-window client
+there could wedge the node. Fixed: O_NONBLOCK is set before the fd
+becomes visible; all SSE sends now carry MSG_DONTWAIT|MSG_NOSIGNAL
+(belt and suspenders — a single send can never block regardless of fd
+flags); EAGAIN/short-write drops the subscriber from the push list
+(Drop Slow Consumer — its own connection thread keeps fd ownership and
+detects the disconnect; no cross-thread close, so no fd-reuse race).
+Residual: a zero-window E2E torture test (client that never reads
+while >1 MiB of events accumulate) is not practical against 100-byte
+seal events at demo rates — the kernel-guaranteed DONTWAIT semantics
+and the drop path are verified by construction + live smoke test
+(hello frame flows, node serves).
+
 ### 0.16 GQC sidecar v2 (delivered 2026-11-04) — residual hardening
 
 The v2 record (52 B, CRC32C over height+aggregate) closes the
@@ -835,6 +853,25 @@ Remaining (honest gaps, not hidden):
   but the raw primitive trusts its caller; a fail-closed clamp belongs
   to the same consensus-wiring pass.
 
+### 1.7 WOTS+ w=256 profile (owner pattern II.5, 2026-11-05)
+
+Halve the witness wire cost by lifting the Winternitz parameter into a
+signed-scheme profile: w=16 gives L=67 chains (2144 B of signature);
+w=256 (1 byte per step instead of a nibble) gives 34 chains
+(32 digest bytes + 2 checksum bytes) — 1088 B, exactly half the VX60
+traffic and sidecar storage, SAME 256-bit classical / 128-bit Grover
+posture, at ~120 µs extra per sign/verify (16x-longer chains).
+
+- [ ] Design: parameterize the scheme (chain length, checksum width,
+  domain-separation tags) WITHOUT touching the frozen w=16 derivation;
+  a w=256 witness must be a different, self-identifying profile —
+  cross-profile witnesses never verify against the wrong profile.
+- [ ] This is a wire-format addition → new format tag per the standing
+  freeze rule; the w=16 profile stays mandatory-verifiable forever
+  (existing chain history).
+- [ ] Re-test: leaf-ledger discipline, rollover certificates and the
+  SegPQ anchor under the new profile.
+
 ---
 
 ### 1.4 MemoryVault hardening round 2
@@ -844,6 +881,17 @@ Remaining (honest gaps, not hidden):
 - [ ] Guard pages around locked regions; verify mlock failure semantics
   on hosts with low `rlimit_memlock` (document the fallback loudly).
 - Acceptance: TSan clean in CI; fallback path tested with a low rlimit.
+- [ ] Owner pattern (2026-11-05, II.1) — vault_mutex_ decomposition:
+  today one global mutex spans the whole ephemeral-sign cycle
+  (claim → SK → WOTS+ sign → burn ≈ 17k sponge calls + clflush), so
+  every concurrent RPC vault call queues behind one signer's
+  cryptography. Split it: an atomic page-state claim
+  (VOID→CLAIMED, compare_exchange) is the only globally-serialized
+  step (~20 ns); heavy key expansion / signing / zeroize / clflush run
+  lock-free on the claimed page; the final BURNED transition publishes
+  with memory_order_release. Pages are physically disjoint, so page i's
+  work never contends with page j. Regression guard: the v0.0.11
+  concurrency stress test must stay green through the split.
 
 ### 1.6 RPC shared-state audit (delivered 2026-11-05, v0.0.11) — residual: TSan
 
@@ -943,7 +991,14 @@ with an active reorg. Honest gap, raised by the owner's review question.
   back the arena bytes of the burned page and assert all-zero (guards
   against a future refactor reintroducing an elidable wipe). Respect
   the vault's read-after-burn policy — do it inside the vault's own
-  test seam, not through the public API.
+  test seam, not through the public API. Owner-supplied pattern
+  (2026-11-05, II.3), guarded by VX_TEST_SEAM:
+  `bool MemoryVault::debug_verify_page_zeroed(size_t page_idx) const
+  noexcept` — walk `const volatile uint8_t*` over the page accumulating
+  `acc |= raw[i]`, then a register barrier `asm volatile("" : "+r"(acc)
+  :: "memory")` so the compiler cannot elide the reads; return
+  `acc == 0`. The volatile accumulate + register barrier forces a
+  physical re-read of all page bytes from RAM after _mm_clflush.
 - [ ] MSan lane (Clang MemorySanitizer) is NOT configured — honest gap;
   it requires an MSan-instrumented libc++. Low priority vs the
   ASan/UBSan+fuzz stack, tracked so it is not forgotten.
@@ -1005,6 +1060,17 @@ rewrites the file after a rollback but never shrinks history), and
 - [ ] The block store itself stays append-only this phase — pruning
   blocks would break backfill sync (0.1) and is a separate SPV-mode
   decision.
+- [ ] Phase 0 (owner pattern II.4, 2026-11-05) — WAL phase marker to
+  close the crash-during-apply window WITHOUT abandoning zero-copy
+  mmap: a 64-bit journal_state in the ledger metadata
+  (IDLE=0 / APPLYING_HEIGHT_N / ROLLING_BACK_N) with the write order
+  (1) undo record + CRC32C + fdatasync, (2) journal_state =
+  APPLYING_HEIGHT_N + msync(MS_SYNC), (3) mutate LedgerState + store
+  block, (4) journal_state = IDLE + msync(MS_SYNC). On startup,
+  journal_state != IDLE proves the previous process died mid-apply →
+  auto-roll-back to the last valid undo record (O(1) recovery instead
+  of a full replay scan). CRC32C on undo records is the companion
+  integrity check.
 
 ### 2.7 Landauer gas: temperature is abstract (owner question, 2026-11-05)
 
@@ -1019,6 +1085,72 @@ overwriting — the physical heart of Landauer's principle). Remaining
 work is documentation only: a whitepaper paragraph stating that T is
 folded into the scale constant and that any joule mapping is a
 doc-level convention, never consensus state.
+
+### 2.9 xorFold truncation window (owner audit item I.1, 2026-11-05)
+
+FACT: xorFold reads only the top 128 bits of each trunk (48 of 384
+bytes; 87.5% of the final attractor state never reaches the address
+digest). The pinned fold-window test froze this as current behavior;
+the owner's audit sharpens WHY it matters: carries propagate from low
+to high bits in the modular arithmetic, so a perturbation settling in
+the low 896 bits of a trunk late in the orbit may never cascade into
+the folded top bits — a potential structural collision class at the
+fold boundary.
+
+- [ ] Orbit-segment experiment: measure, over many pseudorandom seeds,
+  how many final iterations it takes for a single low-bit flip to
+  reach the top 128 bits; if the cascade does not saturate within the
+  iteration budget, the collision window is real, not theoretical.
+- [ ] Remedy (owner's proposal, adopted as the design direction):
+  absorb ALL 384 final trunk bytes through VortexSponge256 BEFORE the
+  fold, replacing the linear xorFold — then every one of the 3072
+  state bits reaches the digest under the sponge's avalanche criterion
+  (SAC). THIS IS A DIGEST-DEFINITION CHANGE: addresses change, so it
+  requires a versioned migration (new address tag + dual-verify
+  window), never a silent swap — same discipline as the frozen sponge
+  digest.
+- Related: 2.3 (formal collision analysis) and 0.15 (sponge
+  integration).
+
+### 2.10 Degenerate subgroup extension of the seed hunt (owner audit item I.2, 2026-11-05)
+
+v0.0.10/v0.0.12 refused whole classes at the surface (zero seed, 0X
+prefix, >512 hex, non-hex). The audit names three deeper degenerate
+classes INSIDE the modular arithmetic that the hunt does not yet cover:
+
+- [ ] Congruent zero: a seed that parses to a 1024-bit word equal to P,
+  Q or R (non-zero as a string, collapses to 0 after mod). Extend
+  canonicalSeedError or the hunt suite to detect seeds congruent to
+  0 mod each attractor modulus.
+- [ ] Fixed points 1 and P-1/Q-1/R-1: multiplicative short cycles
+  (length 1-2) in power/multiplicative maps. Pin whether the attractor
+  map actually contains such cycles and whether they are reachable
+  from a seed.
+- [ ] Trunk diagonal symmetry: seeds whose 1024-bit blocks are equal
+  (X0 = Y0 = Z0), killing inter-trunk diffusion in early rounds.
+  Quantify the address-quality impact; decide whether to refuse or
+  pin.
+- Acceptance: each class either measured-harmless (pinned in
+  test_attractor_degeneracy with the evidence) or fail-closed at the
+  surface.
+
+### 2.11 VX60 witness delivery: witness_merkle_root + orphan-witness defense (owner audit item I.5, 2026-11-05)
+
+FACT: the block frame is fixed at 65536 B, a transaction is 112 B, a
+detached WOTS+/XMSS witness is 2376 B — 30 witnesses (71280 B) exceed
+the block itself, so witnesses necessarily travel out-of-band today.
+
+- [ ] Audit apply_remote_frame: what happens when a block arrives whose
+  PQ-backed senders' witnesses have NOT arrived (or arrive late)?
+  Is the block admitted, rejected, or parked pending witnesses?
+- [ ] Add a witness_merkle_root to the block header (a wire/tag change
+  — needs a versioned format bump, never a silent swap) so a node can
+  demand the exact witness set the proposer committed to; a peer that
+  withholds witnesses (Omission/Orphan Witness attack) becomes
+  attributable instead of merely annoying.
+- [ ] Define the witness-retention window: how long a node must serve
+  witnesses for blocks it proposes, and the ban/score for a peer that
+  repeatedly proposes blocks whose witnesses never arrive.
 
 ### 2.8 Seed canonicalization: fail-closed format at the CLI/RPC surface (degeneracy hunt, 2026-11-05 — first findings fixed in v0.0.10)
 

@@ -390,28 +390,57 @@ void HttpServer::send_response(int client_fd, const HttpResponse& res) {
     ::send(client_fd, out.data(), out.size(), 0);
 }
 
-void HttpServer::send_sse_data(int client_fd, const std::string& event,
+bool HttpServer::send_sse_data(int client_fd, const std::string& event,
                                const std::string& data) {
     std::string message;
     if (!event.empty()) message += "event: " + event + "\n";
     message += "data: " + data + "\n\n";
-    ::send(client_fd, message.data(), message.size(), MSG_NOSIGNAL);
+    // MSG_DONTWAIT: even if the fd somehow stayed blocking, this single send
+    // can never wedge the caller; MSG_NOSIGNAL: no SIGPIPE on a dead peer.
+    // Returns false on EAGAIN/EWOULDBLOCK — the Drop Slow Consumer signal.
+    const ssize_t n = ::send(client_fd, message.data(), message.size(),
+                             MSG_NOSIGNAL | MSG_DONTWAIT);
+    return n == static_cast<ssize_t>(message.size());
 }
 
 void HttpServer::broadcast_sse_event(const std::string& event,
                                      const std::string& data) {
     // Snapshot the fd list under the mutex; sends happen outside the lock
-    // (non-blocking sockets + MSG_NOSIGNAL, so a slow or dead client cannot
-    // wedge the caller — the miner's sealing thread holds seal_mutex_).
+    // (non-blocking sockets + MSG_DONTWAIT|MSG_NOSIGNAL, so a slow or dead
+    // client cannot wedge the caller — the miner's sealing thread holds
+    // seal_mutex_).
     std::vector<int> targets;
     {
         std::lock_guard<std::mutex> lock(sse_mutex_);
         targets = sse_clients_;
     }
-    for (int fd : targets) send_sse_data(fd, event, data);
+    // Drop Slow Consumer Policy (audit 2026-11-05, item II.2): a client that
+    // stopped draining its TCP buffer gets EAGAIN and is REMOVED from the
+    // push list — never closed here (its own connection thread owns the fd
+    // and detects the disconnect in its poll loop; a close from this thread
+    // would race the poll loop's close on a reused fd). EventSource
+    // reconnects cleanly; consensus and the miner never wait on a client.
+    std::vector<int> dropped;
+    for (int fd : targets) {
+        if (!send_sse_data(fd, event, data)) dropped.push_back(fd);
+    }
+    if (!dropped.empty()) {
+        std::lock_guard<std::mutex> lock(sse_mutex_);
+        for (int fd : dropped) {
+            const auto it = std::find(sse_clients_.begin(), sse_clients_.end(), fd);
+            if (it != sse_clients_.end()) sse_clients_.erase(it);
+        }
+    }
 }
 
 void HttpServer::handle_sse_client(int client_fd) {
+    // Audit 2026-11-05 (P1 race fix): the socket MUST be non-blocking BEFORE
+    // this fd becomes visible in sse_clients_. Previously the push happened
+    // here and O_NONBLOCK was set only below — a block sealed in between
+    // made the miner thread issue a send() on a still-BLOCKING socket, where
+    // a zero-window client would wedge the entire node.
+    const int fl = ::fcntl(client_fd, F_GETFL, 0);
+    if (fl >= 0) ::fcntl(client_fd, F_SETFL, fl | O_NONBLOCK);
     // v0.0.8: the endpoint was raw SSE frames with NO HTTP response headers
     // — no HTTP client (browser EventSource, curl, undici) can parse a
     // response that never declares itself; every consumer fell back to
@@ -424,7 +453,7 @@ void HttpServer::handle_sse_client(int client_fd) {
             "Connection: keep-alive\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n";
-        ::send(client_fd, head, sizeof(head) - 1, MSG_NOSIGNAL);
+        ::send(client_fd, head, sizeof(head) - 1, MSG_NOSIGNAL | MSG_DONTWAIT);
     }
 
     // Add client to SSE list
@@ -441,8 +470,7 @@ void HttpServer::handle_sse_client(int client_fd) {
     // kept returning the buffered GET after the client was gone and the
     // detached thread never observed EOF. Consume the handshake bytes and
     // then wait on poll() so a closed connection surfaces immediately.
-    const int fl = ::fcntl(client_fd, F_GETFL, 0);
-    if (fl >= 0) ::fcntl(client_fd, F_SETFL, fl | O_NONBLOCK);
+    // (O_NONBLOCK itself is set at the top of this function — audit race fix.)
     {
         char drain[4096];
         while (::recv(client_fd, drain, sizeof(drain), 0) > 0) {

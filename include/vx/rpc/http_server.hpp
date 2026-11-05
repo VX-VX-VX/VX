@@ -149,7 +149,9 @@ private:
 
     HttpRequest parse_request(int client_fd, bool& ok);
     void send_response(int client_fd, const HttpResponse& res);
-    void send_sse_data(int client_fd, const std::string& event, const std::string& data);
+    // Sends one SSE frame with MSG_DONTWAIT|MSG_NOSIGNAL; returns false on
+    // EAGAIN/EWOULDBLOCK or a short write — the Drop Slow Consumer signal.
+    bool send_sse_data(int client_fd, const std::string& event, const std::string& data);
     HttpResponse dispatch(const HttpRequest& req);
     bool is_sse_client(int client_fd) const;
 
