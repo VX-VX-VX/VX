@@ -1372,7 +1372,13 @@ outside this repo by design (build tools are not consensus code).
     byte-identical before any adoption. Decision + tests = next
     session; do not rush the fix.
 - Work items: (a) compute ord_P(7) and the affine-coefficient orders
-  over the odd part of each (M-1); (b) empirical orbit-length probes
+  over the odd part of each (M-1). FIRST MEASUREMENT (2026-11-05,
+  P_secure): P-1 = 2^2 x 83 x 3769 x 3218807 x C, C = 1004-bit COMPOSITE
+  (unfactored; trial division to 10^7). The cofactor needs ECM/PARI or
+  a GMP-based hunt next session before the owner's Miller-Rabin
+  certificate (7^((P-1)/C) != 1 => ord has a divisor from C) can land;
+  without C's factorization no lower bound above 2^64 is claimed yet -
+  honestly NOT established; (b) empirical orbit-length probes
   over random starts, hunt for cycles below 2^64; (c) if any short
   cycle is found, the derivation must be re-pinned; (d) document
   Pollard-rho O(sqrt|F|) as the generic bound, not a guarantee.
