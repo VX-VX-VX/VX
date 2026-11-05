@@ -811,6 +811,31 @@ burns a ledger leaf. Refusal is fail-closed; TEST 9 pins it
   on hosts with low `rlimit_memlock` (document the fallback loudly).
 - Acceptance: TSan clean in CI; fallback path tested with a low rlimit.
 
+### 1.6 RPC shared-state audit (delivered 2026-11-05, v0.0.11) — residual: TSan
+
+The RPC server serves every handler on detached threads over ONE shared
+HttpServer instance, so every mutable member is a potential cross-request
+race. Audit of the live endpoints:
+
+- CLEAN (stateless by construction): `ZKKeyMatrix` (no data members —
+  every method derives from its arguments), `TensorV6::run` (local
+  matrix), `VirtualTensor::evolve` (pure bit-arithmetic). No locks
+  needed; recorded so future edits keep them stateless or add locking.
+- FIXED: `MemoryCore` (vault_core_) — commit/consume/burn/ephemeral-sign
+  all did check-then-claim on `pages_[].state` with no synchronization;
+  two concurrent commits could claim the same VOID page and overwrite
+  each other's secrets, and consume could read a half-written page.
+  Fix: internal `vault_mutex_` serializing all page-state paths
+  (sign_ephemeral holds it across the whole claim->SK->anchor->burn
+  cycle via `burn_page_internal_`; get_stats snapshots under the lock).
+  Regression: `ConcurrentCommitConsumeStress` (8 threads x 200
+  commit+consume round-trips, zero cross-contamination, coherent final
+  accounting); assert + sanitizer lanes green.
+- CLEAN: `last_htlc_` mutated only under state_mutex_ (HTLC endpoint);
+  trie_/trie_root_cache_ under state_mutex_ (state endpoints).
+- Residual: a TSan lane would catch the NEXT shared member added
+  without locking — fold into 1.4's TSan item.
+
 ---
 
 ## P2 — protocol completeness

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <atomic>
 #include <array>
+#include <mutex>
 #include <string>
 #include <optional>
 #include <functional>
@@ -143,9 +144,23 @@ private:
     std::atomic<size_t> next_page_{0};
     std::atomic<size_t> entropy_nonce_{0};
 
+    // Page-state invariant lock (v0.0.11 shared-state audit): commit,
+    // consume, burn, emergency-burn and ephemeral signing all do
+    // check-then-claim on pages_[].state with no other synchronization.
+    // The RPC server serves handlers on detached threads sharing one
+    // MemoryCore, so two concurrent commits could claim the same VOID
+    // page and overwrite each other's secrets. Mutable: get_stats() is
+    // const and must snapshot page states coherently.
+    mutable std::mutex vault_mutex_;
+
     // Huge page support
     bool try_huge_pages(size_t size);
     void fallback_alloc(size_t size);
+
+    // Internal burn variant called with vault_mutex_ already held (the
+    // ephemeral-sign path burns its own page inside the same critical
+    // section - locking the public burn_page there would self-deadlock).
+    bool burn_page_internal_(uint32_t page_id) noexcept;
 };
 
 } // namespace vx::core

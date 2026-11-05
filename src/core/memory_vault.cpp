@@ -136,6 +136,9 @@ void MemoryCore::fallback_alloc(size_t size) {
 }
 
 void MemoryCore::initialize(uint64_t user_master_key) {
+    // Construction-time state reset; locked for uniformity with the
+    // other arena-mutating paths (initialize is legal on a live object).
+    std::lock_guard<std::mutex> lock(vault_mutex_);
     uint64_t hw_uuid = get_hardware_uuid_seed();
     hw_master_key_ = user_master_key ^ hw_uuid;
 
@@ -185,6 +188,10 @@ std::array<uint8_t, 32> MemoryCore::commit_secure_data(const uint8_t* raw_data, 
     if (size > PAGE_SIZE) {
         throw std::runtime_error("MemoryCore: data exceeds page size");
     }
+    // v0.0.11 shared-state audit: the VOID-page scan below is
+    // check-then-claim on shared state; concurrent RPC handlers racing
+    // here could claim the same page and overwrite each other's secrets.
+    std::lock_guard<std::mutex> lock(vault_mutex_);
 
     // External review round 5: the ring cursor used to claim a slot
     // unconditionally, silently ZEROING a still-LOCKED page when the pool
@@ -224,6 +231,9 @@ std::array<uint8_t, 32> MemoryCore::commit_secure_data(const uint8_t* raw_data, 
 }
 
 bool MemoryCore::consume_data(const std::array<uint8_t, 32>& h32, uint8_t* out_buffer) {
+    // Same audit: consume scans LOCKED pages and mutates them; it must
+    // not interleave with a commit mid-write on the same page.
+    std::lock_guard<std::mutex> lock(vault_mutex_);
     for (auto& page : pages_) {
         if (page.state != static_cast<uint8_t>(PageState::LOCKED)) continue;
         // Constant-time full-digest compare: early-exit memcmp would leak
@@ -255,6 +265,7 @@ bool MemoryCore::consume_data(const std::array<uint8_t, 32>& h32, uint8_t* out_b
 }
 
 void MemoryCore::emergency_burn_all() {
+    std::lock_guard<std::mutex> lock(vault_mutex_);
     for (auto& page : pages_) {
         if (page.state != static_cast<uint8_t>(PageState::VOID)) {
             // Defense in depth: this is the last-ditch zeroization path, so
@@ -295,6 +306,9 @@ MemoryCore::Stats MemoryCore::get_stats() const noexcept {
     stats.void_pages = 0;
     stats.locked_pages = 0;
     stats.burned_pages = 0;
+    // Mutable-lock snapshot: a torn page-state read would misreport
+    // live capability tokens as burned (or vice versa).
+    std::lock_guard<std::mutex> lock(vault_mutex_);
     stats.huge_pages = arena_is_huge_;
     stats.mlock_active = arena_mlock_active_;
     stats.hw_uuid_hash = hw_master_key_;
@@ -379,6 +393,11 @@ std::string to_hex_112(const uint8_t* bytes) {
 } // namespace
 
 bool MemoryCore::burn_page(uint32_t page_id) noexcept {
+    std::lock_guard<std::mutex> lock(vault_mutex_);
+    return burn_page_internal_(page_id);
+}
+
+bool MemoryCore::burn_page_internal_(uint32_t page_id) noexcept {
     if (page_id >= POOL_SIZE) return false;
     MemoryPage& page = pages_[page_id];
     if (page.capacity == 0) return false;
@@ -419,6 +438,13 @@ MemoryCore::EphemeralSignReport MemoryCore::sign_ephemeral_in_vault(
     const uint64_t t0 = hw::cycle_counter();
     const auto wall0 = std::chrono::steady_clock::now();
 
+    // v0.0.11 shared-state audit: the whole sign cycle (claim page ->
+    // expand SK -> anchor signature -> burn) is one critical section.
+    // A concurrent commit or consume touching the claimed page would
+    // otherwise corrupt the key material or read a half-written SK.
+    // NOTE: get_stats() locks too - read the flag directly instead.
+    std::lock_guard<std::mutex> lock(vault_mutex_);
+
     // ── Step 2: allocate a free page VOID -> LOCKED ─────────────────────────
     int32_t page_id = -1;
     for (size_t attempt = 0; attempt < POOL_SIZE; ++attempt) {
@@ -434,7 +460,7 @@ MemoryCore::EphemeralSignReport MemoryCore::sign_ephemeral_in_vault(
     }
     if (page_id < 0) throw std::runtime_error("Vault: no VOID page available");
     report.page_id = static_cast<uint32_t>(page_id);
-    report.mlock_active = get_stats().mlock_active;
+    report.mlock_active = arena_mlock_active_;
 
     uint8_t* page_base = arena_ + pages_[page_id].offset;
 
@@ -477,7 +503,7 @@ MemoryCore::EphemeralSignReport MemoryCore::sign_ephemeral_in_vault(
     report.signed_tx_hex = to_hex_112(reinterpret_cast<const uint8_t*>(&tx));
 
     // ── Step 5: microsecond self-destruction ────────────────────────────────
-    burn_page(static_cast<uint32_t>(page_id));
+    burn_page_internal_(static_cast<uint32_t>(page_id)); // lock already held
     report.final_page_state = "BURNED";
 
     // ── Step 6: lifetime accounting ─────────────────────────────────────────
