@@ -79,7 +79,7 @@ Competing blocks at the same height are each kept by their own node.
 - [ ] `--bind ADDR` flag (default loopback, `0.0.0.0` opt-in), same for
   the RPC `--port` binding.
 - [ ] Document that 0.0.0.0 on the RPC is dangerous without auth (see
-  0.4).
+  0.10).
 - Acceptance: two machines on a LAN sync; loopback behavior unchanged by
   default.
 
@@ -661,6 +661,35 @@ ones are tracked below).
   guard belongs to the atomic-commit work; the redundant finality-guard
   persistence source and the displaced-cap wording are doc cleanups.
 
+### 0.21 External peer discovery (DNS seeds first, DHT later)
+
+Status (owner question, 2026-11-05): v0.0.6-alpha ships `SwarmNode` with
+a TCP listener and STATICALLY configured peers only — no DNS seeds, no
+DHT/Kademlia, no peer exchange. External bootstrap today means an
+operator-configured address. This entry designs the staged path; nothing
+below is implemented yet.
+
+- [ ] Stage 1 — DNS seeds (rendezvous, zero trust): hardcoded seed
+  HOSTNAMES (never raw IPs — a domain can be re-pointed without a fork);
+  resolved at startup, A-record results treated as untrusted candidate
+  peers, capped count, each candidate passes the standard handshake +
+  full-node validation like any other peer. Seeds can lie about peers
+  but cannot lie about the chain (consensus is validated locally).
+- [ ] Stage 2 — peer exchange (ADDR relay): connected nodes share
+  known-good addresses; timestamps for staleness; per-peer caps.
+- [ ] Stage 3 — DHT (Kademlia-class) as a FALLBACK only, not the primary
+  path: heavier, NAT-traversal work, and a sybil-friendly discovery
+  channel — which is acceptable only because discovery is never a trust
+  input (full-node validation remains the trust root; PoGW + per-peer
+  DoS scoring bound the damage of bad peers).
+- [ ] Recommendation recorded: DNS seeds as rendezvous (Bitcoin-style),
+  NOT DHT-first — DHT-first bootstrap is weaker for a small testnet
+  (empty DHT at low peer counts) and adds attack surface before the
+  peer-auth handshake (0.4) exists.
+- Acceptance: a fresh node with zero config (beyond seeds) joins, syncs
+  via 0.1 backfill, and rejects a malicious seed's bad chain under the
+  0.2/0.6 rules.
+
 ---
 
 ## P1 — harden what ships
@@ -772,6 +801,43 @@ lifecycle → attractor collision behavior.
 - [ ] Prove/disprove the phantom-key argument (ghost collisions) with
   experiments against the derivation function.
 - Acceptance: whitepaper §update with numbers, not adjectives.
+
+### 2.3b Reorg-interleaved fuzz harness (owner question, 2026-11-05)
+
+The current libFuzzer set covers parsers and the sequential frame→state
+layer under hostile input; split-brain reorg correctness is covered by
+DETERMINISTIC tests only (`test_reorg`, `test_reorg_carousel`,
+`test_bifurcation`). No harness interleaves corrupted binary frames
+with an active reorg. Honest gap, raised by the owner's review question.
+
+- [ ] `fuzz_reorg`: two interleaved intake streams (honest tip extension
+  vs competing-height/corrupted frames) driven from one fuzz input;
+  assert no crash/UB and post-heal ledger determinism against a
+  reference apply order.
+- [ ] Prerequisite/limiter: production fork choice is not implemented
+  yet — `apply_remote_frame` DROPS competing-height frames (ROADMAP
+  follow-up), so today's harness would exercise the drop path only.
+  Build the harness with the drop path first, extend it when fork
+  choice lands.
+- [ ] Wire-level: fuzz the VX60 handshake/promotion state machine
+  (`fuzz_wire` covers message parse, not the session state machine)
+  under mid-handshake frame corruption.
+
+### 2.3c Sanitizer coverage for the vault burn path (owner question, 2026-11-05)
+
+- Status: build_san (Clang ASan+UBSan) runs the full ctest set incl.
+  `test_vault_memory`; the burn path itself is DSE-safe by construction
+  (volatile stores + `asm volatile("" ::: "memory")` barriers +
+  `explicit_bzero` in SecureByteBuffer + `_mm_clflush` per cache line +
+  `PageState::BURNED` transition).
+- [ ] Add a post-burn content check: after `PageState::BURNED`, read
+  back the arena bytes of the burned page and assert all-zero (guards
+  against a future refactor reintroducing an elidable wipe). Respect
+  the vault's read-after-burn policy — do it inside the vault's own
+  test seam, not through the public API.
+- [ ] MSan lane (Clang MemorySanitizer) is NOT configured — honest gap;
+  it requires an MSan-instrumented libc++. Low priority vs the
+  ASan/UBSan+fuzz stack, tracked so it is not forgotten.
 
 ### 2.4 GQC validator-set formation (ROADMAP item 6)
 
