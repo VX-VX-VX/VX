@@ -961,6 +961,41 @@ work is documentation only: a whitepaper paragraph stating that T is
 folded into the scale constant and that any joule mapping is a
 doc-level convention, never consensus state.
 
+### 2.8 Seed canonicalization: fail-closed format at the CLI/RPC surface (degeneracy hunt, 2026-11-05 — first findings fixed in v0.0.10)
+
+Hunt suite: `tests/test_attractor_degeneracy.cpp`. Findings, in order of
+severity:
+
+- [x] FIXED (v0.0.10): invalid hex parsed SILENTLY to zero.
+  `mpz_class::set_str` ignores parse failures, so every non-hex seed
+  ("zz...", "12g4", a typo) became 0 and collapsed into the zero-seed
+  address — any garbled wallet derivation landed on one known key.
+  `hexToBigInt` now validates character-by-character and throws
+  (fail-loud), including the partial case (valid first half, garbage
+  second half silently zeroed Y_0 before).
+- [ ] The zero seed has a fixed, findable address
+  (NFA_V6_USaRKlmk3c_EfXuVbtfVfwzyd2QEQKZLyL7VbKIIAA with classic
+  moduli). The state does not collapse (Z_0 = PHI != 0), but a
+  derivation surface should refuse the all-zero seed outright.
+- [ ] Seeds longer than 512 hex chars are TRUNCATED; a 2048-bit seed
+  and its 1024-bit truncation map to the same address. Seeds shorter
+  than 512 chars are RIGHT-padded with '0'; "12" and "1200...0"
+  collide. The preimage-space accounting in docs/ADDRESS_SECURITY.md
+  (2^2048 seeds) holds only for CANONICAL 512-char seeds.
+- [ ] Prefix handling is case-asymmetric: run() strips a lowercase
+  "0x" before padding (prefix excluded from the seed budget), an
+  uppercase "0X" is not stripped and consumes two chars of budget.
+  A fail-closed seed format accepts exactly one canonical spelling.
+- [x] Clean results: the zero seed never collapses the state; orbit
+  hunt (40 pseudorandom seeds x 1000 iterations, deterministic
+  VortexSponge256-generated) — no address collisions, no all-zero
+  digest; xorFold index coverage is a bijection onto the 32 digest
+  bytes; palindrome seeds produce identical locked/unlocked addresses
+  (pinned, expected by construction).
+- Where the fix lives: NOT in the attractor (the derivation itself is
+  frozen by the canonical vectors) — in the CLI/RPC surfaces that feed
+  it, which must validate canonical form and reject everything else.
+
 ---
 
 ## P3 — expansion

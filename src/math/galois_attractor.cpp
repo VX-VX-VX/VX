@@ -1,16 +1,30 @@
 #include "vx/math/galois_attractor.hpp"
 #include <algorithm>
+#include <cctype>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 
 namespace vx::math {
 
 mpz_class VortexAttractor::hexToBigInt(std::string_view hex) {
     std::string clean(hex);
-    if (clean.rfind("0x", 0) == 0) {
+    if (clean.rfind("0x", 0) == 0 || clean.rfind("0X", 0) == 0) {
         clean = clean.substr(2);
     }
-    if (clean.empty()) return 0;
+    // Degeneracy-hunt fix (v0.0.10): mpz_class::set_str IGNORES parse
+    // failures, so every non-hex seed ("zz...", "12g4", a typo) silently
+    // parsed to 0 and collapsed into the zero-seed address - a wallet
+    // surface where any garbled derivation lands on one known key. Fail
+    // closed instead: an empty or non-hex string is a loud error.
+    if (clean.empty()) {
+        throw std::invalid_argument("hexToBigInt: empty input");
+    }
+    for (char c : clean) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            throw std::invalid_argument("hexToBigInt: non-hex character in seed");
+        }
+    }
     mpz_class res;
     res.set_str(clean, 16);
     return res;
