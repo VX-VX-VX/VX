@@ -1312,3 +1312,107 @@ outside this repo by design (build tools are not consensus code).
 - The current stage adds: after each major work stage, a full-repo
   adversarial re-hunt runs before the next stage starts, so defects are
   found by us before anyone else finds them.
+
+## Items opened from the owner session of 2026-11-05 (late evening)
+
+### 2.12 Orbit-length proof work for the trunk dynamics (fundamental Q1)
+
+- Status: NOT proven. The per-step X/Y trunk map is injective step-by-step
+  (XOR/rotl are injective as integer maps, x*7 and x+13 are bijective over
+  the prime moduli), so there is no per-step phase-space contraction on
+  X/Y. But a formal conservation theorem over F_P x F_Q x F_R does NOT
+  exist: the order of 7 mod P (which upper-bounds affine cycle lengths) is
+  unknown, and ACT I's Z_0 derivation is deliberately non-injective
+  (cubing is 3-to-1 since 3 | R-1, verified 2026-11-05).
+- Work items: (a) compute ord_P(7) and ord_Q(11), ord_Q(17), ord_Q(19),
+  ord_Q(23) exactly; (b) empirical orbit-length probes over random starts,
+  hunt for cycles below 2^64; (c) if any short cycle is found, the
+  derivation must be re-pinned; (d) document Pollard-rho O(sqrt|F|) as the
+  generic bound, not a guarantee.
+- Mining impact: PoGW search enumerates seeds (sponge), not step-map
+  iterations; a short step cycle would collapse address diversity rather
+  than enable free blocks. 100/100 distinct top-384 projections measured
+  (fold probe, this session).
+
+### 2.13 Gas model design note (fundamental Q2)
+
+- VX ships no smart-contract VM and no gas metering today, so the
+  Bennett reversible-computing paradox has no current attack surface.
+- Design decision recorded for any future VM: consensus gas is a
+  deterministic instruction count (tactic CPU). It is never derived from
+  thermodynamic cost, which consensus cannot verify. A reversible
+  instruction costs gas like any other; a "reversible infinite loop" is
+  an ordinary infinite loop and halts out-of-gas. Landauer's bound
+  describes hardware energy, not consensus metering; the boundary is
+  exactly "verifiable determinism over physics".
+
+### 2.14 ZK aggregation path decision (fundamental Q3)
+
+- Verified 2026-11-05: v2(P-1) = v2(Q-1) = v2(R-1) = 1 (owner's copied
+  constants differed slightly; the conclusion is stronger than stated).
+  No NTT subgroup beyond order 2 exists in any of the three fields:
+  classic multiplicative-subgroup STARK/FRI is algebraically dead on
+  them, naively O(N^2).
+- Decision point for any future witness/state aggregation (ties into
+  2.11): prefer (a) Circle-STARK-style construction over these same
+  low-2-adicity fields (that regime is exactly what Circle STARKs were
+  designed for), or (b) Binius over F_2^k towers. Non-native arithmetic
+  emulation in a foreign field is the last resort (million-gate
+  multiplications). ZK is not on the roadmap before 0.1.8.
+
+### 2.15 MemoryVault flush-pressure measurement (fundamental Q4)
+
+- Status: honestly NOT profiled. No PMU/uncore counters were ever run
+  under combined mining + signing load; the interconnect-saturation
+  concern is plausible but unmeasured.
+- Constraint: cache-local overwrite alone is NOT sufficient for the
+  zeroization promise - lines must reach DRAM or they survive in cache
+  after "erasure" (remanence exposure). clflush/clflushopt is the
+  mechanism, not an accident.
+- Work items: (a) perf-stat profile with uncore/interconnect counters
+  under 8-16 mining threads + RPC signing; (b) batch zeroization to
+  teardown/free boundaries instead of per-operation where the threat
+  model allows; (c) evaluate CPU-affinity isolation of the signing
+  arena from mining threads (cgroup/affinity, isolcpus as a deployment
+  note); (d) clflushopt vs clflush latency/pressure comparison.
+
+### 1.4 refinement: page-descriptor false sharing (owner, II.1)
+
+- PageState descriptors in a dense array share cache lines under
+  parallel access. alignas(64) per descriptor + a static assert on
+  sizeof, so concurrent per-page atomics never contend on one L1 line.
+
+### 1.4 refinement: get_stats() without a global lock (owner, II.1)
+
+- Read statistics as a snapshot sweep over the PageState array with
+  memory_order_acquire, no global lock. Documented honesty: this yields
+  an eventually-consistent snapshot, not a cross-counter atomic read;
+  a seqlock is the upgrade if a consistent snapshot is ever required.
+
+### 2.11 refinement: shutdown(fd, SHUT_RDWR) on SSE drop (owner, II.2)
+
+- v0.0.14 removes a slow SSE client from the broadcast list but does
+  not wake the connection thread's poll(); the fd lingers until the
+  client disconnects. shutdown(fd, SHUT_RDWR) is safe cross-thread
+  (touches socket state, not the fd table - zero FD-reuse risk) and
+  wakes poll() via POLLHUP so the owning thread closes the socket
+  itself. Strictly better than the shipped drop-only behavior.
+
+### 2.3c refinement: acquire barrier in debug_verify_page_zeroed
+(owner, II.3)
+
+- The test seam must read the page state with memory_order_acquire and
+  verify the BURNED state BEFORE reading raw arena bytes; otherwise the
+  seam can observe a page before the final clflush completes.
+
+### 1.5 addition: XMSS per-window leaf cache (owner question)
+
+- Status: NOT implemented. Every signature recomputes all 16 leaves of
+  the window from scratch (wots_leaf_pk_root per leaf) - the owner's
+  ~16k chain-step figure is the right order of magnitude.
+- Design: cache the 16 non-secret leaf digests of the active window
+  (512 bytes per window, public data - safely cacheable, verifiable by
+  recomputation). Cuts the WOTS-chain part of signing ~16x. Honest
+  note: auth-path sibling hashes are still recomputed per signature,
+  but they are cheap node hashes, not chains. Invalidate on any
+  rollover window change; memory-only, never persisted.
