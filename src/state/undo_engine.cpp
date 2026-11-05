@@ -519,7 +519,8 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
         };
         std::unordered_map<Address, NetDelta, AddressHash> net;
         net.reserve(record.transactions.size() * 2 + 1);
-        core::U128 coinbase_sum{0};
+        core::U128 genesis_mint_sum{0};
+        core::U128 miner_mint_sum{0};
         core::U128 record_fees{0};
         for (const auto& tx : record.transactions) {
             vx::blockchain::Address sender, receiver;
@@ -534,7 +535,12 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
             if (is_coinbase) {
                 // Coinbase reversal: remove the receiver credit (un-mint).
                 net[receiver].debit = net[receiver].debit + tx.amount;
-                coinbase_sum = coinbase_sum + tx.amount;
+                // Math-audit F11: track the two mint classes separately —
+                // apply_block prices the fee share against MINER_ mints ONLY.
+                if (std::strncmp(s, "MINER_", 6) == 0)
+                    miner_mint_sum = miner_mint_sum + tx.amount;
+                else
+                    genesis_mint_sum = genesis_mint_sum + tx.amount;
             } else {
                 // Regular transfer: sender gets back amount + fee,
                 // receiver loses the credited amount.
@@ -575,12 +581,18 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
         // coinbase credits minus the fee share re-credited to the
         // producer — and take it back out of the issued-supply counter
         // so the 7,000,000,000 VX cap gate stays exact after a reorg.
+        // Math-audit F11: the recredit floor is min(MINER_ mints, fee
+        // share), matching apply_block's formula structurally — the old
+        // min(all-coinbase, fee_share) over-reversed issued_supply_ by
+        // (fee_share − miner_mint) when a genesis-window block carried a
+        // GENESIS mint AND an under-claimed coinbase.
         {
             const core::U128 fee_share = record_fees - record_fees / core::U128(2);
             const core::U128 recredited =
-                (coinbase_sum < fee_share) ? coinbase_sum : fee_share;
-            if (coinbase_sum > recredited) {
-                ledger_.adjust_issued_supply(coinbase_sum - recredited, false);
+                (miner_mint_sum < fee_share) ? miner_mint_sum : fee_share;
+            const core::U128 issuance = (genesis_mint_sum + miner_mint_sum) - recredited;
+            if (!issuance.is_zero()) {
+                ledger_.adjust_issued_supply(issuance, false);
             }
         }
         // Burned-supply reversal (review round 5, P3): apply_block burned

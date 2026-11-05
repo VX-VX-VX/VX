@@ -450,6 +450,72 @@ including a not-yet-written entry (reads a default Transaction).
   admission wiring (nothing feeds `submit()` from the network stack yet)
   is part of the swarm-intake work.
 
+### 0.20 Crypto-math audit (2026-11-05) — delivered hardening + residuals
+
+Full read-audit of the sponge, WOTS+/XMSS, TDI filter, ASERT retarget and
+emission/fee law. Clean after hand re-derivation: the ASERT tie formula
+(both parities), the saturation early-return (provably value-neutral), the
+fee-split law (burned + miner_reward == total_fees identically, odd fees
+included), the WOTS+ checksum barrier and XMSS auth-path walk, TDI boundary
+arithmetic at 1,120,000 atoms. Delivered in the same wave: finalize
+idempotence + absorb-after-finalize abort (sponge), constant-time digest
+compares (vx/core/ct_equal.hpp), consensus lookup in Tier-1 witness
+verification (admission censoring fix), structurally identical issuance
+reversal in the undo engine (genesis-window under-claim no longer
+over-reverses supply), sponge streaming-contract tests, domain-tag
+prefix-freeness test, odd-half-life and clamp-boundary ASERT tests.
+Residuals, each with its trigger condition:
+
+- [ ] **Sponge pad does not encode length** (P2, latent): H(m) == H(m||0…0)
+  for trailing zeros inside the final partial chunk. Safe today ONLY because
+  every consensus preimage is fixed-length and domain-tagged (now enforced
+  by a test). The 0.15 width work MUST ship a v2 sponge with
+  length-encoded padding under a new tag — the digest of v1 is frozen by
+  the immutable genesis frame.
+- [ ] **WOTS+ leaf single-use is signer-side only** (P2): two valid
+  witnesses under the same leaf for different messages let the holder walk
+  the Winternitz chains and forge for that account at will. Consensus
+  cannot see used leaves — the witness lives in a sidecar, not the block.
+  Real fix is a wire-format change (consensus-visible leaf binding);
+  track it with the 0.15 key-rollover work. Until then the 16-leaf cap,
+  the durable PqLeafLedger and fail-closed defaults are the mitigation.
+- [ ] **Under-claimed fee share is silently destroyed** (P3, deflationary):
+  a coinbase carrying less than the miner's fee share forfeits the
+  remainder (neither burned nor credited). Not exploitable; decide and pin
+  explicitly (burn-or-credit) before mainnet.
+- [ ] Ungoated CPU-burn family + zk shared-state audit: see 0.19.
+- [ ] Witness replayability after restart (deterministic subset only) —
+  document as a property test once the leaf binding work starts.
+
+### 0.19 Ungated crypto-lab family (documented scope cut, round-2 review)
+
+Review flagged six POST endpoints that run real crypto on caller input but
+stay outside both gate classes: `/api/crypto/lab`, `/api/zk/derive_matrix`,
+`/api/zk/recover_shamir`, `/api/zk/proof_of_life`, `/api/zk/audit_view`,
+`/api/crypto/pq_verify`. They are NOT gated in this release deliberately:
+the web GUI's interactive lab uses them without a token workflow, and
+gating them silently breaks the demo surface. Documented risk: an
+unauthenticated flooder can burn CPU there (bounded per request, but not
+rate-limited). Follow-up (0.20 candidate): a full shared-state audit of
+the zk handlers (some mutate `zk_matrix_`/`tensor_v6_` members — locking
+discipline needs a pass) TOGETHER with a GUI token workflow, then move the
+whole family behind the same fail-closed gate. Do not gate half of it.
+
+### 0.18 GENESIS_2 receiver is a public-key holder (documented decision, testnet-only)
+
+Zero-trust round-2 note (P2-6): the height-1 `GENESIS_2` mint is bound to
+`genesis2_mint_receiver_payload()` — the pinned demo-spender payload. That
+spender's PQ secret key is the PUBLISHED demo test vector, so whoever holds
+the public demo key (everyone) can spend the 100,000 VX mint at height 1.
+This is accepted for the testnet/demo phase: the shape binding (P1 fix in
+0.14) pins the amount, height and receiver, so the mint itself cannot be
+diverted; only its spending is open. MAINNET REQUIREMENT: `mainnet` builds
+must pin a receiver payload generated from a key that is never published
+(the payload is consensus data — changing it changes the genesis frame
+hash, so the decision must land before any mainnet genesis is frozen, not
+after). Until then every chain built from this genesis is a test chain by
+construction.
+
 ### 0.17 Electron renderer stays sandboxed (delivered 2026-11-04) — residual: SSE relay
 
 CodeQL flagged `webSecurity: false` (Medium) and `allowRunningInsecureContent: true`
@@ -512,11 +578,16 @@ power there; width is the insurance against our own assumptions.
   and publishes a fresh root per binding, so one key never dies after
   16 transfers; the leaf discipline (nonce counter, no double-sign)
   must stay consensus-visible.
-- [ ] Retarget parameter lock (found by the 2026-11-04 ASERT review,
-  F2): the ASERT anchor and half-life are code constants not covered by
-  the genesis frame hash — "same genesis" enforces nothing about the
-  curve. Commit a hash of the retarget params into the genesis domain
-  and refuse non-default params outside test builds.
+- [x] Retarget parameter lock (found by the 2026-11-04 ASERT review,
+  F2): delivered 2026-11-05 as a fingerprint pin instead of a genesis
+  domain commitment — the genesis frame hash is immutable (485f5afac16d…),
+  so folding the params in would change it. `POGW_RETARGET_FINGERPRINT`
+  (FNV-1a over anchor_bits||half_life_blocks) is pinned by static_assert
+  in retarget.hpp and by `RetargetParameterLock` in test_retarget.cpp:
+  any anchor/half-life edit fails the build until both pins are updated
+  in the same, announced commit. Residual (wire work): carry the params
+  in the version handshake so nodes DISAGREE loudly instead of only
+  failing their own build — needs a wire-format version bump.
 - [ ] Time-anchored retarget exponent (ASERT review F3): the current
   height-only curve is monotone forever — a work escalator with a
   finite lifetime (bounded producers deterministically fail above ~26

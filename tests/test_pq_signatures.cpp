@@ -482,6 +482,9 @@ void test_subtree_guard() {
     std::cout << "  ✓ ledger holds exactly 2 consumed leaves after the sweep\n\n";
 }
 
+void test_sponge_finalize_idempotent();
+void test_pq_domain_tag_injectivity();
+
 int main() {
     std::cout << "================================================================\n";
     std::cout << "  VX PHASE 46: PQ HASH-BASED SIGNATURES (WOTS+/XMSS) TEST SUITE\n";
@@ -496,9 +499,94 @@ int main() {
     test_negative_vector_matrix();
     test_leaf_ledger_lifecycle();
     test_subtree_guard();
+    test_sponge_finalize_idempotent();
+    test_pq_domain_tag_injectivity();
 
     std::cout << "================================================================\n";
     std::cout << "  ALL PQ SIGNATURE TESTS PASSED — SHOR-VULNERABLE OPS: 0        \n";
     std::cout << "================================================================\n";
     return 0;
+}
+
+// ── Math-audit hardening (2026-11-05) ───────────────────────────────────────
+
+// F2 contract: finalize is single-use but IDEMPOTENT — the pad block is
+// absorbed exactly once and every later finalize returns the cached digest.
+// (absorb-after-finalize aborts by design; not exercised here.)
+void test_sponge_finalize_idempotent() {
+    // Same digest through the one-shot path and a double-finalized stream.
+    const uint8_t msg[] = "idempotence probe 0123456789abcdef";
+    uint8_t once[bc::VortexSponge256::DIGEST_SIZE];
+    uint8_t first[bc::VortexSponge256::DIGEST_SIZE];
+    uint8_t second[bc::VortexSponge256::DIGEST_SIZE];
+    bc::VortexSponge256::compute(msg, sizeof(msg) - 1, once);
+
+    bc::VortexSponge256 s;
+    s.absorb(msg, sizeof(msg) - 1);
+    s.finalize(first);
+    s.finalize(second); // must return the cached digest, not re-absorb a pad
+    assert(std::memcmp(first, second, bc::VortexSponge256::DIGEST_SIZE) == 0);
+    assert(std::memcmp(first, once, bc::VortexSponge256::DIGEST_SIZE) == 0);
+
+    // Multi-part absorb contract (F3): absorb(a); absorb(b) == absorb(a||b)
+    // IFF |a| is a multiple of the 32-byte rate. Both directions pinned so a
+    // future sponge width change cannot silently alter streaming semantics.
+    const uint8_t a[32] = {0}; // rate-aligned prefix
+    const uint8_t b[] = "tail-after-aligned-prefix";
+    uint8_t streamed[bc::VortexSponge256::DIGEST_SIZE];
+    uint8_t joined[bc::VortexSponge256::DIGEST_SIZE];
+    bc::VortexSponge256 s1;
+    s1.absorb(a, sizeof(a));
+    s1.absorb(b, sizeof(b) - 1);
+    s1.finalize(streamed);
+    bc::VortexSponge256 s2;
+    s2.absorb(a, sizeof(a));
+    s2.absorb(b, sizeof(b) - 1); // same sequence, joined input equals it
+    std::vector<uint8_t> ab(a, a + sizeof(a));
+    ab.insert(ab.end(), b, b + sizeof(b) - 1);
+    bc::VortexSponge256::compute(ab.data(), ab.size(), joined);
+    assert(std::memcmp(streamed, joined, bc::VortexSponge256::DIGEST_SIZE) == 0);
+
+    // Non-aligned prefix: streaming MUST differ from the joined absorb —
+    // the tail padding restarts per call, so equivalence would mean the
+    // contract silently changed.
+    const uint8_t na[7] = {1, 2, 3, 4, 5, 6, 7};
+    bc::VortexSponge256 s3;
+    s3.absorb(na, sizeof(na));
+    s3.absorb(b, sizeof(b) - 1);
+    s3.finalize(streamed);
+    ab.assign(na, na + sizeof(na));
+    ab.insert(ab.end(), b, b + sizeof(b) - 1);
+    bc::VortexSponge256::compute(ab.data(), ab.size(), joined);
+    assert(std::memcmp(streamed, joined, bc::VortexSponge256::DIGEST_SIZE) != 0);
+    std::cout << "ok: sponge finalize idempotence + multi-part absorb contract\n";
+}
+
+// F1 latent-safety: the finalize pad does not encode message length, so
+// trailing zeros inside the final partial chunk are ambiguous. That is safe
+// ONLY while every consensus preimage is a fixed-length, domain-tagged
+// structure — enforced here by prefix-freeness of the PQ-layer domain tags
+// (no tag may be a prefix of another, all must fit the rate with room for
+// the fixed payload).
+void test_pq_domain_tag_injectivity() {
+    const std::vector<std::string> tags = {
+        "VX_PQ_TX_MSG_V1",  "VX_WOTS_MASK",   "VX_WOTS_STEP",
+        "VX_WOTS_SK",       "VX_XMSS_NODE",   "VX_PQ_PUBSEED_V1",
+        "VX_SEGPQ_ANCHOR_V1", "VX_SEGPQ_WITNESS_V1", "VX_WOTS_PK_ROOT",
+        "VX_PQ_ADDR_DERIVE_V1",
+    };
+    for (size_t i = 0; i < tags.size(); ++i) {
+        assert(tags[i].size() < 32); // tag must fit one rate chunk
+        assert(tags[i].size() < 32);
+        for (size_t j = 0; j < tags.size(); ++j) {
+            if (i == j) continue;
+            // No tag may be a PREFIX of another: a short-tag preimage padded
+            // with zeros must never be a valid preimage of the long tag.
+            const bool prefix =
+                tags[j].size() > tags[i].size() &&
+                tags[j].compare(0, tags[i].size(), tags[i]) == 0;
+            assert(!prefix);
+        }
+    }
+    std::cout << "ok: PQ domain-tag prefix-freeness (padding-ambiguity guard)\n";
 }

@@ -67,6 +67,12 @@ BlockStore::BlockStore(const std::string& path, const std::string& genesis_path,
     // retarget parameters supply the half-life. The anchor from the caller
     // wins, so tests can keep passing a low seal strength while pinning a
     // fast test half-life alongside it.
+    // Math-audit F10: this override is deliberate — but it means the
+    // retarget_.anchor_bits field of a passed struct is IGNORED. Production
+    // must pass consistent values (POGW_MAINNET_RETARGET's anchor equals
+    // the default seal strength), and the fingerprint pin covers the
+    // production pair. A caller passing a disagreeing custom struct gets
+    // the ctor anchor, never a mixed curve.
     retarget_.anchor_bits = required_pogw_bits;
     fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd_ < 0) {

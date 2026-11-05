@@ -3,6 +3,9 @@
 #include "vx/blockchain/block.hpp"
 #include <cstdint>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace vx::blockchain {
 
@@ -11,7 +14,27 @@ namespace vx::blockchain {
  * hash function built on 64-bit limbs (uint64_t[8] = 512-bit internal state,
  * producing a 256-bit digest). Uses Golden Phi fractional expansion constants
  * mixed with 12 non-linear rounds of rotation, addition, and XOR (ARX).
- * Guarantees ~50% avalanche effect (SAC) and zero collision patterns.
+ * Empirically ~50% avalanche (SAC-tested); the standing assurance is the
+ * KAT/SAC/collision-smoke test suite, not a security reduction (a 12-round
+ * custom ARX sponge has none — see BACKLOG 0.15).
+ *
+ * Streaming contract (audit 2026-11-05):
+ *  - absorb(a); absorb(b) equals absorb(a||b) IFF |a| is a multiple of the
+ *    32-byte rate. Signer and verifier must always mirror identical absorb
+ *    call sequences; never rely on cross-call associativity otherwise.
+ *  - finalize() is single-use but IDEMPOTENT: the first call absorbs the
+ *    pad and caches the digest; later calls return the cached digest.
+ *    absorb() after finalize() is a hard error (abort) — misuse must be
+ *    loud, never silently corrupt.
+ *  - Digests are little-endian-dependent (mix_block loads the block buffer
+ *    as uint64_t words); no big-endian target is supported.
+ *  - Known limit, frozen by the immutable genesis frame: the finalize pad
+ *    does not encode the message length, so H(m) == H(m||0…0) for trailing
+ *    zeros inside the final partial chunk. Safe today ONLY because every
+ *    consensus preimage is a fixed-length, domain-tagged structure
+ *    (enforced by PqPreimageDomainInjectivity); a variable-length field
+ *    must never be hashed where length is implicit. The 0.15 width work
+ *    must ship a v2 sponge with length-encoded padding under a new tag.
  */
 class VortexSponge256 {
 public:
@@ -22,6 +45,12 @@ public:
     }
 
     void absorb(const uint8_t* data, size_t len) noexcept {
+        if (finalized_) {
+            // Audit F2: absorbing after finalize would silently produce a
+            // digest for a state the caller cannot reason about. Fail loud.
+            std::fputs("VortexSponge256: absorb() after finalize() - misuse\n", stderr);
+            std::abort();
+        }
         size_t offset = 0;
         while (offset < len) {
             size_t chunk = std::min(len - offset, sizeof(block_buf_));
@@ -38,17 +67,24 @@ public:
     }
 
     void finalize(uint8_t out[DIGEST_SIZE]) noexcept {
-        // Final padding & absorption
-        uint64_t pad = 0x80ULL;
-        absorb(reinterpret_cast<const uint8_t*>(&pad), 1);
+        if (!finalized_) {
+            // Final padding & absorption
+            uint64_t pad = 0x80ULL;
+            absorb(reinterpret_cast<const uint8_t*>(&pad), 1);
 
-        // Extract 256 bits (4 words) into out bytes
-        for (size_t i = 0; i < 4; ++i) {
-            uint64_t w = state_[i];
-            for (int b = 0; b < 8; ++b) {
-                out[i * 8 + b] = static_cast<uint8_t>((w >> (b * 8)) & 0xFF);
+            // Extract 256 bits (4 words) into out bytes
+            for (size_t i = 0; i < 4; ++i) {
+                uint64_t w = state_[i];
+                for (int b = 0; b < 8; ++b) {
+                    digest_cache_[i * 8 + b] = static_cast<uint8_t>((w >> (b * 8)) & 0xFF);
+                }
             }
+            finalized_ = true;
         }
+        // Audit F2: finalize is idempotent — the pad block is absorbed once
+        // and the digest is served from the cache, so a double finalize (or
+        // a caller finalizing in a loop) can never drift the digest.
+        std::memcpy(out, digest_cache_, DIGEST_SIZE);
     }
 
     static void compute(const uint8_t* data, size_t len, uint8_t out[DIGEST_SIZE]) noexcept {
@@ -111,6 +147,8 @@ private:
 
     uint64_t state_[8]{};
     uint8_t block_buf_[32]{};
+    bool finalized_ = false;
+    uint8_t digest_cache_[DIGEST_SIZE]{};
 };
 
 /**

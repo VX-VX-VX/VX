@@ -201,7 +201,15 @@ bool verify_transaction_proof(const Transaction& tx) noexcept {
     if (vx::crypto::pq::PqWitnessRegistry::instance().is_pq_sender(tx.sender_nfa)) {
         const auto msg = vx::crypto::pq::tx_msg_digest(tx);
         vx::crypto::pq::PqSignatureWitness w;
-        if (!vx::crypto::pq::PqWitnessRegistry::instance().lookup(msg, w)) return false;
+        // Math-audit F7: use the consensus lookup, not the first candidate.
+        // An attacker can register a SELF-CONSISTENT witness (own root) for
+        // a predictable digest before the honest one arrives; lookup() then
+        // hands the attacker's candidate to verification and the honest
+        // transaction briefly fails Tier-1 (admission/RPC censoring).
+        // lookup_verifying only returns candidates that actually verify
+        // against THIS transaction.
+        if (!vx::crypto::pq::PqWitnessRegistry::instance().lookup_verifying(tx, w))
+            return false;
         return vx::crypto::pq::pq_verify_transaction(tx, w);
     }
 

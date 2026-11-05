@@ -1,5 +1,6 @@
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/core/ct_equal.hpp"
 #include "vx/core/memory_vault.hpp"
 
 #include "vx/core/hw_intrinsics.hpp"
@@ -317,7 +318,7 @@ bool pq_verify_wots_xmss(const std::array<uint8_t, 32>& msg,
                              w.pub_seed, left, right);
         idx >>= 1;
     }
-    return cur == w.pq_pubkey_root;
+    return vx::core::ct_equal(cur.data(), w.pq_pubkey_root.data(), cur.size());
 }
 
 void pq_set_transaction_anchor(Transaction& tx, const PqSignatureWitness& w) noexcept {
@@ -343,7 +344,7 @@ bool pq_verify_transaction(const Transaction& tx, const PqSignatureWitness& w) n
     // one is not. This also closes subtree_index, which pure WOTS+/XMSS
     // verification does not consume: lying metadata now breaks the anchor.
     const std::array<uint8_t, 32> digest = compute_witness_digest(w);
-    if (digest != w.witness_digest) return false;
+    if (!vx::core::ct_equal(digest.data(), w.witness_digest.data(), digest.size())) return false;
 
     // Anchor: cocoon_proof must be trunc12(Sponge("VX_SEGPQ_ANCHOR_V1" || msg || root || witness_digest)).
     PreimageBuf a; // 18 + 32*3 = 114 bytes, fits
@@ -353,7 +354,7 @@ bool pq_verify_transaction(const Transaction& tx, const PqSignatureWitness& w) n
     a.put(digest.data(), 32);
     std::array<uint8_t, 32> full_tag{};
     sponge(a.b.data(), a.n, full_tag.data());
-    return std::memcmp(full_tag.data(), tx.cocoon_proof, 12) == 0;
+    return vx::core::ct_equal(full_tag.data(), tx.cocoon_proof, 12);
 }
 
 // ── SegPQ signing with MemoryVault ─────────────────────────────────────────

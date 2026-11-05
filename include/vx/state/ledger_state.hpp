@@ -4,6 +4,7 @@
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/blockchain/emission.hpp"
 #include "vx/blockchain/genesis.hpp"
+#include "vx/core/ct_equal.hpp"
 #include "vx/core/u128.hpp"
 #include "vx/crypto/pq_signature.hpp"
 
@@ -183,7 +184,7 @@ public:
                 }
                 std::array<uint8_t, 32> bound{};
                 if (pq_root_of(sender, bound)) {
-                    if (std::memcmp(bound.data(), w.pq_pubkey_root.data(), 32) != 0) {
+                    if (!vx::core::ct_equal(bound.data(), w.pq_pubkey_root.data(), 32)) {
                         res.error = "tx " + std::to_string(i) +
                                     ": PQ witness root does not match the sender's bound key";
                         return res;
