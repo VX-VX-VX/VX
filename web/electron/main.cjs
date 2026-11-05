@@ -119,6 +119,92 @@ app.whenReady().then(() => {
   startVxNode();
   createWindow();
 
+  // SSE-over-IPC relay (BACKLOG 0.17 residual): the renderer asks the main
+  // process to stream /api/events; chunks are parsed into SSE frames and
+  // forwarded over IPC. Same hardening as vx:rpc — absolute http(s) URL,
+  // GET only, header allowlist, redirects refused. No 30 s timeout: SSE is
+  // a long-lived stream; liveness is the renderer's reconnect policy.
+  const sseStreams = new Map(); // webContents.id -> { controller, url }
+  ipcMain.on('vx:sse-open', (event, url) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+      event.sender.send('vx:sse-error', { url: String(url), error: 'absolute http(s) URL required' });
+      return;
+    }
+    // One live stream per renderer: a re-open closes the previous one.
+    const prev = sseStreams.get(event.sender.id);
+    if (prev) {
+      try { prev.controller.abort(); } catch (_) {}
+      sseStreams.delete(event.sender.id);
+    }
+    const controller = new AbortController();
+    sseStreams.set(event.sender.id, { controller, url });
+    (async () => {
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: { Accept: 'text/event-stream' },
+          signal: controller.signal,
+          redirect: 'error',
+        });
+        if (!res.ok || !res.body) {
+          event.sender.send('vx:sse-closed', { url, status: res.status });
+          sseStreams.delete(event.sender.id);
+          return;
+        }
+        event.sender.send('vx:sse-open', { url, status: res.status });
+        let buffer = '';
+        const sendFrame = (raw) => {
+          let name = 'message';
+          const dataLines = [];
+          for (const line of raw.split(/\r?\n/)) {
+            if (line.startsWith(':')) continue; // comment/heartbeat
+            if (line.startsWith('event:')) name = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+            // "id:" and "retry:" are not needed for this consumer
+          }
+          if (dataLines.length === 0) return;
+          event.sender.send('vx:sse-event', { name, data: dataLines.join('\n') });
+        };
+        for await (const chunk of res.body) {
+          buffer += Buffer.from(chunk).toString('utf8');
+          const m = buffer.match(/\r?\n\r?\n/);
+          while (m) {
+            const raw = buffer.slice(0, m.index);
+            buffer = buffer.slice(m.index + m[0].length);
+            if (raw.trim().length > 0) sendFrame(raw);
+            m = buffer.match(/\r?\n\r?\n/);
+          }
+        }
+        // Server closed the stream normally.
+        event.sender.send('vx:sse-closed', { url, status: res.status });
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          event.sender.send('vx:sse-closed', { url, status: 0, error: String(err) });
+        }
+      } finally {
+        sseStreams.delete(event.sender.id);
+      }
+    })();
+  });
+  ipcMain.on('vx:sse-close', (event) => {
+    const s = sseStreams.get(event.sender.id);
+    if (s) {
+      try { s.controller.abort(); } catch (_) {}
+      sseStreams.delete(event.sender.id);
+      event.sender.send('vx:sse-closed', { url: s.url, status: 0, error: 'client closed' });
+    }
+  });
+  // Kill streams when the window navigates away or closes.
+  const abortStreamsFor = (wc) => {
+    const s = sseStreams.get(wc.id);
+    if (s) {
+      try { s.controller.abort(); } catch (_) {}
+      sseStreams.delete(wc.id);
+    }
+  };
+  mainWindow.webContents.on('did-navigate', abortStreamsFor);
+  mainWindow.webContents.on('destroyed', abortStreamsFor);
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

@@ -189,6 +189,11 @@ void PoGWMiner::mine_one(bool single_shot) {
         // Remove sealed transactions from mempool
         mempool_.remove_sealed(txs);
 
+        // SSE push (v0.0.8): block is durably stored and applied. The
+        // callback runs inside the seal scope and must stay non-blocking
+        // (the RPC server's broadcast is a non-blocking socket write).
+        if (on_block_sealed_) on_block_sealed_(height);
+
         std::cout << "[MINER] Block #" << height << " mined with nonce " << nonce
                   << " diff " << diff << " reward "
                   << (claim_tier == 0 ? blockchain::BLOCK_REWARD_BASE_VX

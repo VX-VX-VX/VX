@@ -4,6 +4,7 @@
 #include "vx/state/ledger_state.hpp"
 #include "vx/state/mempool.hpp"
 #include <atomic>
+#include <functional>
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -61,7 +62,16 @@ public:
     // miner itself never takes state_mutex_, so no cycle is possible).
     std::mutex& seal_mutex() noexcept { return seal_mutex_; }
 
+    // SSE push (v0.0.8): invoked inside the seal scope after a block was
+    // appended AND applied. The callback must be cheap and non-blocking
+    // (it runs while seal_mutex_ is held) — the RPC server uses it to
+    // broadcast an SSE frame, which is a non-blocking socket write.
+    void set_on_block_sealed(std::function<void(uint64_t height)> cb) {
+        on_block_sealed_ = std::move(cb);
+    }
+
 private:
+    std::function<void(uint64_t)> on_block_sealed_;
     uint64_t target_block_time_ = 5; // seconds
 };
 

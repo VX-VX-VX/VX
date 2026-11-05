@@ -57,6 +57,14 @@ HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, u
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(store.path() + ".pqw");
     // Initialize swarm node
     swarm_node_ = std::make_unique<vx::net::SwarmNode>();
+    // SSE push (v0.0.8): the miner fires on_block_sealed inside its seal
+    // scope; the broadcast takes sse_mutex_ only (never state/seal — no
+    // cycle with the apply_remote_frame ordering) and does non-blocking
+    // socket writes.
+    miner_->set_on_block_sealed([this](uint64_t height) {
+        broadcast_sse_event("block_sealed",
+                            "{\"height\":" + std::to_string(height) + "}");
+    });
     // Seed the vault memory core with a deterministic master key so the
     // live endpoints return real, reproducible data instead of uninitialized state.
     vault_core_.initialize(0x9e3779b97f4a7c15ULL ^ lock_step_.get_stats().lock_step_cycles);
@@ -118,6 +126,11 @@ void HttpServer::start() {
     if (::listen(server_fd_, 16) < 0)
         throw std::runtime_error("listen() failed");
     running_.store(true);
+    // v0.0.8 fix: sse_running_ was initialized false and never set true —
+    // the SSE client loop exited on its first condition check and every
+    // subscriber was closed ~2 ms after connect. SSE was double-dead before
+    // this (no HTTP response head AND instantly closed).
+    sse_running_.store(true);
     std::cout << "[RPC] Listening on :" << port_ << "\n";
     while (running_.load()) {
         int client = ::accept(server_fd_, nullptr, nullptr);
@@ -141,6 +154,13 @@ void HttpServer::start() {
 }
 
 void HttpServer::stop() {
+    // v0.0.8: quiesce the miner FIRST. Its on_block_sealed callback reaches
+    // into this object's SSE state (sse_mutex_, sse_clients_), and member
+    // destruction runs in reverse declaration order - the miner is destroyed
+    // after the SSE members it calls into. stop() joins the mining thread,
+    // so once it returns no callback can fire and the SSE teardown below is
+    // race-free. (Idempotent: PoGWMiner::stop() guards on its own flag.)
+    if (miner_) miner_->stop();
     if (running_.exchange(false)) {
         if (server_fd_ >= 0) { ::close(server_fd_); server_fd_ = -1; }
     }
@@ -232,6 +252,9 @@ bool HttpServer::apply_remote_frame(const void* frame) {
     // the duplicate at the height check above. Witnesses first (BACKLOG 0.8).
     swarm_node_->broadcast_witnesses_for(std::span<const uint8_t, 65536>(bytes, 65536));
     swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(bytes, 65536));
+    // SSE push (v0.0.8): a remote frame is now our new tip — same event the
+    // local miner fires, so GUI clients hear remote seals too.
+    broadcast_sse_event("block_sealed", "{\"height\":" + std::to_string(h) + "}");
     return true;
 }
 
@@ -367,20 +390,51 @@ void HttpServer::send_response(int client_fd, const HttpResponse& res) {
     ::send(client_fd, out.data(), out.size(), 0);
 }
 
-void HttpServer::send_sse_data(int client_fd, const std::string& data) {
-    std::string message = "data: " + data + "\n\n";
+void HttpServer::send_sse_data(int client_fd, const std::string& event,
+                               const std::string& data) {
+    std::string message;
+    if (!event.empty()) message += "event: " + event + "\n";
+    message += "data: " + data + "\n\n";
     ::send(client_fd, message.data(), message.size(), MSG_NOSIGNAL);
 }
 
+void HttpServer::broadcast_sse_event(const std::string& event,
+                                     const std::string& data) {
+    // Snapshot the fd list under the mutex; sends happen outside the lock
+    // (non-blocking sockets + MSG_NOSIGNAL, so a slow or dead client cannot
+    // wedge the caller — the miner's sealing thread holds seal_mutex_).
+    std::vector<int> targets;
+    {
+        std::lock_guard<std::mutex> lock(sse_mutex_);
+        targets = sse_clients_;
+    }
+    for (int fd : targets) send_sse_data(fd, event, data);
+}
+
 void HttpServer::handle_sse_client(int client_fd) {
+    // v0.0.8: the endpoint was raw SSE frames with NO HTTP response headers
+    // — no HTTP client (browser EventSource, curl, undici) can parse a
+    // response that never declares itself; every consumer fell back to
+    // polling. Emit a conforming SSE response head first.
+    {
+        const char head[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream; charset=utf-8\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n";
+        ::send(client_fd, head, sizeof(head) - 1, MSG_NOSIGNAL);
+    }
+
     // Add client to SSE list
     {
         std::lock_guard<std::mutex> lock(sse_mutex_);
         sse_clients_.push_back(client_fd);
     }
 
-    // Send initial comment to keep connection alive
-    send_sse_data(client_fd, "connected");
+    // Initial hello frame (unnamed data event; GUI logs it, ignores semantics)
+    send_sse_data(client_fd, "", "connected");
 
     // External review round 5 (thread leak): the accept loop only PEEKed the
     // request; the old loop PEEKED again and never consumed it, so recv()

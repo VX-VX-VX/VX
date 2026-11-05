@@ -149,7 +149,7 @@ private:
 
     HttpRequest parse_request(int client_fd, bool& ok);
     void send_response(int client_fd, const HttpResponse& res);
-    void send_sse_data(int client_fd, const std::string& event_data);
+    void send_sse_data(int client_fd, const std::string& event, const std::string& data);
     HttpResponse dispatch(const HttpRequest& req);
     bool is_sse_client(int client_fd) const;
 

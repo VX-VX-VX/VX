@@ -126,6 +126,11 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
   const eventSourceRef = useRef<EventSource | null>(null)
   const sseReconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isSseConnectingRef = useRef(false)
+  // SSE-over-IPC bridge state (Electron cross-origin path)
+  const sseBridgeActiveRef = useRef(false)
+  const sseBridgeListenersRef = useRef(false)
+  const sseBridgeHandlerRef = useRef<(name: string, data: string) => void>(() => {})
+  const sseConnectRef = useRef<() => void>(() => {})
 
   // Request deduplication state - In-Flight Promise Coalescing
   const inFlightRequests = useRef<Map<string, Promise<any>>>(new Map())
@@ -347,13 +352,57 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
       return
     }
 
-    // Under Electron with a cross-origin absolute RPC host, EventSource would
-    // need CORS the node does not send. The polling refresh (3–10 s) already
-    // covers push reactions (block_sealed → refreshAll), so skip SSE there;
-    // an SSE-over-IPC relay is BACKLOG 0.17.
     const sseUrl = resolveUrl('/api/events')
+    const bridge = (globalThis as any).vxSse
     if (/^https?:\/\//i.test(sseUrl) && (globalThis as any).vxRpc) {
-      addRpcLog('SSE: cross-origin host under Electron — relying on polling refresh')
+      // Cross-origin RPC host under Electron: EventSource would need CORS
+      // the node does not send. Stream through the SSE-over-IPC relay
+      // (BACKLOG 0.17 residual, delivered): the main process GETs the
+      // stream, parses frames and forwards them over vx:sse-event.
+      if (!bridge) {
+        addRpcLog('SSE: cross-origin host without vxSse bridge — relying on polling refresh')
+        return
+      }
+      if (sseBridgeActiveRef.current) return
+      sseBridgeActiveRef.current = true
+      isSseConnectingRef.current = true
+      addRpcLog('SSE(IPC): opening relay...')
+
+      if (!sseBridgeListenersRef.current) {
+        sseBridgeListenersRef.current = true
+        bridge.onOpen(() => {
+          isSseConnectingRef.current = false
+          setConnectionStatus('online')
+          addRpcLog('SSE(IPC): connected')
+        })
+        bridge.onError((p: unknown) =>
+          addRpcLog(`SSE(IPC): error ${JSON.stringify(p).slice(0, 80)}`))
+        bridge.onClosed(() => {
+          sseBridgeActiveRef.current = false
+          isSseConnectingRef.current = false
+          setConnectionStatus('offline')
+          addRpcLog('SSE(IPC): closed, retry in 3s')
+          if (sseReconnectTimeoutRef.current) clearTimeout(sseReconnectTimeoutRef.current)
+          sseReconnectTimeoutRef.current = setTimeout(() => sseConnectRef.current?.(), 3000)
+        })
+        bridge.onEvent((p: { name: string; data: string }) =>
+          sseBridgeHandlerRef.current(p?.name, p?.data))
+      }
+      sseBridgeHandlerRef.current = (name: string, data: string) => {
+        try {
+          JSON.parse(data)
+        } catch {
+          addRpcLog(`SSE: Parse error for ${name}`)
+          return
+        }
+        addRpcLog(`SSE: ${name} received`)
+        if (name === 'block_sealed') {
+          dirtyFlagsRef.current = { status: true, blocks: true, accounts: true }
+          refreshAll()
+        }
+        // mempool_updated / miner_tick / security_verdict: phases 7–8
+      }
+      bridge.open(sseUrl)
       return
     }
 
@@ -434,10 +483,12 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
   useEffect(() => {
     refreshAll()
     connectSSE()
+    sseConnectRef.current = connectSSE
 
     // 3-second fallback poll if SSE disconnects
     const fallbackInterval = setInterval(() => {
-      if (eventSourceRef.current?.readyState !== EventSource.OPEN) {
+      const bridgeActive = sseBridgeActiveRef.current
+      if (!bridgeActive && eventSourceRef.current?.readyState !== EventSource.OPEN) {
         addRpcLog('FALLBACK POLL: SSE disconnected, polling...')
         refreshAll()
       }
@@ -450,6 +501,9 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
         eventSourceRef.current.close()
         eventSourceRef.current = null
       }
+      // Tear down the SSE-over-IPC stream in the main process.
+      sseBridgeActiveRef.current = false
+      try { (globalThis as any).vxSse?.close() } catch { /* bridge absent */ }
       // Clear in-flight promises
       inFlightRequests.current.clear()
       abortControllersRef.current.clear()

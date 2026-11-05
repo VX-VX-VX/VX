@@ -543,7 +543,34 @@ undici has no Chromium-style forbidden-header list, so without the allowlist a
 compromised renderer could forge Cookie/Host/Content-Length — and 204/205/304
 responses reconstruct with a null body (the Response constructor throws
 otherwise). Residual: a proper SSE-over-IPC relay in the main process so
-push immediacy returns to the desktop client without re-opening the renderer.
+push immediacy returns to the desktop client without re-opening the
+renderer.
+
+DELIVERED 2026-11-05 (v0.0.8): SSE-over-IPC relay in `web/electron/main.cjs`
+(`vx:sse-open` streams GET /api/events in the main process — same
+hardening as the RPC bridge: absolute http(s), GET, header allowlist,
+redirects refused — frames parsed and forwarded as `vx:sse-event`;
+per-renderer single stream; aborted on navigation/destroy). Renderer uses
+the bridge for cross-origin hosts, EventSource otherwise. Two node-side
+bugs found on the way, both fixed: `/api/events` answered with RAW SSE
+frames and no HTTP response head (unparseable by any HTTP client), and
+`sse_running_` was never set true — the client loop closed every
+subscriber ~2 ms after connect. SSE was never functional before v0.0.8;
+`broadcast_sse_event` was declared but never implemented, so no named
+event ever existed either. Now: conforming response head + named
+`block_sealed` events fired from the miner's seal scope and from the
+remote-frame intake. E2E-verified (undici stream + real seal).
+
+Shutdown-ordering review (2026-11-05): the new miner callback reaches
+into the RPC server's SSE state, and member destruction runs in reverse
+order (the miner outlives the SSE members it calls into) — fixed by
+quiescing the miner first in `HttpServer::stop()`. Residual (pre-existing,
+class-wide, noted here rather than expanded): detached RPC worker threads
+can still be mid-request when `HttpServer` is destroyed at process exit;
+a deterministic join of the detached-thread pool is the eventual fix.
+Also P3, cosmetic: the Electron SSE relay decodes each network chunk as
+UTF-8 independently, so a multi-byte character split across chunk
+boundaries would garble one frame (all current payloads are ASCII JSON).
 
 ### 0.16 GQC sidecar v2 (delivered 2026-11-04) — residual hardening
 
