@@ -426,12 +426,12 @@ void HttpServer::handle_client(int client_fd) {
 
 HttpResponse HttpServer::dispatch(const HttpRequest& req) {
     // -- BACKLOG 0.10: mutating endpoints sit behind the auth token --------
-    // Fail closed: with no token configured this rejects everything that
-    // changes chain, vault, finality or leaf-registry state. Read-only
-    // endpoints below stay open.
-    // Mutating endpoints AND resource-heavy endpoints sit behind the auth
-    // token (BACKLOG 0.10 + security review P1-2/P2-1). Fail closed: with no
-    // token configured this rejects everything in both classes.
+    // Every mutating money path enters through the routing table below -
+    // /api/transfer, /api/mempool/submit and /api/mempool/seal - and every
+    // mutating endpoint AND resource-heavy endpoint sits behind the auth
+    // token (BACKLOG 0.10 + security review P1-2/P2-1). Fail closed: with
+    // no token configured this rejects everything in both classes, before
+    // any handler body runs.
     if ((is_mutating_endpoint(req) || is_resource_heavy_endpoint(req)) && !token_ok(req)) {
         return HttpResponse::error(401, "auth required for mutating/resource-heavy endpoints");
     }
@@ -454,6 +454,11 @@ HttpResponse HttpServer::dispatch(const HttpRequest& req) {
 
  // ZK Mempool
     if (req.method == "GET" && req.path == "/api/mempool/zk_stats") return handle_mempool_zk_stats(req);
+
+ // BACKLOG 0.14: mempool admission (submit = admission only, seal = one
+ // synchronous iteration of the miner's sealing flow).
+    if (req.method == "POST" && req.path == "/api/mempool/submit") return handle_mempool_submit(req);
+    if (req.method == "POST" && req.path == "/api/mempool/seal") return handle_mempool_seal(req);
 
  // VX60 P2P wire + split-brain reorg
     if (req.method == "GET" && req.path == "/api/swarm/peers") return handle_swarm_peers(req);
@@ -516,7 +521,14 @@ bool HttpServer::is_mutating_endpoint(const HttpRequest& req) noexcept {
         || req.path == "/api/security/chaos_fuzz"        // CPU-bound fuzz rounds
         || req.path == "/api/swarm/simulate_split_reorg" // spawns a fork simulator
         || req.path == "/api/vm/htlc_swap"               // settles an HTLC swap
-        || req.path == "/api/vault/ephemeral_sign";      // signing oracle
+        || req.path == "/api/vault/ephemeral_sign"       // signing oracle
+        // BACKLOG 0.14 wiring (stage_D): the mempool admission seam mutates
+        // mempool state (submit) and mines+applies a full block (seal) -
+        // both must sit behind the same fail-closed token gate as
+        // /api/transfer. The stage_D admission tests authenticate with a
+        // configured token (see AdmissionChain).
+        || req.path == "/api/mempool/submit"        // reserves mempool capacity
+        || req.path == "/api/mempool/seal";         // mines + applies a block
 }
 
 // Security-review P1-2/P2-1: endpoints that never mutate persistent state
@@ -760,9 +772,16 @@ HttpResponse HttpServer::handle_accounts(const HttpRequest&) {
     return HttpResponse::json(200, oss.str());
 }
 
-// ── POST /api/transfer ────────────────────────────────────────────────────────
-
-HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
+// -- Shared transfer admission path (BACKLOG 0.14 wiring) ----------------------
+// One definition of "a valid signed transfer request": /api/transfer
+// (admission + immediate seal) and /api/mempool/submit (admission only)
+// both enter through this. Callers must hold state_mutex_ - the ledger
+// balance/nonce reads and the witness registration are chain state.
+std::optional<HttpResponse>
+HttpServer::validate_signed_transfer(const HttpRequest& req,
+                                     vx::blockchain::Transaction& tx,
+                                     vx::blockchain::Address& sender_addr,
+                                     vx::blockchain::Address& recv_addr) {
     // Simple JSON parse helpers
     auto extract = [](const std::string& body, const std::string& key) -> std::string {
         // Tolerant field scan: "key" then optional whitespace, ':', optional
@@ -829,10 +848,7 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
         return HttpResponse::json(403, oss.str());
     }
 
-    std::lock_guard<std::mutex> lock(state_mutex_);
-
     // Parse sender payload
-    vx::blockchain::Address sender_addr{};
     if (sender.size() >= 7 && sender.rfind("NFA_V6_", 0) == 0) {
         sender = sender.substr(7);
     }
@@ -840,7 +856,6 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     std::memset(sender_addr.data(), 0, 42);
     std::memcpy(sender_addr.data(), sender.data() + start, std::min(sender.size() - start, size_t(42)));
 
-    vx::blockchain::Address recv_addr{};
     if (receiver.size() >= 7 && receiver.rfind("NFA_V6_", 0) == 0) {
         receiver = receiver.substr(7);
     }
@@ -848,33 +863,27 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     std::memset(recv_addr.data(), 0, 42);
     std::memcpy(recv_addr.data(), receiver.data() + start, std::min(receiver.size() - start, size_t(42)));
 
+    // Audit F13 (system-prefix admission gate): the ledger classifies
+    // coinbase mints by SENDER prefix (GENESIS*/MINER_*), so a user-signed
+    // tx carrying such a sender is mint-shaped consensus material. Admission
+    // rejects the shape outright - clear 403 here instead of relying on the
+    // PQ root lookup below failing for an unbound system address.
+    if (sender.rfind("GENESIS", 0) == 0 || sender.rfind("MINER_", 0) == 0) {
+        return HttpResponse::error(403,
+            "system sender prefixes (GENESIS*/MINER_*) are not accepted from user transactions");
+    }
+
     uint64_t amount_atomics = static_cast<uint64_t>(amount_vx * 100'000'000ULL);
+    // A zero-amount transfer moves nothing and exists only to burn a nonce
+    // slot; the money math never intends it (mempool entries and the seal
+    // path both assume a real value flow).
+    if (amount_atomics == 0) {
+        return HttpResponse::error(403, "amount must be positive");
+    }
     vx::core::U128 bal = ledger_.balance_of(sender_addr);
     if (bal < vx::core::U128(amount_atomics)) {
         return HttpResponse::error(403, "insufficient funds");
     }
-
-    // Build block
-    uint64_t next_h = store_.chain_height();
-    vx::blockchain::BlockBuilder builder;
-    builder.set_height(next_h);
-    builder.set_timestamp(static_cast<uint64_t>(std::time(nullptr)));
-    uint8_t tip[32] = {};
-    if (next_h > 0) store_.tip_hash(tip);
-    builder.set_prev_hash(tip);
-    // Attractor coords: run a quick 1-round attractor for the new block
-    auto attr = vx::math::VortexAttractor::run(sender, 1000, true);
-    uint8_t coords[384];
-    auto to_le128 = [](const mpz_class& v, uint8_t out[128]) {
-        std::memset(out, 0, 128);
-        mpz_class t = v;
-        mpz_class m = 255;
-        for (int i = 0; i < 128; ++i) { out[i] = static_cast<uint8_t>(mpz_class(t & m).get_ui()); t >>= 8; }
-    };
-    to_le128(attr.finalX, coords);
-    to_le128(attr.finalY, coords + 128);
-    to_le128(attr.finalZ, coords + 256);
-    builder.set_attractor_coords(coords);
 
     // Decode the client's witness (base64, exactly one PqSignatureWitness).
     vx::crypto::pq::PqSignatureWitness w{};
@@ -931,7 +940,6 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
         return HttpResponse::error(403, "nonce mismatch: use the sender's next expected nonce");
     }
 
-    vx::blockchain::Transaction tx{};
     std::memcpy(tx.sender_nfa, sender_addr.data(), 42);
     std::memcpy(tx.receiver_nfa, recv_addr.data(), 42);
     std::memcpy(tx.amount, &amount_atomics, 8);
@@ -949,53 +957,159 @@ HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
     if (!vx::crypto::pq::PqWitnessRegistry::instance().register_witness(tx, w)) {
         return HttpResponse::error(403, "witness rejected by the registry (invalid or duplicate)");
     }
-    builder.add_transaction(tx);
-    builder.finalize();
+    return std::nullopt;
+}
 
-    auto frame_span = builder.bytes();
-    vx::blockchain::BlockFrame frame;
-    std::memcpy(frame.data(), frame_span.data(), 65536);
-    // BACKLOG 0.9: the intake gate enforces real PoGW work on every appended
-    // block, so the transfer path seals its frame before offering it — same
-    // work rule as the background miner, one definition (pogw_meets_target).
-    if (!vx::blockchain::seal_pogw_nonce(frame, store_.required_pogw_bits())) {
-        return HttpResponse::error(500, "pogw seal failed");
+// Gossip one sealed frame: PQ witnesses first, then the frame (BACKLOG 0.8
+// ordering - a peer that receives a block without its witnesses cannot
+// authorize the txs and would drop the block).
+void HttpServer::broadcast_frame_bytes(const uint8_t* frame65536) {
+    swarm_node_->broadcast_witnesses_for(
+        std::span<const uint8_t, 65536>(frame65536, 65536));
+    swarm_node_->broadcast_frame(
+        std::span<const uint8_t, 65536>(frame65536, 65536));
+}
+
+// ── POST /api/transfer ────────────────────────────────────────────────────────
+// BACKLOG 0.14 admission wiring: a transfer that passed every check enters
+// the MEMPOOL before it can enter a block. The mempool is the single
+// admission gate (capacity, pending-balance and per-sender nonce chains);
+// the miner is the single sealing path - this handler drives one
+// synchronous iteration of the same sealing flow the background miner runs
+// (mine_one(true)), so the default request/response contract ("transfer"
+// returns the sealed block) is preserved.
+
+HttpResponse HttpServer::handle_transfer(const HttpRequest& req) {
+    vx::blockchain::Transaction tx{};
+    vx::blockchain::Address sender_addr{}, recv_addr{};
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (auto err = validate_signed_transfer(req, tx, sender_addr, recv_addr)) {
+        return *err;
     }
-    bool appended = store_.append_block(frame);
-    if (!appended) return HttpResponse::error(500, "block rejected");
 
-    auto* new_raw = store_.get_block(next_h);
-    vx::blockchain::BlockView newv{std::span<const uint8_t, 65536>(
-        reinterpret_cast<const uint8_t*>(new_raw), 65536)};
-    auto res = ledger_.apply_block(newv);
-    if (!res.ok) {
-        // Round-7 hardening (P0-2): the store must never keep a block the
-        // ledger refused - store and ledger would disagree about the tip
-        // and every later block would fail the height gate.
-        store_.rollback_last_append();
-        return HttpResponse::error(500, res.error);
+    const auto sub = mempool_.submit(tx, ledger_.balance_of(sender_addr),
+                                     ledger_.get_next_nonce(sender_addr));
+    if (!sub.ok) {
+        return HttpResponse::error(403, "mempool admission refused: " + sub.error);
     }
 
-    // Gossip the freshly mined block to every connected VX60 peer. The
-    // PQ witnesses of its user transactions travel FIRST (BACKLOG 0.8):
-    // a peer that receives a block without its witnesses cannot authorize
-    // the txs and would drop the block.
-    swarm_node_->broadcast_witnesses_for(std::span<const uint8_t, 65536>(frame.data(), 65536));
-    swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(frame.data(), 65536));
+    const uint64_t height_before = store_.chain_height();
+    miner_->mine_one(true);
+    const uint64_t height_after = store_.chain_height();
+
+    if (height_after == height_before) {
+        // No nonce met the target in this attempt: the transaction stays
+        // queued in the mempool for the next seal (background miner or a
+        // later /api/mempool/seal).
+        const auto st = mempool_.stats();
+        std::ostringstream oss;
+        oss << "{\"status\":\"queued\",\"queued_in_mempool\":true,"
+            << "\"mempool_count\":" << st.count << ","
+            << "\"total_pending_fees\":\"" << st.total_pending_fees.to_string() << "\"}";
+        HttpResponse r = HttpResponse::json(202, oss.str());
+        r.status_text = "Accepted";
+        return r;
+    }
+
+    const auto* raw = store_.get_block(height_before);
+    if (raw == nullptr) return HttpResponse::error(500, "sealed frame unreadable");
+    vx::blockchain::BlockView sealed{std::span<const uint8_t, 65536>(
+        reinterpret_cast<const uint8_t*>(raw), 65536)};
+
+    // Did OUR transaction make it into the sealed block? A fuller mempool
+    // can seal other pending traffic while a below-difficulty attempt leaves
+    // ours queued; report which happened instead of guessing.
+    bool sealed_ours = false;
+    for (uint32_t i = 0; i < sealed.header().tx_count; ++i) {
+        const auto& t = sealed.tx(i);
+        if (std::memcmp(t.sender_nfa, tx.sender_nfa, 42) == 0 &&
+            std::memcmp(t.nonce, tx.nonce, 4) == 0) {
+            sealed_ours = true;
+            break;
+        }
+    }
+
+    // Gossip the freshly sealed block to every connected VX60 peer.
+    broadcast_frame_bytes(reinterpret_cast<const uint8_t*>(raw));
 
     uint8_t bh[32];
-    // Full-frame commitment (round 5): the reported block hash must commit
-    // the tail (VM/PoGW metadata) too, not just the 472-byte header.
-    vx::blockchain::hash_block(*reinterpret_cast<const vx::blockchain::RawBlock*>(frame.data()), bh);
+    // Full-frame commitment (round 5), same quantity /api/status reports.
+    vx::blockchain::hash_block(
+        *reinterpret_cast<const vx::blockchain::RawBlock*>(raw), bh);
     std::ostringstream oss;
     oss << "{";
-    oss << "\"status\":\"ok\",\"block_height\":" << next_h << ","
+    oss << "\"status\":\"ok\",\"block_height\":" << height_before << ","
         << "\"block_hash_hex\":\"" << hex_bytes(bh, 32) << "\","
-        << "\"transfers\":" << res.transfers << ",";
+        << "\"transfers\":" << sealed.header().tx_count << ","
+        << "\"sealed\":" << (sealed_ours ? "true" : "false") << ",";
     // Updated balances
     oss << "\"sender_balance_vx\":\"" << format_vx(ledger_.balance_of(sender_addr).lo) << "\","
         << "\"receiver_balance_vx\":\"" << format_vx(ledger_.balance_of(recv_addr).lo) << "\"";
     oss << "}";
+    return HttpResponse::json(200, oss.str());
+}
+
+// -- POST /api/mempool/submit --------------------------------------------------
+// Admission only: the validated transaction enters the mempool and waits for
+// the next seal. This is the observable seam of the admission wiring - the
+// transaction is visible in mempool stats between submit and seal.
+
+HttpResponse HttpServer::handle_mempool_submit(const HttpRequest& req) {
+    vx::blockchain::Transaction tx{};
+    vx::blockchain::Address sender_addr{}, recv_addr{};
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (auto err = validate_signed_transfer(req, tx, sender_addr, recv_addr)) {
+        return *err;
+    }
+
+    const auto sub = mempool_.submit(tx, ledger_.balance_of(sender_addr),
+                                     ledger_.get_next_nonce(sender_addr));
+    if (!sub.ok) {
+        return HttpResponse::error(403, "mempool admission refused: " + sub.error);
+    }
+    const auto st = mempool_.stats();
+    std::ostringstream oss;
+    oss << "{\"status\":\"accepted\",\"mempool_position\":" << sub.position << ","
+        << "\"projected_height\":" << store_.chain_height() << ","
+        << "\"mempool_count\":" << st.count << ","
+        << "\"byte_occupancy\":" << st.byte_occupancy << ","
+        << "\"total_pending_fees\":\"" << st.total_pending_fees.to_string() << "\","
+        << "\"total_pending_amounts\":\"" << st.total_pending_amounts.to_string() << "\"}";
+    return HttpResponse::json(200, oss.str());
+}
+
+// -- POST /api/mempool/seal ----------------------------------------------------
+// One synchronous iteration of the miner's sealing flow: pull from the
+// mempool, coinbase at index 0, PoGW search, append, apply, remove_sealed.
+// Lets an operator (or test) drain the pool without keeping the background
+// miner running.
+
+HttpResponse HttpServer::handle_mempool_seal(const HttpRequest& /*req*/) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    const uint64_t height_before = store_.chain_height();
+    miner_->mine_one(true);
+    const uint64_t height_after = store_.chain_height();
+    if (height_after == height_before) {
+        const auto st = mempool_.stats();
+        std::ostringstream oss;
+        oss << "{\"status\":\"nothing_sealed\",\"mempool_count\":" << st.count << "}";
+        return HttpResponse::json(200, oss.str());
+    }
+
+    const auto* raw = store_.get_block(height_before);
+    if (raw == nullptr) return HttpResponse::error(500, "sealed frame unreadable");
+    broadcast_frame_bytes(reinterpret_cast<const uint8_t*>(raw));
+    const auto st = mempool_.stats();
+    vx::blockchain::BlockView sealed{std::span<const uint8_t, 65536>(
+        reinterpret_cast<const uint8_t*>(raw), 65536)};
+    uint8_t bh[32];
+    vx::blockchain::hash_block(
+        *reinterpret_cast<const vx::blockchain::RawBlock*>(raw), bh);
+    std::ostringstream oss;
+    oss << "{\"status\":\"ok\",\"block_height\":" << height_before << ","
+        << "\"block_hash_hex\":\"" << hex_bytes(bh, 32) << "\","
+        << "\"transfers\":" << sealed.header().tx_count << ","
+        << "\"mempool_count\":" << st.count << "}";
     return HttpResponse::json(200, oss.str());
 }
 

@@ -235,6 +235,14 @@ target_link_libraries(test_rpc_auth PRIVATE vx_core gtest gtest_main)
 add_executable(test_key_import tests/test_key_import.cpp)
 target_link_libraries(test_key_import PRIVATE vx_core gtest gtest_main)
 
+# Stage D hardening suites: half-applied-block commit guard (apply integrity)
+# and mempool admission wiring (RPC -> mempool -> miner seal -> ledger).
+add_executable(test_apply_integrity tests/test_apply_integrity.cpp)
+target_link_libraries(test_apply_integrity PRIVATE vx_core gtest gtest_main)
+
+add_executable(test_mempool_admission tests/test_mempool_admission.cpp)
+target_link_libraries(test_mempool_admission PRIVATE vx_core gtest gtest_main)
+
 # Test executables must keep assertions live in every configuration.
 # Release defines NDEBUG, which silently compiles every assert() in the
 # custom-main suites out of existence — a green lane then proves only
@@ -245,7 +253,8 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
             test_chain_stress test_boundary_torture test_crash_torture
-            test_rpc_auth test_key_import)
+            test_rpc_auth test_key_import
+            test_apply_integrity test_mempool_admission)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -275,6 +284,8 @@ add_test(NAME VortexBoundaryTortureTest COMMAND test_boundary_torture)
 add_test(NAME VxCrashTortureTest COMMAND test_crash_torture)
 add_test(NAME VortexRpcAuthTest COMMAND test_rpc_auth)
 add_test(NAME VortexKeyImportTest COMMAND test_key_import)
+add_test(NAME VortexApplyIntegrityTest COMMAND test_apply_integrity)
+add_test(NAME VortexMempoolAdmissionTest COMMAND test_mempool_admission)
 
 # ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────
 # Standalone fuzz harnesses for the three highest-risk parse/verify surfaces:

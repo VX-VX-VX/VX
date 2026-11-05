@@ -101,6 +101,21 @@ public:
                         std::to_string(blockchain::MAX_TX_PER_BLOCK);
             return res;
         }
+        // -- Apply-integrity guard, part A: body commitment ----------------
+        // apply_block is reachable on frames that never crossed the store's
+        // intake gate (direct state surgery, replay and test harnesses). The
+        // pre-check and commit loops below read exactly header.tx_count
+        // transactions from the body, so a header that lies about its count
+        // - e.g. tx_count patched after the merkle root was computed - must
+        // be caught BEFORE any mutation: the body commitment is recomputed
+        // from the frame bytes alone and compared with the header field.
+        if (!blockchain::verify_block_merkle(*reinterpret_cast<const blockchain::RawBlock*>(
+                block.bytes().data()))) {
+            res.error = "ERR_APPLY_INTEGRITY: merkle_root does not commit the block body"
+                        " (header tx_count " + std::to_string(n) + ")";
+            return res;
+        }
+
         std::vector<U128> debits(n);
         std::vector<U128> fees(n);
         // Intra-block pending credits for intra-block spendability.
@@ -391,18 +406,81 @@ public:
             }
         }
 
-        // Round-7 hardening: every transaction in the block validated, so
-        // the self-certifying bindings collected during the pre-check are
-        // safe to commit now. A block rejected anywhere above leaves
-        // pq_roots_ untouched (the old code bound the sender mid-loop,
-        // before later transactions could still refuse the block).
-        for (const auto& [addr, root] : new_bindings_) {
-            bind_pq_sender(addr, root);
+        // -- Apply-integrity guard, part B: pre-commit supply snapshot -----
+        // The supply law this block must obey (derived from the commit loop
+        // below, which is the one definition of how balances move):
+        //
+        //   post_supply == pre_supply - total_fees + coinbase_mints
+        //
+        // every non-coinbase tx moves (amount + fee) out of its sender and
+        // amount back to its receiver (net -fee per transfer), and every
+        // coinbase credit (GENESIS_*/MINER_) is new money. The fees a block
+        // collects are split floor/2 into burned_supply_ (which is not part
+        // of any balance) and ceil/2 to the producer, so fees never re-enter
+        // the balance sum inside the same block. The pre-check loop already
+        // guarantees total_fees <= pre_supply (each sender's cumulative
+        // debits are checked against real balances), so the subtraction
+        // cannot underflow on a block that validated - a violation there is
+        // itself an integrity signal, not a normal rejection.
+        //
+        // The sum is EXACT (exact_total_supply, 128-bit overflow checked),
+        // never the u64-saturating total_supply() sentinel: a legitimate
+        // supply can exceed 2^64 atoms (boundary torture covers a 2^64-atom
+        // account) and must not be mistaken for the anomaly sentinel.
+        U128 pre_supply{};
+        if (!exact_total_supply(pre_supply)) {
+            res.error = "ERR_APPLY_INTEGRITY: account balance sum overflow before commit";
+            return res;
         }
-        new_bindings_.clear();
+
+        // -- Commit journal -------------------------------------------------
+        // Every mutation the commit loop makes is recorded with the value it
+        // replaces, so a failed commit (or a failed post-apply integrity
+        // check) restores the exact pre-block state. "No partial
+        // application" is enforced here, not assumed from the pre-check.
+        struct BalanceUndo { Address addr; U128 prev; bool existed; };
+        struct NonceUndo { Address addr; uint32_t prev; bool existed; };
+        std::vector<BalanceUndo> balance_undo;
+        std::vector<NonceUndo> nonce_undo;
+        balance_undo.reserve(2 * n);
+        const U128 burned_before = burned_supply_;
+        const U128 issued_before = issued_supply_;
+        auto record_balance = [&](const Address& a) {
+            const auto it = balances_.find(a);
+            balance_undo.push_back(BalanceUndo{a, it == balances_.end() ? U128{} : it->second,
+                                               it != balances_.end()});
+        };
+        auto record_nonce = [&](const Address& a) {
+            const auto it = nonces_.find(a);
+            nonce_undo.push_back(NonceUndo{a, it == nonces_.end() ? 0u : it->second,
+                                           it != nonces_.end()});
+        };
+        auto rollback_commit = [&]() {
+            for (auto it = balance_undo.rbegin(); it != balance_undo.rend(); ++it) {
+                if (it->existed) {
+                    balances_[it->addr] = it->prev;
+                } else {
+                    // The entry was created by this block; it must return to
+                    // the untracked pre-block state (same rule as the reorg
+                    // undo path - see forget_empty_address).
+                    const auto e = balances_.find(it->addr);
+                    if (e != balances_.end() && e->second == U128{}) balances_.erase(e);
+                }
+            }
+            for (auto it = nonce_undo.rbegin(); it != nonce_undo.rend(); ++it) {
+                if (it->existed) {
+                    nonces_[it->addr] = it->prev;
+                } else {
+                    nonces_.erase(it->addr);
+                }
+            }
+            burned_supply_ = burned_before;
+            issued_supply_ = issued_before;
+        };
 
  // commit with TDI fee burn (50% burned, 50% to miner)
 
+        uint32_t applied = 0;
         for (uint32_t i = 0; i < n; ++i) {
             const Transaction& tx = block.tx(i);
             Address sender = blockchain::tx_address(tx.sender_nfa);
@@ -416,19 +494,68 @@ public:
                 // Hard underflow guard (defense in depth): the pre-check
                 // loop's intra_debits_ accounting makes this unreachable;
                 // if it ever fired, refusing is better than minting a
-                // 2^128 phantom balance.
+                // 2^128 phantom balance - and the journal restores the
+                // exact pre-block state instead of leaving a half-applied
+                // block behind.
                 const U128 outflow = debits[i] + fees[i];
-                if (balances_[sender] < outflow) {
+                const auto sit = balances_.find(sender);
+                const U128 current = (sit == balances_.end()) ? U128{} : sit->second;
+                if (current < outflow) {
                     res.error = "tx " + std::to_string(i) + ": internal underflow guard";
+                    rollback_commit();
                     return res;
                 }
-                balances_[sender] = balances_[sender] - outflow;
+                record_balance(sender);
+                balances_[sender] = current - outflow;
                 // Update nonce for non-genesis-v1 transactions
                 if (!(legacy_window && blockchain::is_genesis_v1_tx(tx))) {
+                    record_nonce(sender);
                     set_next_nonce(sender, blockchain::tx_nonce(tx) + 1);
                 }
             }
+            record_balance(receiver);
             balances_[receiver] = balances_[receiver] + debits[i];
+            ++applied;
+        }
+
+        // -- Apply-integrity guard, part C: post-apply supply law ----------
+        // Runs AFTER the commit loop and BEFORE the block is counted in
+        // (height, burned and issued counters move only on a pass). If the
+        // actual account-map delta diverges from the recorded money flows,
+        // the commit loop did not execute what the pre-check validated: the
+        // state is rolled back through the journal and the block is refused
+        // with a hard error instead of silently keeping partial state.
+        if (applied != block.header().tx_count) {
+            res.error = "ERR_APPLY_INTEGRITY: applied " + std::to_string(applied) +
+                        " transactions, header declares " +
+                        std::to_string(block.header().tx_count);
+            rollback_commit();
+            return res;
+        }
+        if (total_fees > pre_supply) {
+            res.error = "ERR_APPLY_INTEGRITY: block fees exceed the pre-block supply";
+            rollback_commit();
+            return res;
+        }
+        const U128 coinbase_mints = genesis_mint_sum + miner_mint_sum;
+        const U128 expected_post = (pre_supply - total_fees) + coinbase_mints;
+        U128 post_supply{};
+        // Exact sum (see part B): the u64-saturation sentinel is a VALID
+        // supply value for large states, never an anomaly signal here.
+        if (!exact_total_supply(post_supply) || !(post_supply == expected_post)) {
+            res.error = "ERR_APPLY_INTEGRITY: supply law violated (post " +
+                        post_supply.to_string() + " != pre " + pre_supply.to_string() +
+                        " - fees " + total_fees.to_string() + " + mints " +
+                        coinbase_mints.to_string() + ")";
+            rollback_commit();
+            return res;
+        }
+        // TDI fee split law: every fee atom the senders paid is either
+        // burned or re-credited to the producer - none may appear or vanish.
+        if (!(burned + miner_reward == total_fees)) {
+            res.error = "ERR_APPLY_INTEGRITY: fee split (burn + miner share) loses atoms";
+            rollback_commit();
+            return res;
         }
 
         // Track burned supply
@@ -437,6 +564,18 @@ public:
         issued_supply_ = issued_supply_ + block_issuance;
 
         ++next_height_;
+
+        // Round-7 hardening: every transaction in the block validated AND
+        // the commit passed the integrity guard, so the self-certifying
+        // bindings collected during the pre-check are safe to commit now.
+        // A block rejected anywhere above leaves pq_roots_ untouched (the
+        // old code bound the sender mid-loop, before later transactions
+        // could still refuse the block).
+        for (const auto& [addr, root] : new_bindings_) {
+            bind_pq_sender(addr, root);
+        }
+        new_bindings_.clear();
+
         res.ok = true;
         res.transfers = n;
         res.fees_burned = burned;
@@ -501,6 +640,27 @@ public:
             sum = sum + bal;
         }
         return sum;
+    }
+
+    /// EXACT balance-map sum with full 128-bit overflow detection. The
+    /// u64-saturating total_supply() above is a cheap sanity helper whose
+    /// sentinel (2^64-1) can legitimately collide with a real supply
+    /// (a 2^64-atom account is a valid state); the apply-integrity guard
+    /// must never mistake that for corruption, so it sums here without the
+    /// saturation and reports overflow through the return value instead.
+    bool exact_total_supply(U128& out) const noexcept {
+        U128 sum{};
+        for (const auto& [addr, bal] : balances_) {
+            const uint64_t lo = sum.lo + bal.lo;
+            const uint64_t carry = (lo < sum.lo) ? 1u : 0u;
+            const uint64_t hi = sum.hi + bal.hi;
+            if (hi < sum.hi) return false; // 128-bit overflow
+            const uint64_t hi2 = hi + carry;
+            if (hi2 < hi) return false;    // 128-bit overflow via carry
+            sum = U128{lo, hi2};
+        }
+        out = sum;
+        return true;
     }
 
     /// Total burned supply (TDI burn)

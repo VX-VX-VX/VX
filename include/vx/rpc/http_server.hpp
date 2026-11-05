@@ -159,6 +159,23 @@ private:
     void broadcast_sse_event(const std::string& event, const std::string& data);
 
     // API Endpoint Handlers
+
+    // Shared admission path (BACKLOG 0.14 wiring): validates a signed PQ
+    // transfer request and builds the transaction - JSON field extraction,
+    // TDI screen, address parsing, balance and nonce checks against the
+    // ledger, witness decode, full WOTS+/XMSS + SegPQ-anchor verification
+    // and registry registration. Callers must hold state_mutex_. Returns an
+    // error response, or std::nullopt when the request carries a fully
+    // validated transaction (tx is filled, sender/receiver resolved).
+    std::optional<HttpResponse> validate_signed_transfer(const HttpRequest& req,
+                                                         blockchain::Transaction& tx,
+                                                         blockchain::Address& sender_addr,
+                                                         blockchain::Address& recv_addr);
+
+    // Gossip one sealed frame: PQ witnesses first, then the frame (BACKLOG
+    // 0.8 ordering - a peer without the witnesses cannot apply the block).
+    void broadcast_frame_bytes(const uint8_t* frame65536);
+
     HttpResponse handle_status(const HttpRequest& req);
     HttpResponse handle_blocks(const HttpRequest& req);
     HttpResponse handle_accounts(const HttpRequest& req);

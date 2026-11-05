@@ -35,7 +35,10 @@ void PoGWMiner::mining_loop() {
     }
 }
 
-void PoGWMiner::mine_one() {
+void PoGWMiner::mine_one(bool single_shot) {
+    // One sealing attempt at a time: the background loop and a synchronous
+    // single-shot caller (RPC transfer/seal path) must not race on the tip.
+    std::lock_guard<std::mutex> seal_lock(seal_mutex_);
     uint64_t height = store_.chain_height();
     // The search target IS the store's live-intake gate (BACKLOG 0.9): the
     // height-derived ASERT curve is the single source of difficulty truth.
@@ -95,7 +98,7 @@ void PoGWMiner::mine_one() {
     uint64_t nonce = 0;
     blockchain::BlockFrame frame;
     for (;;) {
-        if (!running_.load()) return;
+        if (!(running_.load() || single_shot)) return;
 
         // (Re)build the block with the current claim.
         blockchain::Transaction cb;
@@ -121,7 +124,7 @@ void PoGWMiner::mine_one() {
 
         bool matched = false;
         uint8_t hash[32];
-        while (running_.load()) {
+        while (running_.load() || single_shot) {
             std::memcpy(frame.data(), frame_view.data(), 65536);
             auto* raw = reinterpret_cast<blockchain::RawBlock*>(frame.data());
             raw->tail.pogw_nonce = nonce;

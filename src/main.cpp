@@ -55,7 +55,8 @@ Examples:
   vx_node --serve --p2p 19089 --peer 127.0.0.1:19088
   vx_node --demo
 
-RPC endpoints (once serving): /api/status, /api/crypto/lab,
+RPC endpoints (once serving): /api/status, /api/transfer,
+/api/mempool/submit, /api/mempool/seal, /api/crypto/lab,
 /api/crypto/pq_sign, /api/crypto/pq_verify, /api/security/audit,
 /api/crypto/canonical.
 )" << "\n";
