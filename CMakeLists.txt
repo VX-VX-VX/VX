@@ -19,6 +19,23 @@ else()
     message(STATUS "Edition: PUBLIC CORE (portable hardening, synthetic hardware vectors)")
 endif()
 
+# -- Demo keys (BACKLOG 0.10) -------------------------------------------------
+# VX_DEMO_KEYS=OFF (default) -> production: the /api/crypto/pq_sign
+#   demo_key:"spender" signer is compiled out. The genesis PQ binding of the
+#   demo spender to the published demo key is NOT gated: it is consensus
+#   data and must validate identically in every build.
+#   The pinned GENESIS_2 mint receiver address stays ungated - it is a
+#   consensus address, never a key.
+# VX_DEMO_KEYS=ON -> demo/test builds: the RPC demo signer is wired back in
+#   so the demo economy and the multi-node harness run end to end.
+option(VX_DEMO_KEYS "Compile the RPC demo_key signer path (genesis demo spender binding is consensus data, always on)" OFF)
+if(VX_DEMO_KEYS)
+    add_compile_definitions(VX_DEMO_KEYS=1)
+    message(STATUS "Demo keys: ENABLED (RPC demo_key signer; genesis binding is always consensus data)")
+else()
+    message(STATUS "Demo keys: compiled out (production build)")
+endif()
+
 # Find OpenMP
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
@@ -70,6 +87,7 @@ add_library(vx_core STATIC
     src/crypto/simd_accel.cpp
     src/crypto/zk_key_matrix.cpp
     src/crypto/canonical_vectors.cpp
+    src/crypto/key_import.cpp
     src/neural/virtual_tensor.cpp
     src/state/mempool.cpp
     src/consensus/pogw_miner.cpp
@@ -208,6 +226,15 @@ target_link_libraries(test_pq_signatures PRIVATE vx_core gtest gtest_main)
 add_executable(test_retarget tests/test_retarget.cpp)
 target_link_libraries(test_retarget PRIVATE vx_core gtest gtest_main)
 
+# -- BACKLOG 0.10 (Stage C) test suites ---------------------------------------
+# RPC auth token gate (mutating endpoints fail closed without the token).
+add_executable(test_rpc_auth tests/test_rpc_auth.cpp)
+target_link_libraries(test_rpc_auth PRIVATE vx_core gtest gtest_main)
+
+# Key import validation (strict canonical decode, checksum, address match).
+add_executable(test_key_import tests/test_key_import.cpp)
+target_link_libraries(test_key_import PRIVATE vx_core gtest gtest_main)
+
 # Test executables must keep assertions live in every configuration.
 # Release defines NDEBUG, which silently compiles every assert() in the
 # custom-main suites out of existence — a green lane then proves only
@@ -217,7 +244,8 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
-            test_chain_stress test_boundary_torture test_crash_torture)
+            test_chain_stress test_boundary_torture test_crash_torture
+            test_rpc_auth test_key_import)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -245,6 +273,8 @@ add_test(NAME VxBifurcationOracleTest COMMAND test_bifurcation)
 add_test(NAME VortexChainStressTest COMMAND test_chain_stress)
 add_test(NAME VortexBoundaryTortureTest COMMAND test_boundary_torture)
 add_test(NAME VxCrashTortureTest COMMAND test_crash_torture)
+add_test(NAME VortexRpcAuthTest COMMAND test_rpc_auth)
+add_test(NAME VortexKeyImportTest COMMAND test_key_import)
 
 # ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────
 # Standalone fuzz harnesses for the three highest-risk parse/verify surfaces:

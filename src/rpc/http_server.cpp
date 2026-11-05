@@ -34,7 +34,9 @@
 #include <pthread.h>
 #include <errno.h>
 
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <iostream>
 #include <sstream>
@@ -64,6 +66,38 @@ HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, u
     // (pq_sign answers the ledger error), which beats refusing to boot.
     pq_leaf_ledger_ = std::make_unique<vx::crypto::pq::PqLeafLedger>(
         (std::filesystem::path(data_dir_) / "pq_leaves.reg").string());
+
+    // -- BACKLOG 0.10: RPC auth token, read ONCE at startup ----------------
+    // Source: VX_RPC_TOKEN (the token itself) or VX_RPC_TOKEN_FILE (first
+    // line of a file, trailing whitespace stripped). Never hardcoded, never
+    // logged. No token configured -> auth_enabled_ stays false and every
+    // mutating endpoint answers 401 (fail closed); read-only endpoints stay
+    // open.
+    const char* tok = ::getenv("VX_RPC_TOKEN");
+    if (tok != nullptr && tok[0] != '\0') {
+        auth_token_ = tok;
+    } else if (const char* tf = ::getenv("VX_RPC_TOKEN_FILE");
+               tf != nullptr && tf[0] != '\0') {
+        std::ifstream in(tf);
+        if (in.good()) {
+            std::string line;
+            std::getline(in, line);
+            while (!line.empty() &&
+                   (line.back() == '\r' || line.back() == '\n' ||
+                    line.back() == ' ' || line.back() == '\t')) {
+                line.pop_back();
+            }
+            auth_token_ = line;
+        } else {
+            std::cerr << "[RPC] VX_RPC_TOKEN_FILE '" << tf
+                      << "' unreadable - mutating endpoints fail closed\n";
+        }
+    }
+    auth_enabled_ = !auth_token_.empty();
+    std::cout << "[RPC] mutating-endpoint auth: "
+              << (auth_enabled_ ? "token configured"
+                                : "NO TOKEN - mutating endpoints answer 401 (fail closed)")
+              << "\n";
 }
 
 HttpServer::~HttpServer() {
@@ -191,6 +225,55 @@ bool HttpServer::apply_remote_frame(const void* frame) {
     return true;
 }
 
+// Zero-trust review P2-2: header-name matching is line-start exact — a
+// substring find would let "X-Content-Length:" hijack request framing or
+// "Proxy-Authorization:" satisfy the auth gate. Walk real header lines; a
+// duplicate Authorization line fails closed (the header is dropped, so the
+// auth gate answers 401). Shared by the socket path and route_raw, so tests
+// and the fuzzer exercise the exact production parser.
+void HttpServer::scan_headers(const std::string& raw, size_t header_end,
+                              size_t& content_length, HttpRequest& req) {
+    std::string lower;
+    lower.reserve(header_end);
+    for (size_t i = 0; i < header_end; ++i)
+        lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(raw[i]))));
+    size_t auth_hits = 0;
+    size_t auth_vs = 0;
+    bool cl_seen = false;
+    size_t ls = 0;
+    // Skip the request line; header lines start right after CRLF.
+    const size_t nl = lower.find("\r\n");
+    if (nl != std::string::npos) ls = nl + 2;
+    while (ls < header_end) {
+        size_t le = lower.find("\r\n", ls);
+        if (le == std::string::npos || le > header_end) le = header_end;
+        const size_t llen = le - ls;
+        if (llen >= 15 && !cl_seen &&
+            lower.compare(ls, 15, "content-length:") == 0) {
+            cl_seen = true;
+            content_length = static_cast<size_t>(
+                std::strtoull(raw.c_str() + ls + 15, nullptr, 10));
+        } else if (llen >= 14 &&
+                   lower.compare(ls, 14, "authorization:") == 0) {
+            ++auth_hits;
+            auth_vs = ls + 14;
+        }
+        ls = le + 2;
+    }
+    // BACKLOG 0.10: carry the Authorization header into req.headers for the
+    // mutating/resource-heavy auth gate. Exactly one header line must carry
+    // it; duplicates never authenticate.
+    if (auth_hits == 1) {
+        size_t ve = raw.find("\r\n", auth_vs);
+        if (ve == std::string::npos || ve > header_end) ve = header_end;
+        std::string val = raw.substr(auth_vs, ve - auth_vs);
+        const size_t b = val.find_first_not_of(" \t");
+        const size_t e = val.find_last_not_of(" \t");
+        if (b != std::string::npos)
+            req.headers["authorization"] = val.substr(b, e - b + 1);
+    }
+}
+
 HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
     HttpRequest req;
     ok = false;
@@ -212,18 +295,8 @@ HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
 
         if (header_end == std::string::npos) {
             header_end = raw.find("\r\n\r\n");
-            if (header_end != std::string::npos) {
-                // Content-Length from the header block (case-insensitive name).
-                std::string lower;
-                lower.reserve(header_end);
-                for (size_t i = 0; i < header_end; ++i)
-                    lower.push_back(static_cast<char>(::tolower(raw[i])));
-                size_t cl = lower.find("content-length:");
-                if (cl != std::string::npos) {
-                    content_length =
-                        static_cast<size_t>(std::strtoull(raw.c_str() + cl + 15, nullptr, 10));
-                }
-            }
+            if (header_end != std::string::npos)
+                scan_headers(raw, header_end, content_length, req);
         }
         if (header_end != std::string::npos) {
             const size_t body_start = header_end + 4;
@@ -239,9 +312,40 @@ HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
     size_t pos = raw.find("\r\n\r\n");
     if (pos != std::string::npos) {
         req.body = raw.substr(pos + 4);
+        // Frame the body by the (first) Content-Length: a pipelined second
+        // request must never leak into this request's body. A short close
+        // (fewer bytes arrived than declared) keeps what arrived.
+        if (req.body.size() > content_length) req.body.resize(content_length);
     }
     ok = true;
     return req;
+}
+
+// Parse a raw wire request and route it — the entry point for tests and the
+// RPC fuzzer. The socket path (parse_request) and this function share
+// scan_headers, so the byte-level HTTP parser is on the tested/fuzzed
+// surface instead of only the post-parse HttpRequest (P2-2 follow-up).
+// Unlike parse_request there is no client to block on: a raw buffer that
+// does not carry a complete method/path/header block is a 400.
+HttpResponse HttpServer::route_raw(const std::string& raw) {
+    HttpRequest req;
+    size_t content_length = 0;
+    const size_t header_end = raw.find("\r\n\r\n");
+    if (header_end != std::string::npos) {
+        scan_headers(raw, header_end, content_length, req);
+        req.body = raw.substr(header_end + 4);
+        // Same CL framing as the socket path (first Content-Length wins),
+        // so the framing choice is observable and regression-testable.
+        if (req.body.size() > content_length) req.body.resize(content_length);
+    }
+    const size_t line_end = raw.find("\r\n");
+    if (line_end != std::string::npos) {
+        std::istringstream iss(raw.substr(0, line_end));
+        iss >> req.method >> req.path;
+    }
+    if (req.method.empty() || req.path.empty())
+        return HttpResponse::error(400, "malformed request");
+    return route(req);
 }
 
 void HttpServer::send_response(int client_fd, const HttpResponse& res) {
@@ -321,6 +425,16 @@ void HttpServer::handle_client(int client_fd) {
 }
 
 HttpResponse HttpServer::dispatch(const HttpRequest& req) {
+    // -- BACKLOG 0.10: mutating endpoints sit behind the auth token --------
+    // Fail closed: with no token configured this rejects everything that
+    // changes chain, vault, finality or leaf-registry state. Read-only
+    // endpoints below stay open.
+    // Mutating endpoints AND resource-heavy endpoints sit behind the auth
+    // token (BACKLOG 0.10 + security review P1-2/P2-1). Fail closed: with no
+    // token configured this rejects everything in both classes.
+    if ((is_mutating_endpoint(req) || is_resource_heavy_endpoint(req)) && !token_ok(req)) {
+        return HttpResponse::error(401, "auth required for mutating/resource-heavy endpoints");
+    }
     if (req.method == "GET" && req.path == "/api/status") return handle_status(req);
     if (req.method == "GET" && req.path == "/api/blocks") return handle_blocks(req);
     if (req.method == "GET" && req.path == "/api/accounts") return handle_accounts(req);
@@ -382,6 +496,78 @@ HttpResponse HttpServer::route(const HttpRequest& req) {
     } catch (...) {
         return HttpResponse::error(500, "internal error");
     }
+}
+
+// -- RPC auth (BACKLOG 0.10) --------------------------------------------------
+
+// Endpoints that CHANGE persistent state (chain tip, ledger, vault pages,
+// GQC finality checkpoints, the durable PQ one-time-leaf registry). The
+// wire transport is a separate layer: VX60 P2P frames are authorized by
+// their own intake gate, not by this token.
+bool HttpServer::is_mutating_endpoint(const HttpRequest& req) noexcept {
+    if (req.method != "POST") return false;
+    return req.path == "/api/transfer"              // appends blocks, mutates ledger, gossips
+        || req.path == "/api/vault/action"          // vault capability commit/consume
+        || req.path == "/api/consensus/finalize_gqc"// moves finality checkpoints
+        || req.path == "/api/crypto/pq_sign"        // burns a durable one-time PQ leaf
+        // Zero-trust review P2-3: expensive or state-touching endpoints that
+        // an unauthenticated caller could hammer. They sit behind the same
+        // fail-closed token gate as the ledger mutators.
+        || req.path == "/api/security/chaos_fuzz"        // CPU-bound fuzz rounds
+        || req.path == "/api/swarm/simulate_split_reorg" // spawns a fork simulator
+        || req.path == "/api/vm/htlc_swap"               // settles an HTLC swap
+        || req.path == "/api/vault/ephemeral_sign";      // signing oracle
+}
+
+// Security-review P1-2/P2-1: endpoints that never mutate persistent state
+// but are floodable resource burns or serialize on state_mutex_ for their
+// whole run — an unauthenticated flooder there head-of-line blocks the
+// chain mutators. Both methods and both classes share one fail-closed gate.
+bool HttpServer::is_resource_heavy_endpoint(const HttpRequest& req) noexcept {
+    return req.path == "/api/mempool/pipeline_benchmark"  // GET: 100k-tx bundle under state_mutex_
+        || req.path == "/api/security/audit"              // red-team CPU burn
+        || req.path == "/api/vm/execute_trace"            // assemble + execute + trace JSON
+        || req.path == "/api/neural/simulate"
+        || req.path == "/api/mempool/mev_audit"
+        || req.path == "/api/zk/ivk_scan"                 // holds state_mutex_ throughout
+        || req.path == "/api/swarm/relay_cocoon"          // holds state_mutex_ throughout
+        // Round-2 review: two more full-run state_mutex_ holders — an
+        // unauthenticated flood here parks every chain mutator behind them.
+        || req.path == "/api/zk/stealth_envelope"         // holds state_mutex_ throughout
+        || req.path == "/api/state/prove";                // trie build + proof under state_mutex_
+}
+
+// Length-and-byte constant-time comparison; the loop always runs over the
+// longer input and the length difference itself folds into the accumulator.
+bool HttpServer::constant_time_equal(std::string_view a, std::string_view b) noexcept {
+    const size_t n = a.size() > b.size() ? a.size() : b.size();
+    uint8_t diff = (a.size() == b.size()) ? 0 : 1;
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t x = i < a.size() ? static_cast<uint8_t>(a[i]) : 0;
+        const uint8_t y = i < b.size() ? static_cast<uint8_t>(b[i]) : 0;
+        diff |= static_cast<uint8_t>(x ^ y);
+    }
+    return diff == 0;
+}
+
+bool HttpServer::token_ok(const HttpRequest& req) const {
+    if (!auth_enabled_) return false; // fail closed: no token configured
+    const auto it = req.headers.find("authorization");
+    if (it == req.headers.end()) return false;
+    std::string_view v = it->second;
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+    // Accept both "Bearer <token>" and the bare token value.
+    constexpr std::string_view kBearer = "bearer ";
+    if (v.size() >= kBearer.size()) {
+        std::string head(v.substr(0, kBearer.size()));
+        for (char& c : head) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        if (head == kBearer) {
+            v.remove_prefix(kBearer.size());
+            while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+        }
+    }
+    return constant_time_equal(v, auth_token_);
 }
 
 // ── JSON helpers ────────────────────────────────────────────────────────────
@@ -2415,10 +2601,20 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
         // address is already PQ-bound to exactly this key. Still demo-only
         // signing of a PUBLIC key (BACKLOG 0.10: compile demo signers out of
         // production builds); no user key material ever flows here.
+#ifdef VX_DEMO_KEYS
         if (find_str("demo_key") == "spender") {
             bc::VortexSponge256::compute(
                 reinterpret_cast<const uint8_t*>("VX_DEMO_SPENDER_SK_V1"), 21, master_sk.data());
         }
+#else
+        // VX_DEMO_KEYS=OFF (production): the demo spender signer does not
+        // exist. Fail closed with an explicit refusal instead of silently
+        // falling back to a different key.
+        if (find_str("demo_key") == "spender") {
+            return HttpResponse::error(
+                403, "demo_key signer compiled out of production builds (VX_DEMO_KEYS=OFF)");
+        }
+#endif
     }
 
     // Optional sender/receiver override (42-byte address payloads, with or

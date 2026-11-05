@@ -44,6 +44,8 @@ using vx::consensus::asert_pogw_bits;
 using vx::consensus::POGW_MAINNET_RETARGET;
 using vx::consensus::PogwRetargetParams;
 using vx::consensus::POGW_MAX_BITS;
+using vx::consensus::POGW_RETARGET_FINGERPRINT;
+using vx::consensus::retarget_fingerprint;
 
 namespace {
 
@@ -300,4 +302,66 @@ TEST(AsertRetargetTest, AsertAnchorIsGenesis) {
         << "height 2 must still sit at the anchor, not one bit above it";
 
     std::filesystem::remove_all(dir);
+}
+
+// -- 6. Parameter lock (F2) -----------------------------------------------------
+
+// The ASERT anchor and half-life are code constants OUTSIDE the genesis
+// frame hash: "same genesis" enforces nothing about them, so a silent edit
+// forks every peer with no visible disagreement. The fingerprint pin makes
+// such an edit a loud, deliberate consensus change.
+TEST(AsertRetargetTest, RetargetParameterLock) {
+    EXPECT_EQ(POGW_RETARGET_FINGERPRINT, 0xc45e282bf67c611aull)
+        << "ASERT anchor/half-life changed: announce the consensus change and "
+           "update both pins (static_assert in retarget.hpp and this test)";
+    EXPECT_EQ(retarget_fingerprint(16, 34560), POGW_RETARGET_FINGERPRINT);
+    // Sanity: the fingerprint actually moves when either parameter moves.
+    EXPECT_NE(retarget_fingerprint(17, 34560), POGW_RETARGET_FINGERPRINT);
+    EXPECT_NE(retarget_fingerprint(16, 34561), POGW_RETARGET_FINGERPRINT);
+}
+
+// -- 7. Math-audit hardening ----------------------------------------------------
+
+// Odd half-lives exercise the tie threshold (hl>>1)+(hl&1) in its odd
+// parity branch, which the hl=1 degenerate case never really tests.
+TEST(AsertRetargetTest, AsertOddHalfLifeNearestRounding) {
+    for (uint64_t hl : {3ull, 5ull, 7ull}) {
+        const PogwRetargetParams p{16, hl};
+        for (uint64_t h = 2; h <= 20 * hl; ++h) {
+            const uint64_t shift = h - 1;
+            const long double exact =
+                static_cast<long double>(shift) / static_cast<long double>(hl);
+            const uint64_t expected =
+                16 + static_cast<uint64_t>(std::llround(exact)); // nearest, ties up
+            EXPECT_EQ(asert_pogw_bits(p, h), expected)
+                << "hl=" << hl << " h=" << h;
+        }
+    }
+    // Exact boundary heights for hl=5: shift 2 rounds DOWN ((2/5)<0.5),
+    // shift 3 rounds UP ((3/5)>0.5).
+    const PogwRetargetParams p{16, 5};
+    EXPECT_EQ(asert_pogw_bits(p, 3), 16u); // shift 2 -> down
+    EXPECT_EQ(asert_pogw_bits(p, 4), 17u); // shift 3 -> up
+}
+
+// Saturation behavior at both anchors: anchor=64 must never move (the
+// lattice top), anchor=1 must clamp at 64 from the exact height onward.
+TEST(AsertRetargetTest, AsertClampBoundaryExact) {
+    const PogwRetargetParams top{64, 4};
+    for (uint64_t h = 0; h < 1000; ++h)
+        ASSERT_EQ(asert_pogw_bits(top, h), 64u);
+
+    // anchor=1, hl=4: bits = 1 + round((h-1)/4), clamped at 64.
+    const PogwRetargetParams low{1, 4};
+    EXPECT_EQ(asert_pogw_bits(low, 249), 63u); // shift 248: 62 exact -> 63
+    EXPECT_EQ(asert_pogw_bits(low, 250), 63u); // shift 249: 62.25 -> 62 -> 63
+    EXPECT_EQ(asert_pogw_bits(low, 253), 64u); // shift 252: 63 exact -> 64 (== max)
+    EXPECT_EQ(asert_pogw_bits(low, 254), 64u); // shift 253: 63.25 -> 63 -> 64
+    EXPECT_EQ(asert_pogw_bits(low, 255), 64u); // shift 254: 63.5 ties UP -> 65 -> clamped
+    // And the curve never dips back down.
+    for (uint64_t h = 2; h < 100000; ++h) {
+        const uint64_t bits = asert_pogw_bits(low, h);
+        ASSERT_GE(bits, asert_pogw_bits(low, h - 1));
+        ASSERT_LE(bits, 64u);
+    }
 }

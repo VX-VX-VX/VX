@@ -32,8 +32,11 @@ namespace vx::consensus {
 //      round_nearest_ties_up(delta(h)). Rounding the exponent BEFORE adding
 //      the anchor is exact, because the anchor is an integer and
 //      nearest-rounding commutes with adding an integer. Ties (r == half/2
-//      for even half-lives) round up, mirroring how Bitcoin's ASERT rounds
-//      its computed target into the compact encoding. Max deviation from the
+//      for even half-lives) round up. (Math-audit F9: this differs from
+//      Bitcoin's ASERT, which rounds the TARGET MANTISSA into its compact
+//      encoding — here the work lattice IS integer bits, so the exponent
+//      itself is what gets rounded; the choice is self-consistent per
+//      proof steps 1-3.) Max deviation from the
 //      real curve is 1/2 bit (floor or ceil would deviate by up to a full
 //      bit over each half-life cycle).
 //   4. The function is pure and deterministic: no timestamps, no cumulative
@@ -69,6 +72,40 @@ struct PogwRetargetParams {
 
 inline constexpr PogwRetargetParams POGW_MAINNET_RETARGET{
     blockchain::DEFAULT_POGW_DIFFICULTY_BITS, POGW_HALF_LIFE_BLOCKS};
+
+// -- Retarget parameter lock (BACKLOG 0.9 review finding F2) ------------------
+//
+// The anchor difficulty and half-life are CODE constants, not part of the
+// genesis frame: "same genesis" enforces nothing about them. A build that
+// changes either value silently computes a different difficulty curve and
+// forks from every other node with no visible disagreement — the worst
+// failure mode for a parameter that has no wire representation.
+//
+// The fingerprint pins the pair: it is derived from the parameter bytes and
+// asserted (static_assert here, EXPECT in the retarget test). Changing a
+// parameter MUST be a deliberate, announced consensus change that updates
+// both pins in the same commit — never a drive-by edit.
+inline constexpr uint64_t retarget_fingerprint(uint64_t anchor_bits,
+                                               uint64_t half_life_blocks) noexcept {
+    uint64_t h = 1469598103934665603ull; // FNV-1a 64
+    for (int i = 0; i < 8; ++i) {
+        h ^= (anchor_bits >> (8 * i)) & 0xffull;
+        h *= 1099511628211ull;
+    }
+    for (int i = 0; i < 8; ++i) {
+        h ^= (half_life_blocks >> (8 * i)) & 0xffull;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+inline constexpr uint64_t POGW_RETARGET_FINGERPRINT = retarget_fingerprint(
+    POGW_MAINNET_RETARGET.anchor_bits, POGW_MAINNET_RETARGET.half_life_blocks);
+
+static_assert(POGW_RETARGET_FINGERPRINT == 0xc45e282bf67c611aull,
+              "consensus-critical: ASERT anchor/half-life changed - this forks "
+              "every peer silently; announce the change and update the "
+              "fingerprint pin in the same commit");
 
 /// ASERT bits for height h (anchor fixed at genesis, height 0). Pure and
 /// deterministic, overflow-safe for any uint64_t height and half-life.

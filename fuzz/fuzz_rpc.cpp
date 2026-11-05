@@ -1,8 +1,8 @@
 // libFuzzer target: the JSON RPC surface.
 //
-// Byte 0 selects the HTTP method (real or garbage), byte 1 selects a path
-// from the live route table so inputs reach handler depth instead of
-// wandering into 404s, and the rest is the request body (4 KiB cap).
+// Byte 0 selects the HTTP method (real or garbage; 3 = raw-wire mode), byte 1
+// selects a path from the live route table so inputs reach handler depth
+// instead of wandering into 404s, and the rest is the request body (4 KiB cap).
 //
 // Invariants exercised per input:
 //  - no crash, no hang, no exception escaping HttpServer::route();
@@ -92,6 +92,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     }
 
     if (size < 2) return 0;
+
+    if (data[0] == 3) {
+        // Byte-level HTTP parser fuzzing (P2-2 follow-up): raw bytes go
+        // through the same scan_headers/request-line parser the socket path
+        // uses, then route(). GET invariance still holds: a request whose
+        // method line starts with "GET " must never move the tip.
+        std::string raw(reinterpret_cast<const char*>(data + 2),
+                        std::min<size_t>(size - 2, 8192));
+        uint8_t tip_before[32] = {};
+        uint8_t tip_after[32] = {};
+        const bool raw_is_get = (raw.compare(0, 4, "GET ") == 0);
+        if (raw_is_get) store->tip_hash(tip_before);
+        const auto res = server->route_raw(raw);
+        (void)res;
+        if (raw_is_get) {
+            store->tip_hash(tip_after);
+            if (std::memcmp(tip_before, tip_after, 32) != 0) __builtin_trap();
+        }
+        return 0;
+    }
 
     const uint8_t method_byte = data[0];
     std::string method;

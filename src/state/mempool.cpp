@@ -4,6 +4,7 @@
 #include "vx/math/tdi_filter.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <unordered_map>
 
 namespace vx::state {
@@ -46,6 +47,15 @@ bool Mempool::validate_pending_locked(const Transaction& tx, const U128& sender_
     // Check nonce
     auto nonce_it = pending_nonces_.find(sender);
     uint32_t expected_nonce = (nonce_it == pending_nonces_.end()) ? sender_nonce : nonce_it->second;
+
+    // Chain-nonce floor (security-review P1-1, defense in depth): a nonce
+    // the chain already consumed is stale no matter what the pending map
+    // says — pending state can be briefly rewound by an eviction inside the
+    // seal pull-window. Accepting a stale nonce would re-seal an applied tx
+    // and wedge block apply.
+    if (nonce < sender_nonce) {
+        return false;
+    }
 
     if (nonce != expected_nonce) {
         return false;
@@ -108,22 +118,58 @@ SubmitResult Mempool::submit(const Transaction& tx, const U128& sender_balance, 
         return result;
     }
 
+    // 3b. BACKLOG 0.10 pressure relief.
+    //
+    // Per-sender cap: the sender already holds MEMPOOL_MAX_TXS_PER_SENDER
+    // pending txs. Evict that sender's weakest suffix (lowest fee density,
+    // oldest admitted tie-break) so capacity is freed, then re-validate the
+    // incoming tx against the rewound chain. Because the rewound expected
+    // nonce is always BELOW the incoming next nonce, the incoming tx is
+    // refused; the wallet resubmits from the rewound expected nonce. The
+    // eviction - not the acceptance - is the point: a capped sender cannot
+    // grow its pending chain past the cap, and its weakest work is dropped.
+    Address sender = tx_address(tx.sender_nfa);
+    {
+        auto pc = pending_counts_.find(sender);
+        if (pc != pending_counts_.end() && pc->second >= MEMPOOL_MAX_TXS_PER_SENDER) {
+            const size_t victim = find_worst_sender_slot_locked(sender);
+            if (victim != SIZE_MAX) evict_suffix_locked(victim);
+            if (!validate_pending_locked(tx, sender_balance, sender_nonce)) {
+                result.error = "per-sender pending cap reached (256); weakest pending tx evicted, resubmit from the expected nonce";
+                return result;
+            }
+        }
+    }
+
     // 4. Claim the next slot. BACKLOG 0.14(b): slot claim, entry write and
     // count publication all happen under the pool mutex, with the entry
     // fully written BEFORE the count moves. The old find_slot() CAS bumped
     // count_ first, so a concurrent reader could observe the bumped count
     // and read a not-yet-written (default) entry.
-    const size_t slot = count_.load(std::memory_order_relaxed);
+    size_t slot = count_.load(std::memory_order_relaxed);
     if (slot >= MEMPOOL_MAX_TXS) {
-        result.error = "mempool full (16,384 tx limit)";
-        return result;
+        // Global pressure: the pool is at its hard cap. Evict the globally
+        // weakest entry (lowest fee density, oldest tie-break) only when the
+        // incoming tx outranks it - otherwise reject the incoming tx: the
+        // fee market must not churn the pool for work it ranks below.
+        const double incoming_priority = compute_priority(tx);
+        const size_t victim = find_worst_global_slot_locked(&sender);
+        if (victim == SIZE_MAX || !(incoming_priority > entries_[victim].priority)) {
+            result.error = "mempool full (16,384 tx limit)";
+            return result;
+        }
+        evict_suffix_locked(victim);
+        slot = count_.load(std::memory_order_relaxed);
+        if (slot >= MEMPOOL_MAX_TXS) {
+            result.error = "mempool full (16,384 tx limit)";
+            return result;
+        }
     }
 
     // 5. Compute priority
     double priority = compute_priority(tx);
     uint32_t fee = tx_fee_local(tx);
     uint32_t nonce = tx_nonce_local(tx);
-    Address sender = tx_address(tx.sender_nfa);
 
     // 6. Insert entry (complete before it becomes visible via count_)
     Entry& entry = entries_[slot];
@@ -138,11 +184,117 @@ SubmitResult Mempool::submit(const Transaction& tx, const U128& sender_balance, 
     // 7. Update pending state (same critical section as step 3)
     pending_outgoing_[sender] = pending_outgoing_[sender] + U128(amount + fee);
     pending_nonces_[sender] = nonce + 1;
+    ++pending_counts_[sender];
 
     result.ok = true;
     result.position = slot;
     result.projected_height = 0; // Will be set by caller
     return result;
+}
+
+// -- Eviction (BACKLOG 0.10) --------------------------------------------------
+// All three helpers REQUIRE pending_mutex_ to be held: they are called from
+// submit() inside its single critical section, so eviction, pending-state
+// rewind, compaction and the count update are atomic with respect to every
+// other mutation (0.14 discipline).
+
+size_t Mempool::find_worst_sender_slot_locked(const Address& sender) const noexcept {
+    const size_t cnt = count_.load(std::memory_order_relaxed);
+    size_t worst = SIZE_MAX;
+    for (size_t i = 0; i < cnt; ++i) {
+        if (!entries_[i].valid) continue;
+        if (std::memcmp(entries_[i].tx.sender_nfa, sender.data(), 42) != 0) continue;
+        // Strict '<' keeps the EARLIEST slot on equal priority = oldest
+        // admitted, the documented tie-break.
+        if (worst == SIZE_MAX || entries_[i].priority < entries_[worst].priority)
+            worst = i;
+    }
+    return worst;
+}
+
+size_t Mempool::find_worst_global_slot_locked(const Address* exclude_sender) const noexcept {
+    const size_t cnt = count_.load(std::memory_order_relaxed);
+    size_t worst = SIZE_MAX;
+    for (size_t i = 0; i < cnt; ++i) {
+        if (!entries_[i].valid) continue;
+        // Zero-trust review P1-2: never select the incoming sender's own
+        // entries as the global-pressure victim. evict_suffix_locked rewinds
+        // the WHOLE later-nonce chain of the victim's sender, but the
+        // incoming tx was validated against the pre-eviction pending state;
+        // evicting its own chain can strand the incoming nonce above the
+        // rewound expected nonce (a pending nonce hole that block-apply
+        // cannot drain — a seal-time livelock).
+        if (exclude_sender &&
+            std::memcmp(entries_[i].tx.sender_nfa, exclude_sender->data(), 42) == 0)
+            continue;
+        if (worst == SIZE_MAX || entries_[i].priority < entries_[worst].priority)
+            worst = i;
+    }
+    return worst;
+}
+
+void Mempool::evict_suffix_locked(size_t victim_slot) noexcept {
+    const size_t cnt = count_.load(std::memory_order_relaxed);
+    if (victim_slot >= cnt || !entries_[victim_slot].valid) return;
+
+    const Address sender = tx_address(entries_[victim_slot].tx.sender_nfa);
+    const uint32_t victim_nonce = entries_[victim_slot].sender_nonce;
+    size_t prior_count = 0;
+    if (const auto pc = pending_counts_.find(sender); pc != pending_counts_.end())
+        prior_count = pc->second;
+
+    // Evict the victim and every later-nonce entry of the same sender.
+    // Compaction preserves admission order, so same-sender entries at slots
+    // >= victim_slot are exactly the sender's nonces >= victim_nonce (the
+    // nonce < victim_nonce guard is a defensive invariant check, not logic).
+    size_t evicted = 0;
+    for (size_t i = victim_slot; i < cnt; ++i) {
+        if (!entries_[i].valid) continue;
+        if (std::memcmp(entries_[i].tx.sender_nfa, sender.data(), 42) != 0) continue;
+        if (entries_[i].sender_nonce < victim_nonce) continue;
+
+        const U128 cost = entries_[i].amount + entries_[i].fee;
+        auto out_it = pending_outgoing_.find(sender);
+        if (out_it != pending_outgoing_.end()) {
+            if (out_it->second >= cost) {
+                out_it->second = out_it->second - cost;
+            } else {
+                // The reserve is below the entry's cost: books have drifted.
+                // Clamp (fail-safe) but say so — silent under-reserve would
+                // let validate_pending admit submits against earmarked
+                // funds and resurface as seal-time apply failures.
+                std::fputs("mempool: pending_outgoing_ underflow (invariant violation)\n",
+                           stderr);
+                out_it->second = U128{0};
+            }
+            if (out_it->second.is_zero()) pending_outgoing_.erase(out_it);
+        }
+        entries_[i].valid = false;
+        ++evicted;
+    }
+    if (evicted == 0) return;
+
+    const size_t remaining = (prior_count > evicted) ? (prior_count - evicted) : 0;
+    if (remaining == 0) {
+        pending_nonces_.erase(sender);
+        pending_counts_.erase(sender);
+    } else {
+        // The chain now ends just below the victim: the next expected nonce
+        // is the victim's nonce, so a resubmission of it revalidates.
+        pending_nonces_[sender] = victim_nonce;
+        pending_counts_[sender] = remaining;
+    }
+
+    // Compact the array (move valid entries to front), same pass as
+    // remove_sealed, then publish the new count.
+    size_t write_idx = 0;
+    for (size_t i = 0; i < cnt; ++i) {
+        if (entries_[i].valid) {
+            if (write_idx != i) entries_[write_idx] = entries_[i];
+            ++write_idx;
+        }
+    }
+    count_.store(write_idx, std::memory_order_release);
 }
 
 MempoolStats Mempool::stats() const noexcept {
@@ -309,6 +461,11 @@ void Mempool::remove_sealed(const std::vector<Transaction>& sealed_txs) noexcept
                     if (pending_it->second >= U128(amount + fee)) {
                         pending_it->second = pending_it->second - U128(amount + fee);
                     } else {
+                        // Books drifted below the sealed cost: clamp fail-safe
+                        // but keep the invariant violation visible (see the
+                        // twin clamp in evict_suffix_locked).
+                        std::fputs("mempool: pending_outgoing_ underflow (invariant violation)\n",
+                                   stderr);
                         pending_it->second = U128{0};
                     }
                     if (pending_it->second.is_zero()) {
@@ -316,12 +473,41 @@ void Mempool::remove_sealed(const std::vector<Transaction>& sealed_txs) noexcept
                     }
                 }
 
-                // Reset pending nonce to the next expected value
-                pending_nonces_[sender] = entries_[i].sender_nonce + 1;
+                // Reset pending nonce to the next expected value (monotone:
+                // a lower out-of-order entry must never rewind the floor).
+                {
+                    const uint32_t want = entries_[i].sender_nonce + 1;
+                    auto& cur = pending_nonces_[sender];
+                    if (cur < want) cur = want;
+                }
+
+                // BACKLOG 0.10: keep the per-sender pending count consistent
+                auto pc = pending_counts_.find(sender);
+                if (pc != pending_counts_.end()) {
+                    if (pc->second > 0) --pc->second;
+                    if (pc->second == 0) pending_counts_.erase(pc);
+                }
 
                 // Invalidate entry
                 entries_[i].valid = false;
             }
+        }
+    }
+
+    // Security-review fix (stage_C round 2, P1-1): a tx pulled for sealing
+    // but evicted before remove_sealed (the pull window) leaves NO entry to
+    // adjust, yet the chain just consumed its nonce. Advance every sealed
+    // sender's expected nonce to at least max(sealed nonce)+1 even when the
+    // pool no longer holds the entry — the eviction rewound pending state
+    // must never end up BELOW the chain nonce, or honest resubmissions are
+    // refused while stale nonces pass and wedge block apply.
+    for (const auto& key : sealed_set) {
+        const uint32_t want = key.nonce + 1;
+        auto pn = pending_nonces_.find(key.sender);
+        if (pn == pending_nonces_.end()) {
+            pending_nonces_[key.sender] = want;
+        } else if (pn->second < want) {
+            pn->second = want;
         }
     }
 
@@ -344,6 +530,7 @@ void Mempool::clear() noexcept {
     std::lock_guard<std::mutex> lock(pending_mutex_);
     pending_outgoing_.clear();
     pending_nonces_.clear();
+    pending_counts_.clear();
 
     const size_t cnt = count_.load(std::memory_order_relaxed);
     for (size_t i = 0; i < cnt; ++i) {

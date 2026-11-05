@@ -120,6 +120,17 @@ public:
     // the whole node).
     HttpResponse route(const HttpRequest& req);
 
+    // Parse a raw wire request (method line + headers + body) and route it.
+    // Same header parser as the socket path; exists so the tests and the RPC
+    // fuzzer can drive the byte-level HTTP parser directly (see scan_headers).
+    HttpResponse route_raw(const std::string& raw);
+
+    // The shared header scanner (socket path + route_raw): line-start exact
+    // header names, first Content-Length wins, duplicate Authorization fails
+    // closed. Public static so the framing rules are directly testable.
+    static void scan_headers(const std::string& raw, size_t header_end,
+                             size_t& content_length, HttpRequest& req);
+
     // Bind the VX60 P2P listener, register the block-relay hook and connect
     // to the given static peers (HOST:PORT each). Safe to call with no peers;
     // a failed bind only logs and leaves the node RPC-only.
@@ -221,8 +232,24 @@ private:
     static std::string hex_bytes(const uint8_t* data, size_t n);
     static std::string format_vx(uint64_t atomics);
 
+    // -- RPC auth (BACKLOG 0.10) --------------------------------------------
+    // Mutating endpoints (see is_mutating_endpoint) require the auth token,
+    // read ONCE at construction from VX_RPC_TOKEN or VX_RPC_TOKEN_FILE.
+    // Resource-heavy endpoints (see is_resource_heavy_endpoint) share the
+    // same fail-closed gate. Fail closed: no token configured -> every
+    // endpoint in either class answers 401; plain read-only endpoints stay
+    // open. The comparison is constant-time.
+    static bool is_mutating_endpoint(const HttpRequest& req) noexcept;
+    static bool is_resource_heavy_endpoint(const HttpRequest& req) noexcept;
+    static bool constant_time_equal(std::string_view a, std::string_view b) noexcept;
+    bool token_ok(const HttpRequest& req) const;
+
     // Path normalization helper
     std::string normalize_path(const std::string& path);
+
+    // Auth token state (never logged, never echoed back).
+    std::string auth_token_;
+    bool auth_enabled_ = false;
 
     storage::BlockStore& store_;
     state::LedgerState& ledger_;

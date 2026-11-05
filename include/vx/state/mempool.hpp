@@ -22,6 +22,12 @@ using core::U128;
 /// Maximum mempool capacity (16,384 transactions = ~1.8 MB)
 inline constexpr size_t MEMPOOL_MAX_TXS = 16384;
 
+/// BACKLOG 0.10: per-sender pending cap. One address may hold at most this
+/// many pending transactions. When a capped sender submits another tx, the
+/// pool relieves the pressure by evicting that sender's weakest entry
+/// (lowest fee density, oldest admitted tie-break) - see submit().
+inline constexpr size_t MEMPOOL_MAX_TXS_PER_SENDER = 256;
+
 /// Result of submitting a transaction to the mempool
 struct SubmitResult {
     bool ok = false;
@@ -72,6 +78,18 @@ double mev_pair_energy(const Transaction& a, const Transaction& b) noexcept;
  * mutation are guarded by one pool mutex; an entry is fully written
  * before the count reflects it. count()/empty() are lock-free approximate
  * hints (relaxed atomic loads), not a consistent snapshot.
+ *
+ * Eviction (BACKLOG 0.10): pressure comes in two shapes - a sender at
+ * MEMPOOL_MAX_TXS_PER_SENDER and a pool at MEMPOOL_MAX_TXS. The victim is
+ * always the lowest fee-density (priority) entry, oldest-admitted
+ * tie-break. Evicting a mid-chain nonce would strand the sender's higher
+ * nonces behind a gap and the sealed block would fail the ledger's nonce
+ * gate again (the BACKLOG 0.14 livelock), so an eviction removes the
+ * victim AND every later nonce of the same sender (the suffix) and rewinds
+ * the sender's pending nonce to the victim. A capped sender's incoming tx
+ * is therefore refused after the relief; the wallet resubmits from the
+ * rewound expected nonce. An evicted tx can never reappear in a pull: it
+ * is gone from the pool when the critical section ends.
  */
 class Mempool {
 public:
@@ -140,6 +158,9 @@ private:
     mutable std::mutex pending_mutex_;
     std::unordered_map<Address, U128, AddressHash> pending_outgoing_;
     std::unordered_map<Address, uint32_t, AddressHash> pending_nonces_;
+    // Per-sender pending entry count (BACKLOG 0.10 cap input). Maintained
+    // alongside the other pending state inside the same critical sections.
+    std::unordered_map<Address, size_t, AddressHash> pending_counts_;
 
     // Compute TDI-based priority for a transaction
     double compute_priority(const Transaction& tx) const noexcept;
@@ -149,6 +170,18 @@ private:
     // must be ONE critical section, otherwise two concurrent submits of
     // the same nonce both pass the check before either reserves (TOCTOU).
     bool validate_pending_locked(const Transaction& tx, const U128& sender_balance, uint32_t sender_nonce) const noexcept;
+
+    // -- Eviction (BACKLOG 0.10) - all REQUIRE pending_mutex_ held ----------
+    // Slot of the sender's weakest pending entry (lowest priority; strict
+    // '<' keeps the earliest slot on ties = oldest admitted). SIZE_MAX if
+    // the sender holds nothing.
+    size_t find_worst_sender_slot_locked(const Address& sender) const noexcept;
+    // Same over the whole pool (global pressure victim).
+    size_t find_worst_global_slot_locked(const Address* exclude_sender = nullptr) const noexcept;
+    // Evict `victim_slot` and every later-nonce entry of the same sender
+    // (contiguity rule), rewind that sender's pending nonce/counts, subtract
+    // evicted amounts from the pending balance and compact the entry array.
+    void evict_suffix_locked(size_t victim_slot) noexcept;
 };
 
 } // namespace vx::state

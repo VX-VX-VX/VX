@@ -15,9 +15,11 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <unistd.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/sendfile.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <cerrno>
@@ -912,15 +914,80 @@ std::vector<uint8_t> handshake_payload(uint64_t height, uint64_t work, const uin
 
 } // anonymous namespace
 
+// Zero-trust review P2-4: the split-brain sandbox must be owner-private and
+// must not outlive the simulation. 0700 on create (regardless of umask) and
+// remove_all on every exit path — early returns, exceptions, success.
+class TempDirGuard {
+public:
+    explicit TempDirGuard(std::string path) : path_(std::move(path)) {}
+    ~TempDirGuard() {
+        if (armed_) {
+            std::error_code ec;
+            std::filesystem::remove_all(path_, ec);
+        }
+    }
+    TempDirGuard(const TempDirGuard&) = delete;
+    TempDirGuard& operator=(const TempDirGuard&) = delete;
+    const std::string& path() const { return path_; }
+private:
+    std::string path_;
+    bool armed_ = true;
+};
+
 SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
     SplitBrainReport report;
     const auto t0 = std::chrono::steady_clock::now();
 
     try {
-        const std::string base =
-            (std::filesystem::temp_directory_path() / "vx_split_brain").string();
-        std::filesystem::remove_all(base);
-        std::filesystem::create_directories(base);
+        // Zero-trust review P2-3: a FIXED "<tmp>/vx_split_brain" is a
+        // symlink-plant target — another process can pre-create the path as
+        // a symlink and redirect the simulator's ledger writes, or race the
+        // remove/create window. Use a per-process directory, refuse a
+        // planted symlink, and create the final component EXCLUSIVELY so a
+        // racing plant loses.
+        const std::string base = (std::filesystem::temp_directory_path() /
+            ("vx_split_brain-" + std::to_string(static_cast<long>(::getpid()))))
+            .string();
+        std::error_code fs_ec;
+        const auto st = std::filesystem::symlink_status(base, fs_ec);
+        if (!fs_ec && st.type() == std::filesystem::file_type::symlink) {
+            report.error = "split-brain temp dir is a planted symlink; refusing";
+            return report;
+        }
+        std::filesystem::remove_all(base, fs_ec); // stale leftovers of this pid
+        fs_ec.clear();
+        const bool created = std::filesystem::create_directory(base, fs_ec);
+        if (fs_ec || !created) {
+            // A real error, or the path already existed again (raced plant):
+            // refuse rather than write into an attacker-chosen directory.
+            report.error = "split-brain temp dir could not be created exclusively: " + fs_ec.message();
+            return report;
+        }
+        // P2-4: owner-private sandbox regardless of umask — and round-2
+        // review hardening: chmod via an O_NOFOLLOW directory fd (a symlink
+        // swap between create and chmod would otherwise be followed), with
+        // an inode identity check so a swapped path is refused, not chmodded
+        // into an attacker-chosen target.
+        fs_ec.clear();
+        const int dirfd = ::open(base.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (dirfd < 0) {
+            report.error = "split-brain temp dir vanished or is a symlink (race refused)";
+            std::filesystem::remove_all(base, fs_ec);
+            return report;
+        }
+        struct stat fd_sb{};
+        struct stat path_sb{};
+        const bool identity_ok = ::fstat(dirfd, &fd_sb) == 0 &&
+                                 ::stat(base.c_str(), &path_sb) == 0 &&
+                                 S_ISDIR(fd_sb.st_mode) && fd_sb.st_ino == path_sb.st_ino;
+        if (!identity_ok || ::fchmod(dirfd, 0700) != 0) {
+            report.error = "split-brain temp dir identity check or chmod 0700 failed";
+            ::close(dirfd);
+            std::filesystem::remove_all(base, fs_ec);
+            return report;
+        }
+        ::close(dirfd);
+        TempDirGuard sandbox(base); // removes the tree on every exit path
 
         const std::string genesis_path = "genesis.bin";
         try {

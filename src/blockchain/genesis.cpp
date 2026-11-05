@@ -206,9 +206,14 @@ const std::vector<PqSeedBinding>& pq_seed_bindings() {
         v.push_back(genesis_bind);
 
         // 2. Demo spender (Address #2): bound to the PUBLIC demo spender
-        // key. The demo/testnet key is published test data (the demo signs
-        // with it); the binding exists so the PQ authorization path is
-        // exercised end-to-end by the demo, the RPC and the cookbook.
+        // key. The binding table is CONSENSUS DATA and must be unconditional
+        // (zero-trust review P1-1: an #ifdef here splits validation between
+        // demo and production builds). The demo/testnet key is published
+        // test data; a binding is not a key — "holding the key IS holding
+        // the address", so pinning the address root authorizes nothing by
+        // itself. The signing path stays gated in production: the RPC demo
+        // signer is compiled out under VX_DEMO_KEYS=OFF (http_server.cpp),
+        // and no secret key material lives in this repository.
         std::array<uint8_t, 32> demo_sk{};
         VortexSponge256::compute(reinterpret_cast<const uint8_t*>("VX_DEMO_SPENDER_SK_V1"), 21,
                                  demo_sk.data());
