@@ -197,6 +197,82 @@ std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
     return level[0];
 }
 
+// ── Tree rollover (BACKLOG 1.5, v0.0.13) ─────────────────────────────────────
+
+std::array<uint8_t, 32> xmss_root_tree(const std::array<uint8_t, 32>& master_sk,
+                                       const std::array<uint8_t, 32>& pub_seed,
+                                       uint32_t tree_index) noexcept {
+    const uint32_t window_base = tree_index << XMSS_H;
+    std::array<std::array<uint8_t, 32>, XMSS_LEAVES> level{};
+    for (size_t j = 0; j < XMSS_LEAVES; ++j) {
+        level[j] = wots_leaf_pk_root(window_base | static_cast<uint32_t>(j),
+                                     master_sk, pub_seed);
+    }
+    size_t count = XMSS_LEAVES;
+    uint8_t lvl = 0;
+    while (count > 1) {
+        const size_t next = (count + 1) / 2;
+        for (size_t i = 0; i < next; ++i) {
+            const size_t l = i * 2;
+            const size_t r = (l + 1 < count) ? l + 1 : l; // odd node duplicates itself
+            level[i] = xmss_node_hash(lvl, static_cast<uint16_t>(l), pub_seed,
+                                      level[l], level[r]);
+        }
+        count = next;
+        ++lvl;
+    }
+    return level[0];
+}
+
+std::array<uint8_t, 32> rollover_binding_digest(
+    const std::array<uint8_t, 32>& old_root, uint32_t from_tree, uint32_t to_tree,
+    const std::array<uint8_t, 32>& new_root) noexcept {
+    PreimageBuf p; // 17 + 32 + 4 + 4 + 32 = 89 bytes, fits
+    p.put_str("VX_PQ_ROLLOVER_V1", 17);
+    p.put(old_root.data(), 32);
+    p.put_u32(from_tree);
+    p.put_u32(to_tree);
+    p.put(new_root.data(), 32);
+    std::array<uint8_t, 32> out{};
+    sponge(p.b.data(), p.n, out.data());
+    return out;
+}
+
+PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32>& master_sk,
+                                    uint32_t from_tree, uint32_t to_tree) noexcept {
+    if (from_tree == to_tree) return PqSignatureWitness{}; // binds nothing
+    if (from_tree > PQ_MAX_SUBTREE_INDEX || to_tree > PQ_MAX_SUBTREE_INDEX) {
+        return PqSignatureWitness{}; // outside the global-leaf namespace
+    }
+    // The account mask seed, derived exactly as pq_sign_transaction does:
+    // every window lives under the same pub_seed, only the leaf window moves.
+    const auto pub_seed = pub_seed_from_sk(master_sk);
+    const auto old_root = xmss_root_tree(master_sk, pub_seed, from_tree);
+    const auto new_root = xmss_root_tree(master_sk, pub_seed, to_tree);
+    const auto msg = rollover_binding_digest(old_root, from_tree, to_tree, new_root);
+    return pq_sign_message(PQ_ROLLOVER_CERT_LEAF, from_tree, master_sk, pub_seed, msg);
+}
+
+bool pq_verify_rollover(const std::array<uint8_t, 32>& old_root, uint32_t from_tree,
+                        uint32_t to_tree, const std::array<uint8_t, 32>& new_root,
+                        const PqSignatureWitness& cert) noexcept {
+    if (from_tree == to_tree) return false;
+    // Certificate policy: the LAST leaf of the old tree vouches for the new
+    // root. Pinned here so a certificate by any other leaf is refused before
+    // any hash work (and independently of the witness commitment).
+    if (cert.leaf_index != PQ_ROLLOVER_CERT_LEAF) return false;
+    if (cert.subtree_index != from_tree) return false;
+    // The certifying tree IS the old tree: its published root must equal the
+    // root the caller is rotating away from.
+    if (!vx::core::ct_equal(cert.pq_pubkey_root.data(), old_root.data(), 32)) return false;
+    // Transported commitment must match the certificate content (the
+    // witness_digest field is attacker-writable on the wire).
+    const auto recomputed = witness_commitment(cert);
+    if (!vx::core::ct_equal(cert.witness_digest.data(), recomputed.data(), 32)) return false;
+    const auto msg = rollover_binding_digest(old_root, from_tree, to_tree, new_root);
+    return pq_verify_wots_xmss(msg, cert);
+}
+
 // ── Sign / verify ────────────────────────────────────────────────────────────
 
 namespace {
@@ -233,9 +309,16 @@ PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
     w.leaf_index = leaf_idx;
     w.subtree_index = subtree_index;
     w.pub_seed = pub_seed;
-    w.pq_pubkey_root = xmss_root(master_sk, pub_seed);
 
-    const uint32_t global_leaf = (subtree_index << XMSS_H) | leaf_idx;
+    // The window this witness lives in: the signature draws its secret
+    // chains from global_leaf = (subtree_index << H) | leaf_idx, so the
+    // published root and the auth path must span the SAME window's leaves
+    // (rollover coherence, BACKLOG 1.5; window 0 is byte-identical with the
+    // frozen pre-rollover behavior).
+    const uint32_t window_base = subtree_index << XMSS_H;
+    w.pq_pubkey_root = xmss_root_tree(master_sk, pub_seed, subtree_index);
+
+    const uint32_t global_leaf = window_base | leaf_idx;
     uint8_t b[WOTS_CHAINS];
     wots_base_vector(msg.data(), b);
 
@@ -250,10 +333,13 @@ PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
         w.wots_sig[i] = chain_run(sk[i], 0, b[i], pub_seed, static_cast<uint16_t>(i));
     }
 
-    // Auth path: rebuild the tree from all leaves, collect H siblings.
+    // Auth path: rebuild the window's tree from its leaves, collect H
+    // siblings. Leaves are addressed in the global namespace so the signed
+    // leaf is one of them.
     std::array<std::array<uint8_t, 32>, XMSS_LEAVES> level{};
     for (size_t j = 0; j < XMSS_LEAVES; ++j) {
-        level[j] = wots_leaf_pk_root(static_cast<uint32_t>(j), master_sk, pub_seed);
+        level[j] = wots_leaf_pk_root(window_base | static_cast<uint32_t>(j),
+                                     master_sk, pub_seed);
     }
     size_t count = XMSS_LEAVES;
     size_t idx = leaf_idx;
@@ -403,12 +489,14 @@ bool pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_
     const uint32_t leaf_idx = nonce & 0xF;
     const uint32_t subtree_index = nonce >> XMSS_H;
 
-    // Subtree guard: tree rollover is not implemented. The published root
-    // covers exactly the first tree (subtree 0, leaves 0..15); a nonce
-    // above 15 derives the secret WOTS leaf from a subtree the root does
-    // not span — a signature that can never verify while still burning a
-    // one-time leaf. Refuse before reserving anything (external review
-    // finding; see VERIFICATION_EVIDENCE changelog).
+    // Window guard: the crypto layer now supports coherent rollover trees
+    // (v0.0.13, BACKLOG 1.5) — but the consensus-layer acceptance policy for
+    // a rotated root (certification-chain verification against the
+    // account's published window-0 root) is NOT wired into any rule yet.
+    // Until it is, a transaction whose nonce names a window above 0 would
+    // emit a witness under a root no consensus rule can attribute to this
+    // account — still fail-closed. Refuse before reserving anything
+    // (external review finding; see VERIFICATION_EVIDENCE changelog).
     if (subtree_index != 0) return false;
 
     // 4a. One-time-leaf lifecycle: reserve before any signing work. `root`

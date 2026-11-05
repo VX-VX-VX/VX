@@ -101,9 +101,78 @@ std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
 /// PQ binding) without signing anything.
 std::array<uint8_t, 32> pub_seed_from_sk(const std::array<uint8_t, 32>& sk) noexcept;
 
+// ── Tree rollover (BACKLOG 1.5, delivered v0.0.13) ──────────────────────────
+//
+// The account's master key spans ONE flat WOTS+ hypertree with a 32-bit
+// global leaf namespace: global_leaf = (tree_index << XMSS_H) | leaf_idx.
+// Window 0 (leaves 0..15) is the published account key with the FROZEN
+// derivation — for tree_index 0 every value below is byte-identical with
+// the pre-rollover behavior. Tree rollover advances the account to the
+// NEXT 16-leaf window: xmss_root_tree(master_sk, pub_seed, t) is the root
+// over global leaves (t<<4)|0..(t<<4)|15, derived from the same master key
+// and mask seed, so windows share no leaves and no roots.
+//
+// The 2376-byte witness stays frozen: pq_sign_message now builds the root
+// and auth path over the SAME global-leaf window its signature draws the
+// secret chains from (previously it signed window-t leaves against a
+// window-0 tree — the incoherence that forced the nonce>15 refusal), and
+// pq_verify_wots_xmss needs no change: it walks the auth path inside the
+// transported root's window using leaf_index & 0xF.
+//
+// Binding windows to ONE account without growing the witness uses the
+// XMSS^MT certification construction: the LAST leaf (15) of window t signs
+// a rollover certificate over window u's root. A verifier chains
+// certificates from the account's published root (window 0); the
+// certificate burns leaf 15 of the old window exactly like a transaction
+// leaf (reserve it in the PqLeafLedger under the old root). After a
+// rollover out of window t, that window is fully spent and MUST NOT sign
+// again — enforcing that policy at the wallet/consensus layer is the
+// remaining BACKLOG 1.5 item (together with the acceptance policy for a
+// rotated root, which today is NOT wired into any consensus rule).
+//
+// Leaf-namespace capacity: the top XMSS_H bits of global_leaf are the leaf
+// itself, so the valid tree_index domain is 0..PQ_MAX_SUBTREE_INDEX.
+inline constexpr uint32_t PQ_MAX_SUBTREE_INDEX =
+    static_cast<uint32_t>(0xFFFFFFFFu) >> XMSS_H; // 0x0FFFFFFF
+
+// The certificate leaf: the LAST leaf of the certifying window.
+inline constexpr unsigned PQ_ROLLOVER_CERT_LEAF = XMSS_LEAVES - 1; // leaf 15
+
+// Root of window t — the PQ public key a rollover certificate publishes for
+// the target window. Equals xmss_root() for t == 0 (frozen epoch 0).
+std::array<uint8_t, 32> xmss_root_tree(const std::array<uint8_t, 32>& master_sk,
+                                       const std::array<uint8_t, 32>& pub_seed,
+                                       uint32_t tree_index) noexcept;
+
+// M = Sponge256("VX_PQ_ROLLOVER_V1" || old_root[32] || u32(from_tree)
+//               || u32(to_tree) || new_root[32]) — 32 bytes.
+std::array<uint8_t, 32> rollover_binding_digest(
+    const std::array<uint8_t, 32>& old_root, uint32_t from_tree, uint32_t to_tree,
+    const std::array<uint8_t, 32>& new_root) noexcept;
+
+// Signs the rollover certificate window from_tree -> to_tree: a full
+// PqSignatureWitness by leaf 15 of window from_tree over the binding
+// digest, with the account mask seed derived exactly as
+// pq_sign_transaction derives it ("VX_PQ_PUBSEED_V1" || master_sk).
+// Refuses from_tree == to_tree or any index beyond PQ_MAX_SUBTREE_INDEX
+// by returning a default witness whose verification fails.
+PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32>& master_sk,
+                                    uint32_t from_tree, uint32_t to_tree) noexcept;
+
+// Verifies a rollover certificate end-to-end: the leaf and window policy
+// (leaf 15 of from_tree), the certificate root equals old_root, the
+// transported witness commitment matches the content, and the WOTS+/XMSS
+// chain verifies over the binding digest of THIS (old_root, from, to,
+// new_root) tuple. Fail-closed: any disagreement refuses.
+bool pq_verify_rollover(const std::array<uint8_t, 32>& old_root, uint32_t from_tree,
+                        uint32_t to_tree, const std::array<uint8_t, 32>& new_root,
+                        const PqSignatureWitness& cert) noexcept;
+
 // ── Sign / verify ────────────────────────────────────────────────────────────
-// Signs `msg` with leaf `leaf_idx` of subtree 0's tree shape; fills the whole
-// witness including pq_pubkey_root and witness_digest.
+// Signs `msg` with leaf `leaf_idx` of the tree whose key material is
+// (master_sk, pub_seed); fills the whole witness including pq_pubkey_root
+// and witness_digest. For rollover trees pass tree_sk/tree_pub_seed — the
+// witness is then coherent inside THAT tree (see the rollover section).
 PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
                                    const std::array<uint8_t, 32>& master_sk,
                                    const std::array<uint8_t, 32>& pub_seed,

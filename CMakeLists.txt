@@ -233,6 +233,8 @@ target_link_libraries(test_chaos_fuzzer PRIVATE vx_core gtest gtest_main)
 # Post-Quantum hash-based signature engine (WOTS+/XMSS) test suite (Phase 46, test #16)
 add_executable(test_pq_signatures tests/test_pq_signatures.cpp)
 target_link_libraries(test_pq_signatures PRIVATE vx_core gtest gtest_main)
+add_executable(test_pq_rollover tests/test_pq_rollover.cpp)
+target_link_libraries(test_pq_rollover PRIVATE vx_core)
 
 # ASERT PoGW difficulty retarget test suite (BACKLOG 0.9 remainder)
 add_executable(test_retarget tests/test_retarget.cpp)
@@ -267,7 +269,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_chain_stress test_boundary_torture test_crash_torture
             test_rpc_auth test_key_import
             test_apply_integrity test_mempool_admission test_fold_window
-            test_sponge512 test_attractor_degeneracy)
+            test_sponge512 test_attractor_degeneracy test_pq_rollover)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -292,6 +294,7 @@ add_test(NAME VortexGqcRingStealthTest COMMAND test_gqc_ring_stealth)
 add_test(NAME VortexVaultHtlcTest COMMAND test_vault_htlc)
 add_test(NAME VortexChaosFuzzerTest COMMAND test_chaos_fuzzer)
 add_test(NAME VortexPqSignatureTest COMMAND test_pq_signatures)
+add_test(NAME VortexPqRolloverTest COMMAND test_pq_rollover)
 add_test(NAME VortexRetargetTest COMMAND test_retarget)
 add_test(NAME VortexReorgCarouselTest COMMAND test_reorg_carousel)
 add_test(NAME VxBifurcationOracleTest COMMAND test_bifurcation)

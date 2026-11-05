@@ -788,18 +788,52 @@ VortexSponge256 and the attractor round function.
 - Acceptance: no exploitable bias found, or one found and fixed — either
   way the report is public.
 
-### 1.5 XMSS tree rollover (gated today)
+### 1.5 XMSS tree rollover (crypto layer DELIVERED v0.0.13; consensus wiring open)
 
-`pq_sign_transaction` refuses any nonce above 15 (subtree guard, external
+`pq_sign_transaction` refuses any nonce above 15 (window guard, external
 review finding): the published root covers exactly the first 16-leaf
 tree, and a nonce above 15 would derive the secret WOTS leaf from a
-subtree the root does not span — an unverifiable signature that still
-burns a ledger leaf. Refusal is fail-closed; TEST 9 pins it
+window the root does not span — an unverifiable signature that still
+burns a ledger leaf. Refusal stays fail-closed; TEST 9 pins it
 (nonces 0/15 sign+verify; 16/17/255/UINT32_MAX refuse, zero burns).
 
-- [ ] Design tree rollover (XMSS multi-tree: top tree over subtree roots,
-  per-subtree roots published with the witness).
-- [ ] Re-test witness size and verification cost at the target height.
+Delivered v0.0.13 (flat-hypertree design, superseding the draft
+"top tree over subtree roots" sketch — the 2376-byte witness is frozen,
+so a top-tree auth path cannot fit):
+
+- **Flat WOTS+ hypertree**: one master key, one account mask seed,
+  32-bit global leaf namespace `global_leaf = (window << 4) | leaf`.
+  `pq_sign_message` now builds the witness root and auth path over the
+  SAME window its secret chains come from — the pre-rollover code signed
+  window-t leaves against a window-0 tree (the incoherence behind the
+  guard). Window 0 is byte-identical with the frozen derivation
+  (pinned by the full existing PQ suite).
+- **`xmss_root_tree(master_sk, pub_seed, t)`** — root over global leaves
+  `(t<<4)|0..15`; the PQ public key a rollover publishes for window t.
+- **Rollover certificates (XMSS^MT construction)**: leaf 15 of window t
+  signs `Sponge("VX_PQ_ROLLOVER_V1" || old_root || u32(from) ||
+  u32(to) || new_root)`; `pq_sign_rollover` / `pq_verify_rollover` are
+  fail-closed (leaf-15 policy checked independently of the witness
+  commitment, commitment recomputed, ct_equal on roots, self-certs and
+  out-of-namespace indexes refused). A certificate burns leaf 15 of the
+  old window exactly like a transaction leaf (leaf-ledger reserve).
+- **Verification cost**: a rollover link verifies in one WOTS+ envelope
+  — 0.23 ms measured; witness size unchanged at 2376 B (static_assert).
+
+Remaining (honest gaps, not hidden):
+
+- [ ] Consensus wiring: a rule for WHEN a rotated root is accepted
+  (certificate chain from the account's published window-0 root,
+  sequential-window policy, replay/rollback of certificates). Today
+  `PqWitnessRegistry` overwrites `sender_roots_` on every registration —
+  root rotation is silently accepted, which the certification chain must
+  replace.
+- [ ] Wallet policy: when to roll over (window exhaustion), certificate
+  publication/relay, and burning leaf 15 in the ledger at rollover time.
+- [ ] `pq_sign_message` still accepts `subtree_index` values whose
+  `window << 4` wraps (t > 0x0FFFFFFF) — the rollover API refuses them,
+  but the raw primitive trusts its caller; a fail-closed clamp belongs
+  to the same consensus-wiring pass.
 
 ---
 
