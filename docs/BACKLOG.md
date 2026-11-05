@@ -1143,6 +1143,18 @@ the block itself, so witnesses necessarily travel out-of-band today.
 - [ ] Audit apply_remote_frame: what happens when a block arrives whose
   PQ-backed senders' witnesses have NOT arrived (or arrive late)?
   Is the block admitted, rejected, or parked pending witnesses?
+  VERIFIED 2026-11-05: a missing witness makes verify_transaction_proof
+  fail Tier 1 → apply_block refuses → rollback_last_append → the block
+  is REJECTED (fail-closed, never admitted witness-less) — but the
+  failure mode is a liveness stall, and the NEW-sender case looks
+  unserveable: `sender_roots_` is fed ONLY by tx-verified local
+  registrations (round-7 rule: wire registrations must not flip a
+  sender into the PQ class), so a remote sender's FIRST transaction
+  arrives with no binding at all → Tier 2 rejects unbound user
+  senders → every remote block containing a brand-new PQ sender is
+  rejected until that sender registers locally. Needs a designed
+  first-seen binding path (e.g., block-carried witness registration
+  bound to the accepted block) rather than an accidental stall.
 - [ ] Add a witness_merkle_root to the block header (a wire/tag change
   — needs a versioned format bump, never a silent swap) so a node can
   demand the exact witness set the proposer committed to; a peer that
