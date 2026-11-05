@@ -236,13 +236,15 @@ frame and rejects torn tails.
   pinned by test `GqcQuorumForgeableFromPublicDataOnly`. VX claims NO
   cryptographic finality until BACKLOG 0.4/2.4 ships.)*
 
-### Vortex VM — Landauer thermodynamic gas
+### Vortex VM — deterministic gas with a thermodynamic cost model
 
-Every opcode pays a metered cost derived from the **Landauer limit** —
-kT·ln 2 per irreversible bit erasure — measured against the VM's live
-register/stack entropy snapshot, not against a static gas price table. The
-same engine hosts the HTLC acts digest (preimage hashing over GF(2⁸) shared
-with the Galois trie).
+Every opcode pays a metered cost shaped after the **Landauer limit** —
+kT·ln 2 per irreversible bit erasure — computed deterministically from
+the VM's live register/stack snapshots (base opcode cost for every
+opcode, plus a scaled term per 1→0 bit transition), not measured as
+physical heat: the metering is integer arithmetic, identical on every
+validator. The same engine hosts the HTLC acts digest (preimage hashing
+over GF(2⁸) shared with the Galois trie).
 
 ### Swarm P2P — the VX60 wire protocol
 
@@ -493,7 +495,7 @@ point is that it is *public*.
 
 ## Test suite
 
-16 ctest targets; all pass in **both** build editions:
+31 ctest entries; all pass in **both** build editions:
 
 | Target | Coverage |
 |---|---|
@@ -514,6 +516,16 @@ point is that it is *public*.
 | `VortexChaosFuzzerTest` | Chaos-driven adversarial fuzzing |
 | `VortexPqSignatureTest` | WOTS+/XMSS KATs, tamper-evident chains, Vault burn proof |
 
+Newer suites added since the first release wave (each a full
+regression suite; `tests/` is the source of truth): PQ tree rollover
+certificates (`VortexPqRolloverTest`), the algebraic degeneracy hunt
+at the seed surface, boundary torture (block/tx limits, U128 edges,
+the 15-leaf PQ economy), a 1000-block chain stress with full
+ledger-model cross-check, the deterministic bifurcation oracle,
+crash/recovery torture, the reorg carousel, ASERT retarget, RPC
+auth, C5 key import (fail-closed, constant-time), apply-path
+integrity, and mempool admission.
+
 ---
 
 ## Repository layout
@@ -522,7 +534,7 @@ point is that it is *public*.
 include/vx/          public headers (blockchain, consensus, crypto, core,
                      math, net, rpc, state, storage, vm, wif)
 src/                 implementation, one directory per subsystem
-tests/               16 test targets (GoogleTest + plain runners)
+tests/               31 test targets (GoogleTest + plain runners)
 web/                 React + TypeScript PWA console (+ Electron wrapper)
 .github/workflows/   CI: both C++ editions + web, archlinux container
 CMakeLists.txt       edition option, targets, tests

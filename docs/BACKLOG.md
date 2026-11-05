@@ -1387,17 +1387,33 @@ outside this repo by design (build tools are not consensus code).
   unexploitable for block difficulty. 100/100 distinct top-384
   projections measured (fold probe, this session).
 
-### 2.13 Gas model design note (fundamental Q2)
+### 2.13 Gas model design note (fundamental Q2) — CORRECTED
 
-- VX ships no smart-contract VM and no gas metering today, so the
-  Bennett reversible-computing paradox has no current attack surface.
-- Design decision recorded for any future VM: consensus gas is a
-  deterministic instruction count (tactic CPU). It is never derived from
-  thermodynamic cost, which consensus cannot verify. A reversible
-  instruction costs gas like any other; a "reversible infinite loop" is
-  an ordinary infinite loop and halts out-of-gas. Landauer's bound
-  describes hardware energy, not consensus metering; the boundary is
-  exactly "verifiable determinism over physics".
+- CORRECTION (same night, verified in code after the first answer was
+  sent): the first answer claimed VX ships no VM and no gas metering.
+  WRONG. VortexVM exists (src/vm/vortex_vm.cpp, VX-ASM, ~28 opcodes)
+  with deterministic integer metering:
+  gas(step) = base_opcode_cost(op) + erased_bits * 960 + flips * 3.
+- Verified answers to the owner's Q2, in code:
+  - base_opcode_cost is >= 1 for EVERY opcode, including the fully
+    reversible ones (XOR/AND/OR/ROTL = 1, ADD/SUB = 3). A
+    "Reversible Infinite Loop" therefore pays >= 1 per step and halts
+    out-of-gas like any other loop - the reversible free ride is
+    priced away by the floor. No zero-cost opcode exists.
+  - The Landauer term is a deterministic PROXY: erased_bits counts
+    1->0 transitions between register/stack snapshots, scaled by a
+    constant (960 micro-units). It mimics Landauer's form but is
+    computed from execution state, not measured joules - consensus
+    cannot verify physics, and does not try. The boundary between
+    thermodynamics and EVM-style gas passes exactly here: the cost
+    MODEL is thermodynamic-inspired; the metering is deterministic
+    integer arithmetic, reproducible across validators.
+  - Honest framing for docs: "Landauer gas" is a cost model name, not
+    a physical claim. README wording should not imply measured heat
+    (README sync item below).
+- Open: gas is not yet wired into consensus acceptance (no tx-level
+  gas accounting end-to-end); pinning that gap is part of the Q2-Q4
+  Phase 1 directive.
 
 ### 2.14 ZK aggregation path decision (fundamental Q3)
 
