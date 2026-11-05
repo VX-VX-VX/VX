@@ -84,11 +84,19 @@ int main() {
         const auto r1 = xmss_root_tree(master, pub_seed, 1);
         const auto r2 = xmss_root_tree(master, pub_seed, 2);
 
-        const auto cert01 = pq_sign_rollover(master, 0, 1);
+        // Kernel invariant: the certificate call burns leaf 15 ITSELF when
+        // a ledger is supplied — reserve+fsync BEFORE the signature.
+        PqLeafLedger ledger0; // memory-only
+        const auto cert01 = pq_sign_rollover(master, 0, 1, &ledger0);
         assert(pq_verify_rollover(r0, 0, 1, r1, cert01));
         assert(cert01.leaf_index == PQ_ROLLOVER_CERT_LEAF);
         assert(cert01.subtree_index == 0);
         assert(roots_equal(cert01.pq_pubkey_root, r0));
+        // Leaf 15 is now burned under r0; a second cert from window 0
+        // cannot exist (fail-closed, nothing signed).
+        assert(pq_sign_rollover(master, 0, 1, &ledger0).witness_digest ==
+               std::array<uint8_t, 32>{});
+        assert(ledger0.used_count(r0) == 1);
 
         const auto cert12 = pq_sign_rollover(master, 1, 2);
         assert(pq_verify_rollover(r1, 1, 2, r2, cert12));
@@ -142,19 +150,28 @@ int main() {
         std::cout << "rollover refusal matrix (9 attack shapes) OK\n";
     }
 
-    // ── 6. Certificate burns leaf 15 like any transaction leaf ───────────
+    // ── 6. Kernel leaf policy: transactions live in 0..14, certs in 15 ──
     {
         PqLeafLedger ledger; // memory-only
         const auto r0 = xmss_root_tree(master, pub_seed, 0);
+        // reserve_for_tx refuses leaf 15 outright and never assigns it in
+        // the lowest-free search.
+        assert(ledger.reserve_for_tx(r0, PQ_ROLLOVER_CERT_LEAF) < 0);
+        // Leaves 0..14 exhaust one by one; 15 stays untouched.
+        for (unsigned i = 0; i < 15; ++i) {
+            assert(ledger.reserve_for_tx(r0, 0) == static_cast<int>(i));
+        }
+        assert(ledger.reserve_for_tx(r0, 0) < 0);  // 0..14 exhausted
+        assert(ledger.used_count(r0) == 15);
+        // The certificate leaf is still free and reserve() (generic) can
+        // see it — but only reserve_cert_leaf may take it.
         assert(ledger.reserve(r0, PQ_ROLLOVER_CERT_LEAF) ==
                static_cast<int>(PQ_ROLLOVER_CERT_LEAF));
-        // Leaf 15 is spent: a second signer asking for it gets the lowest
-        // free leaf instead, and the window eventually exhausts.
-        assert(ledger.reserve(r0, PQ_ROLLOVER_CERT_LEAF) == 0);
-        assert(ledger.used_count(r0) == 2);
-        for (unsigned i = 2; i < 16; ++i) assert(ledger.reserve(r0, i) >= 0);
-        assert(ledger.reserve(r0, 0) < 0); // all 16 leaves consumed
-        std::cout << "certificate leaf burn discipline OK\n";
+        PqLeafLedger ledger2; // fresh
+        assert(ledger2.reserve(r0, PQ_ROLLOVER_CERT_LEAF) ==
+               static_cast<int>(PQ_ROLLOVER_CERT_LEAF));
+        assert(ledger2.reserve_cert_leaf(r0) < 0); // already burned
+        std::cout << "kernel leaf policy (tx 0..14, cert 15) OK\n";
     }
 
     // ── 7. Verification cost stays in the one-signature envelope ─────────

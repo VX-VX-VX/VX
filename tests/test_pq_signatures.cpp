@@ -414,17 +414,20 @@ void test_leaf_ledger_lifecycle() {
         assert(w.leaf_index != 7); // 7 burned before the restart
     }
 
-    // 3. Exhaustion: 13 more leaves, then the key refuses to sign.
+    // 3. Exhaustion: 12 more tx leaves, then the key refuses to sign.
+    //    Kernel invariant (2026-11-05): leaf 15 is reserved for rollover
+    //    certificates, so a transaction key offers 15 signatures, not 16.
     {
         PqLeafLedger ledger(log_path);
         PqSignTimings t{};
-        for (int i = 0; i < 13; ++i) {
+        for (int i = 0; i < 12; ++i) {
             tx = make_test_tx(7);
             assert(pq_sign_transaction(tx, sk, &t, &ledger));
         }
         tx = make_test_tx(7);
         assert(!pq_sign_transaction(tx, sk, &t, &ledger));
-        std::cout << "  ✓ 16/16 leaves consumed; 17th signature refused\n";
+        std::cout << "  ✓ 15/15 tx leaves consumed (leaf 15 reserved for"
+                     " rollover); 16th signature refused\n";
     }
 
     // 4. Tampered log (leaf byte out of range) must fail closed forever.
@@ -457,9 +460,11 @@ void test_subtree_guard() {
     PqLeafLedger ledger(""); // memory-only: counts the burns, nothing durable
     PqSignTimings t{};
 
-    // In-tree nonces still sign and verify.
+    // In-tree nonces still sign and verify. Kernel invariant (2026-11-05):
+    // leaf 15 is reserved for rollover certificates, so nonce 15 now REFUSES
+    // like any out-of-window nonce; the in-tree sweep uses 0 and 14.
     std::array<uint8_t, 32> root{};
-    for (const uint32_t nonce : {0u, 15u}) {
+    for (const uint32_t nonce : {0u, 14u}) {
         bc::Transaction tx = make_test_tx(nonce);
         assert(pq_sign_transaction(tx, sk, &t, &ledger));
         bc::Transaction last{}; PqSignatureWitness w{};
@@ -470,8 +475,9 @@ void test_subtree_guard() {
                   << ", verify ok\n";
     }
 
-    // Out-of-tree nonces must refuse without burning a leaf.
-    for (const uint32_t nonce : {16u, 17u, 255u, 0xFFFFFFFFu}) {
+    // Out-of-tree nonces — and the reserved certificate leaf 15 — must
+    // refuse without burning a leaf.
+    for (const uint32_t nonce : {15u, 16u, 17u, 255u, 0xFFFFFFFFu}) {
         bc::Transaction tx = make_test_tx(nonce);
         assert(!pq_sign_transaction(tx, sk, &t, &ledger));
         std::cout << "  ✓ nonce " << nonce << " -> refused (no leaf burned)\n";

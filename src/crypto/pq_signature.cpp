@@ -239,7 +239,8 @@ std::array<uint8_t, 32> rollover_binding_digest(
 }
 
 PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32>& master_sk,
-                                    uint32_t from_tree, uint32_t to_tree) noexcept {
+                                    uint32_t from_tree, uint32_t to_tree,
+                                    PqLeafLedger* leaf_ledger) noexcept {
     if (from_tree == to_tree) return PqSignatureWitness{}; // binds nothing
     if (from_tree > PQ_MAX_SUBTREE_INDEX || to_tree > PQ_MAX_SUBTREE_INDEX) {
         return PqSignatureWitness{}; // outside the global-leaf namespace
@@ -248,6 +249,13 @@ PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32>& master_sk,
     // every window lives under the same pub_seed, only the leaf window moves.
     const auto pub_seed = pub_seed_from_sk(master_sk);
     const auto old_root = xmss_root_tree(master_sk, pub_seed, from_tree);
+    // Kernel invariant: THIS call burns the certificate leaf itself, with
+    // the fsync BEFORE the signature (same fail-closed ordering as every
+    // transaction leaf). No reservation -> no certificate.
+    if (leaf_ledger &&
+        leaf_ledger->reserve_cert_leaf(old_root) != static_cast<int>(PQ_ROLLOVER_CERT_LEAF)) {
+        return PqSignatureWitness{};
+    }
     const auto new_root = xmss_root_tree(master_sk, pub_seed, to_tree);
     const auto msg = rollover_binding_digest(old_root, from_tree, to_tree, new_root);
     return pq_sign_message(PQ_ROLLOVER_CERT_LEAF, from_tree, master_sk, pub_seed, msg);
@@ -503,11 +511,17 @@ bool pq_sign_transaction(Transaction& tx, const std::array<uint8_t, 32>& master_
     //     (computed above) is this key's XMSS root — the ledger is keyed by
     //     it, so different accounts never share leaf history. A leaf that
     //     already signed is never handed out twice: the ledger assigns the
-    //     lowest free leaf instead, and exhausting all 16 fails the call.
+    //     lowest free leaf instead, and exhausting the allowed leaves fails
+    //     the call. Kernel invariant (owner directive, 2026-11-05): leaf 15
+    //     is reserved EXCLUSIVELY for rollover certificates — in the
+    //     tracked path a regular signature may not request it and the
+    //     lowest-free search never assigns it. The untracked legacy path
+    //     (no ledger, no reuse protection by definition) is unchanged.
     uint32_t use_leaf = leaf_idx;
     if (leaf_ledger) {
-        const int assigned = leaf_ledger->reserve(root, leaf_idx);
-        if (assigned < 0) return false; // key exhausted or log untrusted
+        if (leaf_idx == PqLeafLedger::kReservedCertLeaf) return false;
+        const int assigned = leaf_ledger->reserve_for_tx(root, leaf_idx);
+        if (assigned < 0) return false; // exhausted or log untrusted
         use_leaf = static_cast<uint32_t>(assigned);
     }
     t.used_leaf_index = use_leaf;
@@ -633,7 +647,17 @@ bool PqLeafLedger::append_locked(const std::array<uint8_t, 32>& key_root, unsign
     return ::fsync(fd_) == 0;
 }
 
-int PqLeafLedger::reserve(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf) {
+size_t PqLeafLedger::used_count(const std::array<uint8_t, 32>& key_root) const {
+    std::lock_guard<std::mutex> guard(mu_);
+    const auto it = used_.find(key_root);
+    return (it == used_.end()) ? 0u : it->second.count();
+}
+
+// Shared reservation core: `allowed` masks which leaves may be assigned.
+// requested_leaf must be inside `allowed` or the call fails without
+// burning anything; the lowest-free search visits only allowed leaves.
+int PqLeafLedger::reserve_impl(const std::array<uint8_t, 32>& key_root,
+                               unsigned requested_leaf, unsigned allowed_mask) {
     std::lock_guard<std::mutex> guard(mu_);
 
     if (!memory_only_) {
@@ -648,38 +672,52 @@ int PqLeafLedger::reserve(const std::array<uint8_t, 32>& key_root, unsigned requ
         }
     }
 
+    const auto finish = [&](int result) -> int {
+        if (!memory_only_) ::flock(fd_, LOCK_UN);
+        return result;
+    };
+
     std::bitset<kLeaves>& bits = used_[key_root];
-    unsigned assigned = (requested_leaf < kLeaves) ? requested_leaf : 0u;
+    if (requested_leaf >= kLeaves || (allowed_mask & (1u << requested_leaf)) == 0) {
+        return finish(-1); // refuse WITHOUT burning anything
+    }
+    unsigned assigned = requested_leaf;
     if (bits.test(assigned)) {
         int found = -1;
         for (unsigned i = 0; i < kLeaves; ++i) {
-            if (!bits.test(i)) {
+            if ((allowed_mask & (1u << i)) && !bits.test(i)) {
                 found = static_cast<int>(i);
                 break;
             }
         }
         if (found < 0) {
-            if (!memory_only_) ::flock(fd_, LOCK_UN);
-            return -1; // all 16 one-time leaves of this key are consumed
+            return finish(-1); // no allowed free leaf
         }
         assigned = static_cast<unsigned>(found);
     }
 
     if (!memory_only_ && !append_locked(key_root, assigned)) {
         durable_ok_ = false; // fail closed from here on
-        ::flock(fd_, LOCK_UN);
-        return -1;
+        return finish(-1);
     }
     bits.set(assigned);
-
-    if (!memory_only_) ::flock(fd_, LOCK_UN);
-    return static_cast<int>(assigned);
+    return finish(static_cast<int>(assigned));
 }
 
-size_t PqLeafLedger::used_count(const std::array<uint8_t, 32>& key_root) const {
-    std::lock_guard<std::mutex> guard(mu_);
-    const auto it = used_.find(key_root);
-    return (it == used_.end()) ? 0u : it->second.count();
+int PqLeafLedger::reserve(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf) {
+    return reserve_impl(key_root, requested_leaf, 0xFFFFu); // all 16 leaves
+}
+
+int PqLeafLedger::reserve_for_tx(const std::array<uint8_t, 32>& key_root,
+                                 unsigned requested_leaf) {
+    // Leaf 15 belongs to rollover certificates exclusively (kernel
+    // invariant, owner directive 2026-11-05) — regular signatures live in
+    // leaves 0..14.
+    return reserve_impl(key_root, requested_leaf, 0x7FFFu);
+}
+
+int PqLeafLedger::reserve_cert_leaf(const std::array<uint8_t, 32>& key_root) {
+    return reserve_impl(key_root, kReservedCertLeaf, 1u << kReservedCertLeaf);
 }
 
 // ── PqWitnessRegistry ────────────────────────────────────────────────────────

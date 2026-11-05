@@ -154,10 +154,18 @@ std::array<uint8_t, 32> rollover_binding_digest(
 // PqSignatureWitness by leaf 15 of window from_tree over the binding
 // digest, with the account mask seed derived exactly as
 // pq_sign_transaction derives it ("VX_PQ_PUBSEED_V1" || master_sk).
+// Kernel invariant (owner directive, 2026-11-05): leaf 15 is reserved
+// EXCLUSIVELY for rollover certificates — regular transaction signatures
+// refuse it, and THIS call burns it itself: when `leaf_ledger` is
+// provided, leaf 15 is reserved+fsync'd under the OLD root BEFORE the
+// certificate signature is produced (a reserve failure returns a default
+// witness whose verification fails — fail-closed). Without a ledger the
+// caller keeps full responsibility for the burn.
 // Refuses from_tree == to_tree or any index beyond PQ_MAX_SUBTREE_INDEX
 // by returning a default witness whose verification fails.
 PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32>& master_sk,
-                                    uint32_t from_tree, uint32_t to_tree) noexcept;
+                                    uint32_t from_tree, uint32_t to_tree,
+                                    class PqLeafLedger* leaf_ledger = nullptr) noexcept;
 
 // Verifies a rollover certificate end-to-end: the leaf and window policy
 // (leaf 15 of from_tree), the certificate root equals old_root, the
@@ -295,12 +303,31 @@ public:
     // when the log cannot be trusted).
     int reserve(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf);
 
+    // TRANSACTION reservation (kernel invariant, owner directive
+    // 2026-11-05): leaf 15 is RESERVED for rollover certificates and is
+    // never handed to a regular transaction signature — a request for 15
+    // fails, and the lowest-free search skips 15. Returns -1 when no
+    // allowed leaf is available (or the log cannot be trusted).
+    static constexpr unsigned kReservedCertLeaf = 15;
+    int reserve_for_tx(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf);
+
+    // CERTIFICATE reservation: reserves EXACTLY leaf 15 (the rollover
+    // certificate leaf) under `key_root`; -1 when it is already consumed
+    // or the log cannot be trusted. append+fsync happens BEFORE the
+    // certificate signature is produced (the same fail-closed ordering as
+    // every transaction leaf).
+    int reserve_cert_leaf(const std::array<uint8_t, 32>& key_root);
+
     // Number of consumed leaves for this key (0..16).
     size_t used_count(const std::array<uint8_t, 32>& key_root) const;
 
 private:
     bool parse_log_locked(); // rebuilds used_ from the file; false = corrupt
     bool append_locked(const std::array<uint8_t, 32>& key_root, unsigned leaf);
+
+    // Shared reservation core; `allowed_mask` bit i permits leaf i.
+    int reserve_impl(const std::array<uint8_t, 32>& key_root,
+                     unsigned requested_leaf, unsigned allowed_mask);
 
     mutable std::mutex mu_;
     std::unordered_map<std::array<uint8_t, 32>, std::bitset<kLeaves>, PqArrayHash> used_;

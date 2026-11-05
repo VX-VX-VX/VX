@@ -71,6 +71,39 @@ public:
     static std::string canonicalSeedError(std::string_view seedHex);
 
     /**
+     * @brief Algebraic extension (v0.0.15, owner-audit item I.2): the same
+     * refusal pipeline, plus the degenerate classes that live INSIDE the
+     * modular arithmetic rather than in the seed string.
+     *
+     * Additional refused classes (checked on BOTH orientations — locked
+     * mode reverses the seed string, and both addresses derive from one
+     * seed):
+     *  - a zero trunk (X_0 == 0 or Y_0 == 0) — the string-level all-zero
+     *    check cannot see a per-trunk zero;
+     *  - a trunk congruent to 0 mod its modulus (X_0 % p == 0 /
+     *    Y_0 % q == 0): a non-zero word that collapses to a zero residue;
+     *  - a seed whose ACT I derivation produces Z_0 == 0
+     *    (cube_sum == rotl1024(PHI, Y_0 % 64)) — adversarially
+     *    constructible because the cube map is 3-to-1 (3 | r-1).
+     *
+     * The 1-argument overload delegates with the classic moduli (the only
+     * production set), so callers upgrading automatically gain these
+     * checks.
+     */
+    static std::string canonicalSeedError(
+        std::string_view seedHex, const core::AttractorModuli& moduli);
+
+    /**
+     * @brief The ACT I Z-trunk derivation, exposed as the single source of
+     * truth for run() and canonicalSeedError: Z_0 = ((X_0^3 mod r +
+     * Y_0^3 mod r) % r) XOR rotl1024(PHI_1024, Y_0 mod 64). Byte-identical
+     * with the in-line formula it replaces in run().
+     */
+    static mpz_class derive_z0(const mpz_class& X0, const mpz_class& Y0,
+                               const core::AttractorModuli& moduli,
+                               const mpz_class& PHI_1024);
+
+    /**
      * @brief Computes Act IV Chinese Remainder Theorem (CRT) reconstruction.
      */
     static mpz_class computeCrtUnwrapping(

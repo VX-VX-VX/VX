@@ -848,6 +848,15 @@ Remaining (honest gaps, not hidden):
   replace.
 - [ ] Wallet policy: when to roll over (window exhaustion), certificate
   publication/relay, and burning leaf 15 in the ledger at rollover time.
+  The leaf-15 burn is NO LONGER caller discipline: kernel invariant
+  delivered v0.0.15 (owner directive, 2026-11-05) — leaf 15 is reserved
+  EXCLUSIVELY for rollover certificates: `reserve_for_tx` refuses it and
+  never assigns it in the lowest-free search; `pq_sign_transaction`
+  refuses a leaf-15 nonce with or without a ledger (fail-closed, no
+  burn); `pq_sign_rollover` with a ledger reserves+fsyncs leaf 15 under
+  the OLD root BEFORE producing the certificate signature (a reserve
+  failure signs nothing). Transaction keys offer 15 signatures, not 16
+  (TEST 9 and the ledger-lifecycle test updated accordingly).
 - [ ] `pq_sign_message` still accepts `subtree_index` values whose
   `window << 4` wraps (t > 0x0FFFFFFF) — the rollover API refuses them,
   but the raw primitive trusts its caller; a fail-closed clamp belongs
@@ -1116,23 +1125,45 @@ fold boundary.
 
 v0.0.10/v0.0.12 refused whole classes at the surface (zero seed, 0X
 prefix, >512 hex, non-hex). The audit names three deeper degenerate
-classes INSIDE the modular arithmetic that the hunt does not yet cover:
+classes INSIDE the modular arithmetic.
 
-- [ ] Congruent zero: a seed that parses to a 1024-bit word equal to P,
-  Q or R (non-zero as a string, collapses to 0 after mod). Extend
-  canonicalSeedError or the hunt suite to detect seeds congruent to
-  0 mod each attractor modulus.
-- [ ] Fixed points 1 and P-1/Q-1/R-1: multiplicative short cycles
-  (length 1-2) in power/multiplicative maps. Pin whether the attractor
-  map actually contains such cycles and whether they are reachable
-  from a seed.
-- [ ] Trunk diagonal symmetry: seeds whose 1024-bit blocks are equal
-  (X0 = Y0 = Z0), killing inter-trunk diffusion in early rounds.
-  Quantify the address-quality impact; decide whether to refuse or
-  pin.
+DELIVERED v0.0.15 (canonicalSeedError 2-arg overload; the 1-arg RPC
+gate delegates with the classic moduli, so the surface upgrade is
+automatic). Checked on BOTH orientations (locked mode reverses the
+seed string; both addresses derive from one seed):
+
+- [x] Congruent zero + per-trunk zero: X_0 == 0 / Y_0 == 0 (a seed
+  whose second half is all zeros — the old string-level all-zero check
+  could not see it) and X_0 % p == 0 / Y_0 % q == 0 (a non-zero word
+  that collapses to a zero residue, e.g. the word equal to its
+  modulus). NOTE: this SUPERSEDES the v0.0.12 decision to accept
+  shorter-than-canonical seeds — every seed of ≤256 hex chars has a
+  zero Y trunk and is now refused (documented behavior change; the
+  derivation itself stays frozen).
+- [x] Zero Z-trunk: a seed whose ACT I derivation produces Z_0 == 0
+  (cube_sum == rotl1024(PHI, Y_0 % 64)). Adversarially constructible
+  in principle because the cube map is 3-to-1 (3 | r-1); the checker
+  refuses the class. The regression suite pins the NEGATIVE evidence
+  (accepted seeds derive Z_0 != 0 — ACT I refactor: the Z_0 formula is
+  now the public derive_z0(), single source of truth for run() and the
+  checker, byte-identical); constructing a positive instance needs a
+  cube-root construction mod r (no inverse of 3 mod r-1) — queued as
+  an exercise in the same item.
+- [x] Fixed-point PREMISE CORRECTED: the audit assumed power maps with
+  fixed points 1 and P-1/Q-1/R-1. The actual per-step trunk map is
+  AFFINE — (x ^ Phi_lock)*7+13 mod p (and 11+17 / 19+23 for Y/Z) — so
+  1 and P-1 are NOT fixed points of the dynamics; the only power map
+  is ACT I's cubing. Pinned in the suite: trunk=1 and trunk=p-1 seeds
+  are accepted and derive distinct non-degenerate addresses.
+- [ ] Trunk diagonal symmetry X_0 == Y_0: pinned ACCEPTED for now —
+  the three different moduli break the symmetry after the first round
+  (X_0 = W, Y_0 = W give W mod p != W mod q), so the early-round
+  correlation is real but non-structural. The deeper orbit-quality
+  measurement (cycle lengths, diffusion decay) stays open.
 - Acceptance: each class either measured-harmless (pinned in
   test_attractor_degeneracy with the evidence) or fail-closed at the
-  surface.
+  surface — met for the zero/congruent classes; diagonal measurement
+  open.
 
 ### 2.11 VX60 witness delivery: witness_merkle_root + orphan-witness defense (owner audit item I.5, 2026-11-05)
 
@@ -1181,10 +1212,11 @@ severity:
   crypto-lab endpoint. Refused classes: non-hex, over-length (the
   truncation degeneracy), the uppercase 0X prefix, the all-zero seed.
   E2E-verified against a live node (garbage/zero/overlong -> 400,
-  canonical vector -> 200). Shorter-than-canonical seeds are still
-  accepted (the padding degeneracy stays pinned in the test suite, not
-  yet refused - refusing it would break any existing wallet that
-  derived from a short seed, so it needs a migration note first).
+  canonical vector -> 200). Shorter-than-canonical seeds were still
+  accepted in v0.0.12; SUPERSEDED in v0.0.15 for the zero-trunk
+  sub-class (seeds of ≤256 hex chars derive a zero Y trunk — refused;
+  see 2.10). Seeds of 257..511 hex chars remain accepted (nonzero
+  right-padding degeneracy, pinned in the suite).
 - [x] The zero seed has a fixed, findable address
   (NFA_V6_USaRKlmk3c_EfXuVbtfVfwzyd2QEQKZLyL7VbKIIAA with classic
   moduli). The state does not collapse (Z_0 = PHI != 0), but a

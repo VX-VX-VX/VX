@@ -196,11 +196,78 @@ int main() {
         assert(!VortexAttractor::canonicalSeedError("0X" + kCanonicalSeed).empty()); // 0X prefix
         assert(!VortexAttractor::canonicalSeedError(std::string(500, 'a') + "zz").empty()); // non-hex
 
-        // Shorter-than-canonical seeds remain accepted (the padding
-        // degeneracy is pinned in check 3, not yet refused - a future
-        // canonical-length policy belongs to the same BACKLOG item).
-        assert(VortexAttractor::canonicalSeedError("1234").empty());
+        // Shorter-than-canonical seeds: the v0.0.12 acceptance decision is
+        // SUPERSEDED for the zero-trunk sub-class (v0.0.15, audit item
+        // I.2): a seed whose second half is entirely zeros derives a zero
+        // Y trunk - genuinely degenerate, now refused.
+        assert(!VortexAttractor::canonicalSeedError("1234").empty());
         std::cout << "canonicalSeedError: all degenerate classes refused OK\n";
+    }
+
+    // ── 10. Algebraic degeneracy classes (v0.0.15, audit item I.2) ──────
+    {
+        const auto moduli = vx::core::AttractorModuli::classic();
+        const std::string f256(256, 'f');
+
+        // Per-trunk zero: X half zero (string not all-zero -> passed the
+        // old string-level check), Y half nonzero.
+        assert(!VortexAttractor::canonicalSeedError(std::string(256, '0') + f256).empty());
+        // Y half zero.
+        assert(!VortexAttractor::canonicalSeedError(f256 + std::string(256, '0')).empty());
+        // Congruent zero: X trunk == p exactly (non-zero word, zero residue).
+        {
+            const std::string p_hex = moduli.p.get_str(16);
+            assert(p_hex.size() == 256);
+            std::string low(256, '0'); low[255] = '1'; // Y = 1
+            assert(!VortexAttractor::canonicalSeedError(p_hex + low).empty());
+            // Same in the LOCKED orientation: run() reverses the string,
+            // so the seed's SECOND half must reverse to p_hex for the
+            // locked X trunk to be congruent zero.
+            const std::string p_rev(p_hex.rbegin(), p_hex.rend());
+            const std::string locked_seed = low + p_rev;
+            assert(!VortexAttractor::canonicalSeedError(locked_seed).empty());
+        }
+        // Congruent zero: Y trunk == q exactly.
+        {
+            const std::string q_hex = moduli.q.get_str(16);
+            assert(q_hex.size() == 256);
+            std::string high(256, '0'); high[255] = '1'; // X = 1
+            assert(!VortexAttractor::canonicalSeedError(high + q_hex).empty());
+        }
+        // Canonical seed and hunt seeds still clean; Z_0 != 0 pinned for
+        // every accepted seed (the zero-Z class is refused by the checker).
+        assert(VortexAttractor::canonicalSeedError(kCanonicalSeed).empty());
+        assert(VortexAttractor::canonicalSeedError("0x" + kCanonicalSeed).empty());
+        for (uint64_t c = 0; c < 10; ++c) {
+            assert(VortexAttractor::canonicalSeedError(pseudoSeed(c, 512)).empty());
+        }
+        // Honest correction to the audit's fixed-point premise: the per-step
+        // map is AFFINE ((x ^ Phi)*7+13 mod p), not a power map, so 1 and
+        // p-1 are NOT fixed points of the dynamics; only ACT I cubes.
+        // Pin that trunk=1 and trunk=p-1 seeds are accepted and derive
+        // non-degenerate (distinct) addresses.
+        {
+            std::string one(256, '0'); one[255] = '1';           // X_0 = 1
+            const mpz_class p_minus_1 = moduli.p - 1;
+            const std::string pm1 = p_minus_1.get_str(16);       // X_0 = p-1
+            assert(pm1.size() == 256);
+            const auto a = VortexAttractor::run(one + f256, iters, true, moduli);
+            const auto b = VortexAttractor::run(pm1 + f256, iters, true, moduli);
+            assert(a.addressNFA != b.addressNFA);
+            assert(VortexAttractor::canonicalSeedError(one + f256).empty());
+            assert(VortexAttractor::canonicalSeedError(pm1 + f256).empty());
+        }
+        // Diagonal symmetry X0 == Y0: pinned ACCEPTED (different moduli
+        // break the symmetry after the first round; BACKLOG 2.10 tracks the
+        // deeper orbit-quality measurement).
+        {
+            const auto a = VortexAttractor::run(f256 + f256, iters, true, moduli);
+            assert(!a.addressNFA.empty());
+            std::cout << "diagonal seed address: " << a.addressNFA << "\n";
+            assert(VortexAttractor::canonicalSeedError(f256 + f256).empty());
+        }
+        std::cout << "algebraic degeneracy classes: zero/congruent trunks refused, "
+                     "fixed-point premise corrected OK\n";
     }
 
 

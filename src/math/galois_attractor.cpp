@@ -8,6 +8,11 @@
 namespace vx::math {
 
 std::string VortexAttractor::canonicalSeedError(std::string_view seedHex) {
+    return canonicalSeedError(seedHex, core::AttractorModuli::classic());
+}
+
+std::string VortexAttractor::canonicalSeedError(
+    std::string_view seedHex, const core::AttractorModuli& moduli) {
     // Mirror run()'s own normalization exactly: lowercase "0x" is
     // stripped BEFORE length checks (it is excluded from the 512-char
     // seed budget); an uppercase "0X" is NOT stripped by run(), so it
@@ -32,6 +37,36 @@ std::string VortexAttractor::canonicalSeedError(std::string_view seedHex) {
     if (all_zero) {
         return "zero seed refused (degenerate fixed address)";
     }
+
+    // ── Algebraic degeneracy classes (v0.0.15, owner-audit item I.2) ────
+    // These live INSIDE the modular arithmetic: a non-zero, hex-clean
+    // seed can still start a trunk at zero (congruent to its modulus) or
+    // derive a zero Z-trunk. Checked on BOTH orientations: locked mode
+    // reverses the seed string before parsing, and both addresses derive
+    // from one seed, so a degenerate trunk in either is refused.
+    const auto check_orientation = [&](const std::string& s) -> std::string {
+        const std::string padded = (s.size() < 512)
+            ? s + std::string(512 - s.size(), '0')
+            : s.substr(0, 512);
+        const mpz_class PHI_1024 = hexToBigInt(core::PHI_1024_HEX);
+        const mpz_class x = hexToBigInt(padded.substr(0, 256));
+        const mpz_class y = hexToBigInt(padded.substr(256, 256));
+        if (x == 0) return "seed trunk X is zero (degenerate start)";
+        if (y == 0) return "seed trunk Y is zero (degenerate start)";
+        if ((x % moduli.p) == 0) {
+            return "seed trunk X is congruent to 0 mod p (collapses to a zero residue)";
+        }
+        if ((y % moduli.q) == 0) {
+            return "seed trunk Y is congruent to 0 mod q (collapses to a zero residue)";
+        }
+        if (derive_z0(x, y, moduli, PHI_1024) == 0) {
+            return "seed derives a zero Z trunk (cube_sum equals the rotated PHI)";
+        }
+        return {};
+    };
+    if (std::string err = check_orientation(clean); !err.empty()) return err;
+    std::string reversed(clean.rbegin(), clean.rend());
+    if (std::string err = check_orientation(reversed); !err.empty()) return err;
     return {};
 }
 
@@ -79,6 +114,14 @@ mpz_class VortexAttractor::pow3_mod(const mpz_class& base, const mpz_class& mod)
     mpz_class res;
     mpz_powm_ui(res.get_mpz_t(), base.get_mpz_t(), 3, mod.get_mpz_t());
     return res;
+}
+
+mpz_class VortexAttractor::derive_z0(const mpz_class& X0, const mpz_class& Y0,
+                                     const core::AttractorModuli& moduli,
+                                     const mpz_class& PHI_1024) {
+    const mpz_class cube_sum = (pow3_mod(X0, moduli.r) + pow3_mod(Y0, moduli.r)) % moduli.r;
+    const unsigned int y0_mod64 = mpz_class(Y0 % 64).get_ui();
+    return cube_sum ^ rotl1024(PHI_1024, y0_mod64);
 }
 
 core::Hash256 VortexAttractor::xorFold(const mpz_class& x, const mpz_class& y, const mpz_class& z) {
@@ -244,9 +287,7 @@ AttractorResult VortexAttractor::run(
     mpz_class X_0 = hexToBigInt(m1);
     mpz_class Y_0 = hexToBigInt(m2);
 
-    mpz_class cube_sum = (pow3_mod(X_0, moduli.r) + pow3_mod(Y_0, moduli.r)) % moduli.r;
-    unsigned int y0_mod64 = mpz_class(Y_0 % 64).get_ui();
-    mpz_class Z_0 = cube_sum ^ rotl1024(PHI_1024, y0_mod64);
+    mpz_class Z_0 = derive_z0(X_0, Y_0, moduli, PHI_1024);
 
     mpz_class x = X_0;
     mpz_class y = Y_0;
