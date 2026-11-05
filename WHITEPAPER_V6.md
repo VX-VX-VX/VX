@@ -401,8 +401,9 @@ enough to make bulk precomputation of the seed→address space annoying.
 The 256-bit account digest and its string form are derived from the final
 attractor state (x, y, z):
 
-**Step 1 — serialize.** Each trunk becomes 128 bytes, least-significant
-byte first: `xB[0..127]`, `yB[0..127]`, `zB[0..127]`.
+**Step 1 — serialize.** Each trunk becomes 128 bytes, most-significant
+byte first (index 0 holds the most significant byte): `xB[0..127]`,
+`yB[0..127]`, `zB[0..127]`.
 
 **Step 2 — xor-fold to 32 bytes.**
 
@@ -415,10 +416,12 @@ for k in 0..15:
 
 Reading it apart:
 
-- The X trunk contributes its *low* 16 bytes, the Y trunk its *high* 16
-  bytes (reversed order), the Z trunk a strided selection `0,7,14,…,105` —
-  three different sampling patterns across the 384 input bytes, so a
-  collision must agree in all three simultaneously.
+- Each trunk contributes its **high 16 bytes (top 128 bits)**: X
+  straight (`xB[k]`), Y reversed (`yB[15-k]`), Z permuted by
+  `(7k) mod 16` — a full 16-cycle (0, 7, 14, 5, 12, 3, 10, 1, 8, 15, 6,
+  13, 4, 11, 2, 9, since gcd(7,16)=1) — three different orderings across
+  the 48 sampled bytes, so a collision must agree in all three
+  simultaneously.
 - Each `mixed` byte lands twice: once raw at an even digest position, once
   nibble-swapped at an odd position. Over k = 0..15 the even positions
   0,2,…,30 and odd positions 1,3,…,31 cover all 32 digest bytes exactly
@@ -448,6 +451,13 @@ backward compatibility of display only.
 `receiver_nfa` fields hold the 42 ASCII characters of the payload
 literally (not re-decoded bits) — the wire form of an address *is* its
 display form minus the prefix.
+
+**Preimage security of this construction** — the seed-search wall
+(2^2048 seeds → 2^256 digests → ~2^256 generic preimage cost), the
+parity-invariant dichotomy, hardware-binding-as-salt, and the honest
+comparison with Bitcoin's 2^160/2^128 walls — is analyzed in
+[docs/ADDRESS_SECURITY.md](docs/ADDRESS_SECURITY.md)
+("Address Security of Vortex").
 
 ---
 
@@ -993,7 +1003,10 @@ balances remain public.)*
   (permutation cube maps, CRT bijectivity, SAC) is verified, but "verified
   algebra" ≠ "cryptographic PRF". The attractor's role is derivation and
   commitment, not secrecy — but its collision behavior deserves formal
-  study before any real-value deployment.
+  study before any real-value deployment. The address-preimage wall
+  (fold-preimage cost, the 48-byte fold window as the priority
+  cryptanalysis target, the refuted parity-invariant claim) is analyzed
+  in [docs/ADDRESS_SECURITY.md](docs/ADDRESS_SECURITY.md).
 - **GQC** is a threshold stamp over an AES-field; the 2/3 quorum model
   assumes an honest-majority validator set whose formation logic is still
   research-grade.
