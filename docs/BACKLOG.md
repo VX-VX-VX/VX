@@ -486,6 +486,18 @@ Residuals, each with its trigger condition:
 - [ ] Ungoated CPU-burn family + zk shared-state audit: see 0.19.
 - [ ] Witness replayability after restart (deterministic subset only) —
   document as a property test once the leaf binding work starts.
+- [ ] Undo journal vs apply-integrity guard (P3, re-hunt 2026-11-05):
+  UndoEngine::apply_block only RECORDS the undo journal — the caller
+  applies to the ledger separately, so a block the new integrity guard
+  refuses leaves a phantom undo record (journal written, state never
+  moved). Today the only paired undo+ledger callers live in the swarm
+  SIMULATOR (src/net/swarm_node.cpp), where refusals do not occur; the
+  production seal path does not journal. Before UndoEngine enters the
+  production seal/reorg path, callers must gate journaling on the ledger
+  apply result (journal AFTER a successful apply), or UndoEngine needs a
+  dry-run pre-check. The resync path in the simulator already half-does
+  this (commit_undo_point only on success) but the record itself is
+  written first and persists via load_latest_undo_journal.
 
 ### 0.19 Ungated crypto-lab family (documented scope cut, round-2 review)
 

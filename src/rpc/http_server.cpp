@@ -194,7 +194,17 @@ bool HttpServer::apply_remote_frame(const void* frame) {
     vx::blockchain::BlockView view{std::span<const uint8_t, 65536>(bytes, 65536)};
     const uint64_t h = view.header().block_height;
 
-    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    // Re-hunt 2026-11-05 (P1): LedgerState has NO internal locking, and
+    // apply_block is called concurrently from the background miner (holding
+    // only the miner's seal_mutex_) and from this remote-frame intake (which
+    // held only state_mutex_) - two different mutexes guarding one mutable
+    // account map is a data race (concurrent balances_/nonces_/height
+    // mutation from two threads of a live node). Serialize by taking the
+    // miner's seal_mutex_ as well; the lock ORDER is state_mutex_ ->
+    // seal_mutex_ everywhere (handle_mempool_seal takes state first and
+    // mine_one acquires seal inside), so no lock-order cycle is possible.
+    std::lock_guard<std::mutex> seal_lock(miner_->seal_mutex());
     // Only a frame that extends our current tip is applied. Fork choice and
     // reorg handling for live peers is ROADMAP item 2 follow-up; until then
     // a competing-height frame is dropped rather than guessed at.

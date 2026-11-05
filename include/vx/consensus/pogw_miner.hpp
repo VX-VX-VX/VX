@@ -52,6 +52,16 @@ private:
     // single-shot caller): two miners building from the same tip would only
     // race to a failed append, but serializing keeps one writer.
     std::mutex seal_mutex_;
+
+public:
+    // Re-hunt 2026-11-05 (P1): the RPC server's remote-frame intake must
+    // serialize its ledger_.apply_block against the miner's sealing flow
+    // (LedgerState has no internal locking). Exposed so the server can take
+    // seal after state_mutex_ (the global lock order is state -> seal; the
+    // miner itself never takes state_mutex_, so no cycle is possible).
+    std::mutex& seal_mutex() noexcept { return seal_mutex_; }
+
+private:
     uint64_t target_block_time_ = 5; // seconds
 };
 
