@@ -71,6 +71,18 @@ Competing blocks at the same height are each kept by their own node.
   simulation's deterministic miner), heal over the wire, converge.
 - Acceptance: the live split-brain scenario no longer needs the
   in-process shortcut; update the runbook's limits section honestly.
+- Design decision (owner question, 2026-11-05): ASERT makes difficulty a
+  pure function of height, so equal-height chains carry the SAME floor
+  target and classical cumulative difficulty cannot discriminate. The
+  honest weight metric is real proven work: W(chain) = sum over blocks
+  of 2^(verified leading zero bits of the block hash) — the tier
+  escalation (REWARD_TIER_ZEROS) is enforced against the block's own
+  hash, so heavier-tier chains weigh more with no trusted field. Exact
+  tie: lexicographically-lowest 32-byte tip hash (objective,
+  effectively random, and ungameable — grinding it IS doing more PoGW).
+  Attractor-phase tie-breakers (pseudoentropy, F_P/F_Q/F_R trajectory
+  distance) are rejected for consensus until proven ungameable:
+  attractor_coords is a miner-influenced header field.
 
 ### 0.3 Configurable bind address
 
@@ -604,10 +616,21 @@ same wall classical 256-bit work is today. The VX sponge is a custom
 construction, so Grover optimality is only a LOWER bound on attacker
 power there; width is the insurance against our own assumptions.
 
-- [ ] Parameterize the sponge output width (256/512/1024) behind an
+- [x] Parameterize the sponge output width (256/512/1024) behind an
   address version: v1 = 256 (current, frozen wire), v2 = 512 (the
   standing target), 1024 documented as the paranoid maximum (no
-  standard requires deeper than a 2^256 preimage class).
+  standard requires deeper than a 2^256 preimage class). — PRIMITIVE
+  DELIVERED 2026-11-05 (v0.0.9): `VortexSponge512` lives in
+  `include/vx/blockchain/crypto_sponge.hpp` beside v1: 16x64-bit state
+  (1024-bit), 64-byte rate (capacity 512), 512-bit digest taken from the
+  capacity words (v1's own convention), 12 ChaCha-style column+diagonal
+  rounds over the 4x4 word matrix, splitmix64-continued Golden Phi init
+  stream, and LENGTH-ENCODED padding — the trailing-zeros limit frozen
+  into v1 is closed for v2. Contract-tested (KATs incl. rate boundaries
+  63/64/65, streaming equivalence both directions, SAC ~50%, idempotent
+  finalize, H(m) != H(m||0)). NOT wired into consensus or the frozen
+  wire: the address-version soft migration (both versions verified in
+  parallel) is the remaining half of this item.
 - [ ] Extend the wire frame and address derivation for v2 with a soft
   migration (both versions verified in parallel; v1 never invalidated).
 - [ ] Fold into the same work: PQ key rollover (a key signs at most 16
@@ -900,6 +923,43 @@ with an active reorg. Honest gap, raised by the owner's review question.
   pressure vs. TDI-filtered spam economics (simulate).
 - Acceptance: `docs/design/tokenomics.md`; remaining parameters land in
   genesis config, not scattered constants.
+
+### 2.6 Epoch snapshots & undo-journal pruning (owner question, 2026-11-05)
+
+Today nothing is prunable: the block store is an append-only mmap
+archive by design; `undo.vxl` keeps undo records for the WHOLE height
+range (the in-memory journal is the write model; `truncate_undo_file`
+rewrites the file after a rollback but never shrinks history), and
+`displaced.vxd` grows with every reorg event. Honest gap.
+
+- [ ] Phase 1 (provable, cheap): prune undo records and displaced
+  frames with height <= GQC finalized_checkpoint_height_ (after each
+  new checkpoint and at startup). Safe by construction: rollback below
+  the checkpoint is already refused (ERR_FINALIZED_BY_GQC), so those
+  records can never be used. Compact via the existing rewrite path.
+- [ ] Phase 2 (real epochs): at a GQC-cemented epoch boundary, write a
+  state snapshot (LedgerState balances+nonces+supply, GaloisTrie state
+  root) into an epoch sidecar, bound to the chain by hashing the state
+  root into the certified record. New nodes: snapshot + verify root +
+  replay forward. The state-root RPC surface
+  (handle_state_trie_root/handle_state_prove) already exists.
+- [ ] The block store itself stays append-only this phase — pruning
+  blocks would break backfill sync (0.1) and is a separate SPV-mode
+  decision.
+
+### 2.7 Landauer gas: temperature is abstract (owner question, 2026-11-05)
+
+`LANDAUER_KT_LN2_SCALED = 960` (include/vx/vm/vortex_vm.hpp) is a
+dimensionless scaled proxy for k_B*T*ln2, not a physical constant: no
+Kelvin value and no joule-to-atom conversion exists in the code, and
+none SHOULD exist — gas must be byte-reproducible from bytecode alone,
+so any physical constant would be an unverifiable scale factor. The
+consensus invariants are determinism and the ratio structure
+(erasure : flip : NOP = 960 : 3 : 1; erasure costs more than
+overwriting — the physical heart of Landauer's principle). Remaining
+work is documentation only: a whitepaper paragraph stating that T is
+folded into the scale constant and that any joule mapping is a
+doc-level convention, never consensus state.
 
 ---
 

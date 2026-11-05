@@ -136,6 +136,10 @@ target_link_libraries(test_vortex PRIVATE vx_core)
 add_executable(test_fold_window tests/test_fold_window.cpp)
 target_link_libraries(test_fold_window PRIVATE vx_core)
 
+# VortexSponge512 (v2 sponge) contract tests - BACKLOG 0.15
+add_executable(test_sponge512 tests/test_sponge512.cpp)
+target_link_libraries(test_sponge512 PRIVATE vx_core gtest gtest_main)
+
 # Industrial deep cryptographic verification suite
 add_executable(crypto_deep_tests tests/crypto_deep_tests.cpp)
 target_link_libraries(crypto_deep_tests PRIVATE vx_core gtest gtest_main)
@@ -258,13 +262,15 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
             test_chain_stress test_boundary_torture test_crash_torture
             test_rpc_auth test_key_import
-            test_apply_integrity test_mempool_admission test_fold_window)
+            test_apply_integrity test_mempool_admission test_fold_window
+            test_sponge512)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
 enable_testing()
 add_test(NAME VortexMathTest COMMAND test_vortex)
 add_test(NAME VortexFoldWindowTest COMMAND test_fold_window)
+add_test(NAME VortexSponge512Test COMMAND test_sponge512)
 add_test(NAME VortexDeepCryptoTest COMMAND crypto_deep_tests)
 add_test(NAME VortexBlockTest COMMAND test_block)
 add_test(NAME VortexDocumentedGapsTest COMMAND test_documented_gaps)
