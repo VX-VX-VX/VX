@@ -56,6 +56,21 @@ public:
     static std::string formatAddress(std::string_view rawAddress, std::string_view type = "NFA");
 
     /**
+     * @brief Fail-closed seed canonicalization check (BACKLOG 2.8).
+     *
+     * The derivation itself is frozen (canonical vectors), so degenerate
+     * input classes are refused at the SURFACES that feed it. Returns an
+     * empty string when the seed is canonical, otherwise a short operator
+     * -facing reason. Rules (mirroring the degeneracy findings):
+     *  - empty, non-hex characters, or the all-zero seed: refused;
+     *  - more than 512 hex chars (after the optional lowercase "0x"
+     *    prefix): refused - run() would silently truncate;
+     *  - an uppercase "0X" prefix: refused - it is not stripped by run()
+     *    and shifts the seed window (case-asymmetric quirk).
+     */
+    static std::string canonicalSeedError(std::string_view seedHex);
+
+    /**
      * @brief Computes Act IV Chinese Remainder Theorem (CRT) reconstruction.
      */
     static mpz_class computeCrtUnwrapping(

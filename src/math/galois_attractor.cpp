@@ -7,6 +7,34 @@
 
 namespace vx::math {
 
+std::string VortexAttractor::canonicalSeedError(std::string_view seedHex) {
+    // Mirror run()'s own normalization exactly: lowercase "0x" is
+    // stripped BEFORE length checks (it is excluded from the 512-char
+    // seed budget); an uppercase "0X" is NOT stripped by run(), so it
+    // must be refused rather than silently mis-windowed.
+    std::string clean(seedHex);
+    if (clean.rfind("0x", 0) == 0) clean = clean.substr(2);
+    if (!clean.empty() && clean.rfind("0X", 0) == 0) {
+        return "uppercase 0X prefix is non-canonical (use 0x or bare hex)";
+    }
+    if (clean.empty()) {
+        return "seed is empty";
+    }
+    if (clean.size() > 512) {
+        return "seed exceeds 512 hex chars (would be silently truncated)";
+    }
+    for (char c : clean) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            return "seed contains non-hex characters";
+        }
+    }
+    const bool all_zero = clean.find_first_not_of('0') == std::string::npos;
+    if (all_zero) {
+        return "zero seed refused (degenerate fixed address)";
+    }
+    return {};
+}
+
 mpz_class VortexAttractor::hexToBigInt(std::string_view hex) {
     std::string clean(hex);
     if (clean.rfind("0x", 0) == 0 || clean.rfind("0X", 0) == 0) {

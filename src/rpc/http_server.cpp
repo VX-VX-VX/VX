@@ -1507,6 +1507,15 @@ HttpResponse HttpServer::handle_crypto_lab(const HttpRequest& req) {
         "b2fd1f7332a634663fdac32f387c63bc0d6a4fc3e47f62b3baf0c1e0194b7868"
         "7bf978d1e0b6561501dbaa6ea17a3ad582b6e3bf4ce818823d8ce38233a2b7cf";
 
+    // BACKLOG 2.8 fail-closed canonicalization: degenerate seed classes
+    // (non-hex, over-length truncation, 0X prefix, the zero seed) are
+    // refused with an explicit 400 instead of deriving a degenerate
+    // address. The derivation itself stays frozen.
+    if (const std::string seed_err = vx::math::VortexAttractor::canonicalSeedError(seed);
+        !seed_err.empty()) {
+        return HttpResponse::error(400, seed_err.c_str());
+    }
+
     int rounds = extract_num("rounds", 1000);
     bool sac_test = extract_bool("sac_test");
 

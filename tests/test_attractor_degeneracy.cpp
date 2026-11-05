@@ -182,6 +182,28 @@ int main() {
         std::cout << "xorFold coverage: 32/32 digest bytes, exactly once OK\n";
     }
 
+    // ── 9. Fail-closed canonicalization at the surface (BACKLOG 2.8) ────
+    // The derivation is frozen; degenerate seed classes are refused by
+    // canonicalSeedError() BEFORE they reach it (wired into the
+    // crypto-lab RPC endpoint as a 400).
+    {
+        assert(VortexAttractor::canonicalSeedError(kCanonicalSeed).empty());
+        assert(VortexAttractor::canonicalSeedError("0x" + kCanonicalSeed).empty());
+
+        assert(!VortexAttractor::canonicalSeedError("").empty());              // empty
+        assert(!VortexAttractor::canonicalSeedError(std::string(512, '0')).empty()); // zero seed
+        assert(!VortexAttractor::canonicalSeedError(std::string(513, 'a')).empty()); // truncation
+        assert(!VortexAttractor::canonicalSeedError("0X" + kCanonicalSeed).empty()); // 0X prefix
+        assert(!VortexAttractor::canonicalSeedError(std::string(500, 'a') + "zz").empty()); // non-hex
+
+        // Shorter-than-canonical seeds remain accepted (the padding
+        // degeneracy is pinned in check 3, not yet refused - a future
+        // canonical-length policy belongs to the same BACKLOG item).
+        assert(VortexAttractor::canonicalSeedError("1234").empty());
+        std::cout << "canonicalSeedError: all degenerate classes refused OK\n";
+    }
+
+
     std::cout << "DEGENERACY HUNT: all checks passed\n";
     return 0;
 }

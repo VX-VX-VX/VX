@@ -998,7 +998,16 @@ severity:
   `hexToBigInt` now validates character-by-character and throws
   (fail-loud), including the partial case (valid first half, garbage
   second half silently zeroed Y_0 before).
-- [ ] The zero seed has a fixed, findable address
+- [x] DELIVERED 2026-11-05 (v0.0.12) at the RPC surface:
+  `VortexAttractor::canonicalSeedError()` + a 400 gate in the
+  crypto-lab endpoint. Refused classes: non-hex, over-length (the
+  truncation degeneracy), the uppercase 0X prefix, the all-zero seed.
+  E2E-verified against a live node (garbage/zero/overlong -> 400,
+  canonical vector -> 200). Shorter-than-canonical seeds are still
+  accepted (the padding degeneracy stays pinned in the test suite, not
+  yet refused - refusing it would break any existing wallet that
+  derived from a short seed, so it needs a migration note first).
+- [x] The zero seed has a fixed, findable address
   (NFA_V6_USaRKlmk3c_EfXuVbtfVfwzyd2QEQKZLyL7VbKIIAA with classic
   moduli). The state does not collapse (Z_0 = PHI != 0), but a
   derivation surface should refuse the all-zero seed outright.
