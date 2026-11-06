@@ -495,7 +495,7 @@ point is that it is *public*.
 
 ## Test suite
 
-35 ctest entries; all pass in **both** build editions:
+36 ctest entries; all pass in **both** build editions:
 
 | Target | Coverage |
 |---|---|
@@ -526,7 +526,9 @@ U128 edges, the 15-leaf PQ economy), a 1000-block chain stress with full
 ledger-model cross-check, the deterministic bifurcation oracle,
 crash/recovery torture, the reorg carousel, ASERT retarget, RPC
 auth, C5 key import (fail-closed, constant-time), apply-path
-integrity, and mempool admission.
+integrity, mempool admission, the VortexSponge1024 digest contract, and
+the VX2 generation-2 address format (own 135-bit BCH checksum, 6-symbol
+substitution guarantee - docs/ADDRESS_FORMATS_V2.md).
 
 ---
 

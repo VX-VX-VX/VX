@@ -1662,6 +1662,18 @@ this session:
   exist to diff against.
 - Status: DOCUMENTED AND PINNED (defect pin, not a fix pin); address v2
   awaits the owner's go, bundled with the migration protocol.
+- UPDATE (2026-11-06, later): the VX2 PRIMITIVE IS BUILT AND COMMITTED
+  (include/vx/math/address_v2.hpp + tests/test_address_v2.cpp +
+  docs/ADDRESS_FORMATS_V2.md) - still ADDITIVE, not wired into consensus
+  or the v1 wire; adoption stays gated on the owner + migration
+  protocol. VX2 fixes the 2.17 narrow fold by construction (sponge
+  digest over all 3072 final-state bits) and the 2.18 side-finding
+  (NFA/OFA domain separation) by construction. The VX2 checksum survived
+  two of our own adversarial redesigns before commit (order-31 alpha:
+  bound void; order-93 alpha: exponent aliasing, 1794 undetected
+  weight-2 pairs found empirically); the final design is a 135-bit BCH
+  code over GF(2^9) with alpha of order 511 and a valid Vandermonde
+  bound - every <= 6-symbol substitution detected, ~2^-135 residual.
 
 ### 2.18 DOC-VS-CODE DRIFT: the documented KDF stretch does not exist in the derivation path
 
