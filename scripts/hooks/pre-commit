@@ -36,12 +36,13 @@ fi
 if command -v clang-format >/dev/null 2>&1; then
     while IFS= read -r f; do
         case "$f" in *.cpp|*.cc|*.hpp|*.h) ;; *) continue ;; esac
-        ranges=$(git diff --cached -U0 -- "$f" | awk '/^@@/{gsub("[^0-9,+]","",$3); print $3}' | tr -d '+')
+        ranges=$(git diff --cached -U0 -- "$f" |
+                 awk '/^@@/{split($3,a,","); s=substr(a[1],2)+0;
+                      n=(a[2]==""?1:a[2]+0); if(n>0) print s":"(s+n-1)}')
         [ -n "$ranges" ] || continue
         for r in $ranges; do
-            start=${r%%,*}; end=${start}; [ "$r" = "$start" ] || end=${r##*,}
-            if ! clang-format --dry-run -Werror --lines="$start:$end" "$f" >/dev/null 2>&1; then
-                echo "OPSEC pre-commit: $f lines $start:$end violate .clang-format."
+            if ! clang-format --dry-run -Werror --lines="$r" "$f" >/dev/null 2>&1; then
+                echo "OPSEC pre-commit: $f lines $r violate .clang-format."
                 echo "  Run: scripts/format_staged.sh   (then re-add the file)"
                 status=1
             fi
