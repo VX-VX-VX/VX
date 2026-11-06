@@ -1547,9 +1547,17 @@ system's cryptographic security."
   the key); warm/cold byte-identical witnesses pinned (test_pq_rollover
   section 12) - the cache can never alter an output, so a stale digest
   cannot surface as success.
-- P1 seed validation: a single secure set - prime certification with a
-  documented error probability; no path may mix classic validation /
-  secure derivation / a third set; classic is a test fixture only.
+- P1 seed validation: DONE (2026-11-06, T8 of VortexCrtSeamTheoremsTest).
+  Single-set discipline pinned structurally: active_default() IS
+  secure_crt() (field-by-field), the constants live only in
+  include/vx/core/types.hpp, src/ references classic() in comments
+  only, and tests use it as the declared fixture. Prime certification
+  now runs IN-REPO: GMP trial division + 50 Miller-Rabin rounds per
+  modulus, documented error probability <= 4^-50 < 2^-100 each - this
+  also pins Theorem 6's hypothesis (cube-map bijectivity requires
+  prime moduli). The classic fixture set is pinned COMPOSITE
+  (definitely-composite verdict for all three), so it can never
+  silently become a derivation set.
 - P1 genesis migration: byte-identical vectors via a dedicated
   migration protocol - pin the old canonical vectors, generate new ones
   under the Guard, compare all 3072 bits plus every derived address,

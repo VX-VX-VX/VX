@@ -230,6 +230,32 @@ int main() {
     std::cout << "T7 constructive fold entry: seeds with arxY_B = arxY_A + Q, "
                  "cubeY equal, step output diverges OK\n";
 
+    // -- T8: moduli certification (P1 seed-set unification, BACKLOG) ------
+    // Theorem 6's hypothesis is PRIMALITY of the frozen moduli; it is
+    // pinned here, not assumed. Certification: GMP mpz_probab_prime_p
+    // runs trial division + `reps` Miller-Rabin rounds; the MR error
+    // bound is 4^-reps, so reps = 50 documents an error probability
+    // <= 4^-50 < 2^-100 for each modulus. The classic fixture set is
+    // pinned COMPOSITE (definitely-composite verdict for all three) so
+    // it can never silently become a derivation set, and single-set
+    // discipline is pinned structurally: active_default() IS secure_crt.
+    {
+        const auto secure = vx::core::AttractorModuli::secure_crt();
+        const auto classic = vx::core::AttractorModuli::classic();
+        for (const mpz_class *m : {&secure.p, &secure.q, &secure.r}) {
+            assert(mpz_probab_prime_p(m->get_mpz_t(), 50) >= 1);
+        }
+        for (const mpz_class *m : {&classic.p, &classic.q, &classic.r}) {
+            assert(mpz_probab_prime_p(m->get_mpz_t(), 50) == 0); // composite
+        }
+        assert(secure.p == moduli.p && secure.q == moduli.q && secure.r == moduli.r);
+        const auto active = vx::core::AttractorModuli::active_default();
+        assert(active.p == secure.p && active.q == secure.q && active.r == secure.r);
+        std::cout << "T8 moduli certification: secure set prime (MR error "
+                     "<= 2^-100), classic set composite, single-set "
+                     "discipline OK\n";
+    }
+
     std::cout << "CRT SEAM THEOREMS: all pins passed\n";
     return 0;
 }
