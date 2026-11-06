@@ -1662,3 +1662,32 @@ this session:
   exist to diff against.
 - Status: DOCUMENTED AND PINNED (defect pin, not a fix pin); address v2
   awaits the owner's go, bundled with the migration protocol.
+
+### 2.18 DOC-VS-CODE DRIFT: the documented KDF stretch does not exist in the derivation path
+
+- FOUND (2026-11-06, while walking the owner through a live derivation
+  with a fresh 2048-bit demo seed): docs/ADDRESS_SECURITY.md sections 3
+  and 6 describe the chain as "seed -> KDF stretch (VX_KDF_ITERS sponge
+  rounds) -> attractor", and the wall table prices one preimage trial as
+  "1000 iterations x 3 cubic maps + KDF". There is NO VX_KDF_ITERS
+  anywhere in src/ or include/ and run() consumes the seed directly:
+  split -> Z_0 -> 1000 steps. The attractor does not touch the sponge at
+  all. (The grep hit "stretch" in emission.hpp is the emission schedule,
+  unrelated.)
+- Consequence: the per-trial cost claim is PARTLY overstated (the KDF
+  term is fiction), but the wall itself is unchanged - one trial is
+  measured at ~3 ms (1000 iterations x 3 modular cubings over 1024-bit
+  generalized Mersenne moduli), and ~2^128 trials is astronomically
+  beyond reach regardless. The drift is a claims-integrity violation of
+  the cardinal rule, not a security loss.
+- Side finding from the same walk: NFA and OFA share the IDENTICAL
+  base64url body (both are formatted from one rawAddr string) - holding
+  both address types of one identity is by construction a trivial link.
+  Record for the address-v2 design: v2 should domain-separate the two
+  formats (different fold tag per address type).
+- Fix: correct ADDRESS_SECURITY.md sections 3 and 6 (drop the KDF term
+  or specify an actual stretch as a versioned change); revisit whether a
+  real KDF stretch SHOULD exist (it would raise bulk-attack cost per
+  seed at wallet-open time) - that is a derivation change and goes
+  through the migration protocol, not a doc edit.
+- Status: OPEN (P2, documentation honesty).
