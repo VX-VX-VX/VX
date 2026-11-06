@@ -147,7 +147,7 @@ std::array<uint8_t, 32> wots_leaf_pk_root(uint32_t global_leaf,
     return root;
 }
 
-// ── Per-window leaf cache (BACKLOG 1.5) ──────────────────────────────────────
+// ── Per-window leaf cache (BACKLOG 1.5, P1-declassified key) ─────────────────
 // Every signature and every tree root used to recompute all 16 leaves of the
 // window from scratch (~16k chain steps each). The leaf public-key roots are
 // PUBLIC, deterministic data (chain ends of the WOTS public keys), so caching
@@ -155,22 +155,54 @@ std::array<uint8_t, 32> wots_leaf_pk_root(uint32_t global_leaf,
 // signature that fails verification (fail-visible), never a wrong-but-valid
 // one, and the cache is always checkable by recomputation. thread_local: no
 // locks, no cross-thread sharing, no false sharing. Never persisted.
+//
+// P1 (owner audit): master_sk must NOT rest in the cache. The slot key is
+// an OPAQUE 256-bit generation tag sponge("VX_PQ_CACHE_GEN_V1" || master_sk
+// || pub_seed) recomputed from the caller's key material on every lookup;
+// no secret byte is ever stored. Object-address reuse cannot alias a slot
+// (no pointers or addresses are part of the key), and rollover invalidates
+// explicitly via pq_leaf_cache_invalidate().
 struct LeafCacheSlot {
     bool valid = false;
     uint32_t window = 0;
-    std::array<uint8_t, 32> master{};
-    std::array<uint8_t, 32> seed{};
+    std::array<uint8_t, 32> gen{};  // opaque, non-reversible tag
+    std::array<uint8_t, 32> seed{}; // pub_seed (public)
     std::array<std::array<uint8_t, 32>, XMSS_LEAVES> leaves{};
 };
 thread_local LeafCacheSlot g_leaf_cache[2];
 thread_local unsigned g_leaf_cache_turn = 0;
 
+std::array<uint8_t, 32> leaf_cache_gen_id(const std::array<uint8_t, 32> &master_sk,
+                                          const std::array<uint8_t, 32> &pub_seed) noexcept {
+    PreimageBuf k;
+    k.put_str("VX_PQ_CACHE_GEN_V1", 19);
+    k.put(master_sk.data(), 32);
+    k.put(pub_seed.data(), 32);
+    std::array<uint8_t, 32> out{};
+    sponge(k.b.data(), k.n, out.data());
+    return out;
+}
+
+void pq_leaf_cache_invalidate() noexcept {
+    for (auto &slot : g_leaf_cache) {
+        slot.valid = false;
+        for (auto &leaf : slot.leaves) {
+            volatile uint8_t *wipe = leaf.data();
+            for (size_t b = 0; b < 32; ++b)
+                wipe[b] = 0; // public data; hygiene wipe
+        }
+        (void)0;
+    }
+    g_leaf_cache_turn = 0;
+}
+
 std::array<uint8_t, 32> window_leaf_root(uint32_t window, uint32_t leaf_in_window,
                                          const std::array<uint8_t, 32>& master_sk,
                                          const std::array<uint8_t, 32>& pub_seed) noexcept {
+    const std::array<uint8_t, 32> gen = leaf_cache_gen_id(master_sk, pub_seed);
     for (const auto& slot : g_leaf_cache) {
         if (slot.valid && slot.window == window &&
-            std::memcmp(slot.master.data(), master_sk.data(), 32) == 0 &&
+            vx::core::ct_equal(slot.gen.data(), gen.data(), 32) &&
             std::memcmp(slot.seed.data(), pub_seed.data(), 32) == 0) {
             return slot.leaves[leaf_in_window];
         }
@@ -182,7 +214,7 @@ std::array<uint8_t, 32> window_leaf_root(uint32_t window, uint32_t leaf_in_windo
     g_leaf_cache_turn = (g_leaf_cache_turn + 1) % 2;
     s.valid = true;
     s.window = window;
-    s.master = master_sk;
+    s.gen = gen;
     s.seed = pub_seed;
     const uint32_t window_base = window << XMSS_H;
     for (size_t j = 0; j < XMSS_LEAVES; ++j) {
@@ -285,6 +317,10 @@ std::array<uint8_t, 32> rollover_binding_digest(
 PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32>& master_sk,
                                     uint32_t from_tree, uint32_t to_tree,
                                     PqLeafLedger* leaf_ledger) noexcept {
+    // Explicit rollover invalidation (P1): the certificate changes the
+    // account's active window epoch, so any cached window state must not
+    // outlive this call. Cheap (two flag clears), conservative.
+    pq_leaf_cache_invalidate();
     if (from_tree == to_tree) return PqSignatureWitness{}; // binds nothing
     if (from_tree > PQ_MAX_SUBTREE_INDEX || to_tree > PQ_MAX_SUBTREE_INDEX) {
         return PqSignatureWitness{}; // outside the global-leaf namespace

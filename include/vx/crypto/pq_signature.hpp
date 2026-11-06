@@ -101,6 +101,12 @@ std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
 /// PQ binding) without signing anything.
 std::array<uint8_t, 32> pub_seed_from_sk(const std::array<uint8_t, 32>& sk) noexcept;
 
+/// P1 hardening of the per-window leaf cache (BACKLOG 1.5): the cache key
+/// holds an opaque 256-bit generation tag, never master_sk bytes. Call to
+/// drop every cached window (called automatically by pq_sign_rollover;
+/// exposed for explicit invalidation around key-handling operations).
+void pq_leaf_cache_invalidate() noexcept;
+
 // ── Tree rollover (BACKLOG 1.5, delivered v0.0.13) ──────────────────────────
 //
 // The account's master key spans ONE flat WOTS+ hypertree with a 32-bit

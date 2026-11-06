@@ -306,6 +306,48 @@ int main() {
         ::unlink(path.c_str());
     }
 
+    // ── 12. P1 cache-key declassification: opaque gen id, no master_sk ──
+    // (1) the cache output is INDEPENDENT of cache state: byte-identical
+    // witness warm vs cold (invalidate between) - a stale digest can never
+    // be served as success because the key (gen, seed, window) pins the
+    // derivation exactly and the miss path recomputes the same bytes;
+    // (2) explicit rollover invalidation keeps rollover signing correct;
+    // (3) slot reuse across invalidate() calls cannot alias: alternating
+    // two masters/windows interleaved with invalidations still derives
+    // the same roots as a cold computation;
+    // (4) object-address reuse is structurally impossible to alias - the
+    // key holds no pointers or addresses, only (opaque gen tag, pub_seed,
+    // window), and the gen tag is recomputed from live key material.
+    {
+        // warm/cold determinism: sign, invalidate, sign again.
+        const auto wit_warm = pq_sign_message(0, 0, master, pub_seed, pseudo_bytes(77));
+        pq_leaf_cache_invalidate();
+        const auto wit_cold = pq_sign_message(0, 0, master, pub_seed, pseudo_bytes(77));
+        assert(roots_equal(wit_warm.witness_digest, wit_cold.witness_digest));
+        assert(pq_verify_wots_xmss(pseudo_bytes(77), wit_warm));
+
+        // interleaved slot reuse: two masters, same window, invalidations
+        // between - each derivation must match its own cold value.
+        const auto m2 = pseudo_bytes(202);
+        const auto ps2 = pub_seed_from_sk(m2);
+        const auto r_m1 = xmss_root_tree(master, pub_seed, 0);
+        const auto r_m2 = xmss_root_tree(m2, ps2, 0);
+        pq_leaf_cache_invalidate();
+        assert(roots_equal(xmss_root_tree(m2, ps2, 0), r_m2));
+        pq_leaf_cache_invalidate();
+        assert(roots_equal(xmss_root_tree(master, pub_seed, 0), r_m1));
+        assert(!roots_equal(r_m1, r_m2)); // distinct keys never collide
+
+        // rollover still certifies correctly right after invalidation.
+        PqLeafLedger ledger;
+        const auto r0 = xmss_root_tree(master, pub_seed, 0);
+        const auto r1 = xmss_root_tree(master, pub_seed, 1);
+        const auto cert = pq_sign_rollover(master, 0, 1, &ledger);
+        assert(pq_verify_rollover(r0, 0, 1, r1, cert));
+        std::cout << "P1 cache declassification: warm/cold byte-identical, "
+                     "no aliasing, rollover invalidation OK\n";
+    }
+
     std::cout << "PQ ROLLOVER: all checks passed\n";
     return 0;
 }

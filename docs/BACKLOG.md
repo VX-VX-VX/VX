@@ -1502,15 +1502,17 @@ outside this repo by design (build tools are not consensus code).
 
 ### 1.5 addition: XMSS per-window leaf cache (owner question)
 
-- Status: NOT implemented. Every signature recomputes all 16 leaves of
-  the window from scratch (wots_leaf_pk_root per leaf) - the owner's
-  ~16k chain-step figure is the right order of magnitude.
-- Design: cache the 16 non-secret leaf digests of the active window
-  (512 bytes per window, public data - safely cacheable, verifiable by
-  recomputation). Cuts the WOTS-chain part of signing ~16x. Honest
-  note: auth-path sibling hashes are still recomputed per signature,
-  but they are cheap node hashes, not chains. Invalidate on any
-  rollover window change; memory-only, never persisted.
+- Status: IMPLEMENTED (thread_local, two direct-mapped slots, 512 bytes
+  per window, memory-only, never persisted). P1 KEY DECLASSIFICATION
+  DONE (2026-11-06): master_sk no longer rests in the cache - the slot
+  key is an opaque 256-bit generation tag sponge("VX_PQ_CACHE_GEN_V1" ||
+  master_sk || pub_seed) recomputed from live key material on every
+  lookup. Object-address reuse cannot alias a slot (no pointers in the
+  key); pq_sign_rollover invalidates explicitly (pq_leaf_cache_invalidate,
+  also exposed publicly); warm/cold byte-identical witness pinned in
+  test_pq_rollover section 12 - a stale digest can never be served as
+  success. Honest note: auth-path sibling hashes are still recomputed
+  per signature, but they are cheap node hashes, not chains.
 
 ## Owner priority table for the next release (audit of v0.0.16, 2026-11-05 late)
 
@@ -1536,12 +1538,15 @@ system's cryptographic security."
   directory (flock + re-parse) - no double assignment; rollback never
   returns a reserved leaf to the pool (no release API exists; the burned
   set only grows). 32/32 ctest suites green.
-- P1 thread-local leaf cache: master_sk must NOT be part of the cache
-  key (a secret in a cache key contradicts the MemoryVault threat
-  model) - use an opaque generation identifier + pub_seed + window
-  instead; explicit invalidation on rollover; verify object-address
-  reuse cannot alias a slot; the cache must never serve a stale digest
-  as success.
+- P1 thread-local leaf cache: DONE (2026-11-06). master_sk is out of
+  the cache key entirely - the slot key is an opaque 256-bit generation
+  tag (sponge over the key material, recomputed per lookup, no secret
+  bytes at rest); pub_seed + window stay public plaintext parts of the
+  key; pq_sign_rollover invalidates explicitly (pq_leaf_cache_invalidate
+  is also public); object-address reuse cannot alias (no pointers in
+  the key); warm/cold byte-identical witnesses pinned (test_pq_rollover
+  section 12) - the cache can never alter an output, so a stale digest
+  cannot surface as success.
 - P1 seed validation: a single secure set - prime certification with a
   documented error probability; no path may mix classic validation /
   secure derivation / a third set; classic is a test fixture only.
