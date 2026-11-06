@@ -26,6 +26,48 @@ The binding condition a candidate seed must satisfy is the **fold
 preimage**: `xorFold(X, Y, Z) == target_digest`. That condition — not a
 parity invariant — is the wall this document analyzes.
 
+## CORRECTION (2026-11-06): the digest carries 128 bits, not 256
+
+Found during the genesis-migration vector work and pinned 32/32 in
+`test_digest_uniformity` (`VortexDigestUniformityTest`). The xor-fold
+implementation (src/math/galois_attractor.cpp) writes
+
+    out[2k]   = mixed_k = x_k ^ y_(15-k) ^ z_((7k) mod 16)
+    out[2k+1] = nibble_swap(mixed_k)
+
+so every adjacent byte pair of the digest is (b, swapnib(b)) - the
+second byte carries NO new information. Additionally only the TOP 128
+bits of each 1024-bit final state enter the fold (bytes 0..15; the
+byte-extraction loop writes the most significant byte to index 0).
+Corrected arithmetic:
+
+| Quantity | Claimed | ACTUAL |
+|---|---|---|
+| Address digest space | 2^256 | **2^128** (16 independent bytes) |
+| Birthday collision threshold | ~2^128 accounts | **~2^64 accounts** |
+| Fold-preimage wall (generic) | ~2^256 | **~2^128** |
+| Visible payload entropy | 238 bits | **~126 bits** (16 bytes + truncation) |
+
+Two independent consequences:
+
+1. **Security margin, not break.** 2^128 address space and a ~2^64
+   birthday bound remain far beyond any realistic account population;
+   seed preimage still requires inverting ~1000 ARX+sponge rounds. But
+   the published 256-bit claims above are WRONG and must not be cited.
+2. **Fingerprinting.** The (b, swapnib(b)) byte structure is visible in
+   the base64url body: every VX address is trivially distinguishable
+   from arbitrary base64 strings by this pattern alone - a linkability
+   and network-fingerprinting surface that did not have to exist.
+
+DECISION: the derivation, wire formats and address formats are FROZEN.
+The fix is an ADDRESS FORMAT V2 (independent hash-based fold - the
+sponge, not a hand-rolled XOR) adopted through the genesis migration
+protocol (docs/DERIVATION_MIGRATION.md, `DERIVATION_VERSION`), with
+old/new node fail-closed separation. Until then this defect stands
+documented and pinned. The claims in the numbered sections below are
+the PRE-correction analysis; wherever they state 256-bit figures, the
+corrected table above governs.
+
 ## 2. Space arithmetic
 
 | Quantity | Value | Source |

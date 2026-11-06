@@ -1618,3 +1618,37 @@ this session:
 - (6) Tree revision: complete; this BACKLOG entry is the session checklist
   record. Ongoing duty: every future commit goes through the two hooks +
   `commit_utc.sh`; every future release through `make_release.sh`.
+
+### 2.17 P0 FINDING: address digest carries 128 bits, not 256 (palindromic xor-fold)
+
+- FOUND (2026-11-06, during the genesis-migration vector work; flagged
+  first as a visual base64 pattern, then confirmed on raw digest bytes,
+  pinned 32/32 in test_digest_uniformity / VortexDigestUniformityTest).
+- Root cause (src/math/galois_attractor.cpp, xorFold): for k = 0..15
+  the fold writes out[2k] = mixed_k and out[2k+1] = nibble_swap(mixed_k)
+  - every odd output byte is the nibble swap of the preceding even byte
+  and carries zero information. Additionally only the TOP 128 bits of
+  each 1024-bit state enter the fold at all (bytes 0..15 of the
+  big-endian byte extraction).
+- Consequences: address digest space 2^128 (not 2^256); birthday
+  collision threshold ~2^64 accounts (not ~2^128); generic fold-preimage
+  ~2^128 (not ~2^256); visible payload ~126 bits; and VX addresses are
+  VISUALLY FINGERPRINTABLE - the (b, swapnib(b)) structure shows through
+  the base64url body, so a VX address is recognizable among arbitrary
+  base64 strings (linkability surface). docs/ADDRESS_SECURITY.md
+  corrected with a dated section; the pre-correction 256-bit figures
+  there are superseded.
+- Not a practical break: 2^128 address space and ~2^64 birthday remain
+  beyond any realistic account population, and seed preimage still
+  requires inverting ~1000 ARX+sponge rounds. The damage is to the
+  PUBLISHED CLAIMS (cardinal rule: never present a theoretical figure
+  as a cryptographic guarantee) and to address stealth.
+- DECISION: derivation, wire and address formats are FROZEN; no silent
+  fix. The remedy is ADDRESS FORMAT V2 (fold through the sponge instead
+  of the hand-rolled XOR) adopted via the genesis migration protocol
+  (docs/DERIVATION_MIGRATION.md, VortexAttractor::DERIVATION_VERSION,
+  pinned version-1 vectors, fail-closed old/new node separation) - the
+  migration machinery this same session built. Version-1 vectors now
+  exist to diff against.
+- Status: DOCUMENTED AND PINNED (defect pin, not a fix pin); address v2
+  awaits the owner's go, bundled with the migration protocol.

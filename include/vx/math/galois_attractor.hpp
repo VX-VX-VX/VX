@@ -48,6 +48,14 @@ struct SacRoundData {
 
 class VortexAttractor {
 public:
+    // Derivation algorithm version (genesis migration protocol,
+    // docs/DERIVATION_MIGRATION.md). Version 1 = the frozen derivation as
+    // pinned in tests/test_derivation_migration.cpp. NEVER change the
+    // derivation without bumping this and running the migration protocol:
+    // byte-identical 3072-bit vectors + every derived address, and nodes
+    // refuse identity material from a foreign version (fail-closed).
+    static constexpr uint32_t DERIVATION_VERSION = 1;
+
     static mpz_class hexToBigInt(std::string_view hex);
     static std::string bigIntToHex1024(const mpz_class& val);
     static mpz_class rotl1024(const mpz_class& val, unsigned int shift);

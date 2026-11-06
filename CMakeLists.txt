@@ -161,6 +161,10 @@ target_link_libraries(test_attractor_degeneracy PRIVATE vx_core)
 # (docs/CRT_COLLISION_ANALYSIS.md, owner audit 2026-11-05/06)
 add_executable(test_crt_seam_theorems tests/test_crt_seam_theorems.cpp)
 target_link_libraries(test_crt_seam_theorems PRIVATE vx_core)
+add_executable(test_derivation_migration tests/test_derivation_migration.cpp)
+target_link_libraries(test_derivation_migration PRIVATE vx_core)
+add_executable(test_digest_uniformity tests/test_digest_uniformity.cpp)
+target_link_libraries(test_digest_uniformity PRIVATE vx_core)
 
 # Industrial deep cryptographic verification suite
 add_executable(crypto_deep_tests tests/crypto_deep_tests.cpp)
@@ -288,7 +292,8 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_rpc_auth test_key_import
             test_apply_integrity test_mempool_admission test_fold_window
             test_sponge512 test_attractor_degeneracy test_pq_rollover
-            test_crt_seam_theorems)
+            test_crt_seam_theorems test_derivation_migration
+            test_digest_uniformity)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -298,6 +303,8 @@ add_test(NAME VortexFoldWindowTest COMMAND test_fold_window)
 add_test(NAME VortexSponge512Test COMMAND test_sponge512)
 add_test(NAME VortexAttractorDegeneracyTest COMMAND test_attractor_degeneracy)
 add_test(NAME VortexCrtSeamTheoremsTest COMMAND test_crt_seam_theorems)
+add_test(NAME VortexDerivationMigrationTest COMMAND test_derivation_migration)
+add_test(NAME VortexDigestUniformityTest COMMAND test_digest_uniformity)
 add_test(NAME VortexDeepCryptoTest COMMAND crypto_deep_tests)
 add_test(NAME VortexBlockTest COMMAND test_block)
 add_test(NAME VortexDocumentedGapsTest COMMAND test_documented_gaps)
