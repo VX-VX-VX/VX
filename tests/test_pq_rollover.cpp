@@ -13,7 +13,9 @@
 #include <iostream>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
+#include <unistd.h>
 
 using namespace vx::crypto::pq;
 
@@ -186,6 +188,122 @@ int main() {
         assert(ok);
         std::cout << "rollover verify cost: " << ms << " ms (single WOTS+ envelope)\n";
         assert(ms < 500.0);
+    }
+
+    // ── 8. P0 crash test: reserve+fsync, crash BEFORE the signature ─────
+    // Durable ordering contract: the 33-byte record is appended and fsync'd
+    // INSIDE reserve_impl before any signature exists. A crash in that
+    // window burns the leaf (fail-closed) and must never hand it back.
+    {
+        const std::string path = "/tmp/vx_pq_leaf_crash_a_" + std::to_string(::getpid()) + ".log";
+        ::unlink(path.c_str());
+        const auto r0 = xmss_root_tree(master, pub_seed, 0);
+        {
+            PqLeafLedger ledger(path);
+            assert(ledger.reserve_for_tx(r0, 0) == 0); // record on disk now
+            // crash simulation: the object dies here, signature never made
+        }
+        PqLeafLedger reopened(path); // re-parses the log under flock
+        assert(reopened.used_count(r0) == 1);
+        // the same request lands on the NEXT leaf, never on the burned one
+        assert(reopened.reserve_for_tx(r0, 0) == 1);
+        assert(reopened.used_count(r0) == 2);
+        std::cout << "crash after reserve+fsync: leaf burned, not reused OK\n";
+        ::unlink(path.c_str());
+    }
+
+    // ── 9. P0 crash test: signed, crash BEFORE the tx is persisted ──────
+    // The ledger record already fsync'd at reserve time; a lost transaction
+    // (e.g. a reorg discard) must not resurrect its leaf either. The
+    // account simply continues on the next leaf.
+    {
+        const std::string path = "/tmp/vx_pq_leaf_crash_b_" + std::to_string(::getpid()) + ".log";
+        ::unlink(path.c_str());
+        const auto r0 = xmss_root_tree(master, pub_seed, 0);
+        {
+            PqLeafLedger ledger(path);
+            const int leaf = ledger.reserve_for_tx(r0, 3);
+            assert(leaf == 3);
+            const auto wit = pq_sign_message(static_cast<unsigned>(leaf), 0, master, pub_seed,
+                                             std::array<uint8_t, 32>{1, 2, 3});
+            assert(wit.pq_pubkey_root == r0);
+            // crash: the signed tx never reaches a block
+        }
+        PqLeafLedger reopened(path);
+        assert(reopened.used_count(r0) == 1);
+        // leaf 3 is gone forever; the lowest free leaf (0) is next
+        assert(reopened.reserve_for_tx(r0, 3) == 0);
+        assert(reopened.reserve_for_tx(r0, 3) == 1);
+        std::cout << "crash after sign before persist: no leaf resurrection OK\n";
+        ::unlink(path.c_str());
+    }
+
+    // ── 10. P0 concurrency: 16 RPC threads race one leaf request ────────
+    // In-process mutex serialization: exactly 15 wins (leaves 0..14),
+    // every winner holds a DISTINCT leaf, one loser gets -1. Leaf 15 is
+    // never assigned to a transaction under any schedule.
+    {
+        PqLeafLedger ledger; // memory-only
+        const auto r0 = xmss_root_tree(master, pub_seed, 0);
+        std::vector<int> assigned(16, -99);
+        std::vector<std::thread> pool;
+        for (int i = 0; i < 16; ++i) {
+            pool.emplace_back([&, i] { assigned[i] = ledger.reserve_for_tx(r0, 0); });
+        }
+        for (auto &t : pool)
+            t.join();
+        std::set<int> winners;
+        int losers = 0;
+        for (const int a : assigned) {
+            if (a < 0) {
+                ++losers;
+                continue;
+            }
+            assert(a >= 0 && a <= 14); // kernel invariant under races
+            winners.insert(a);
+        }
+        assert(losers == 1);
+        assert(winners.size() == 15);
+        std::cout << "16-thread leaf race: 15 distinct leaves, 1 refusal OK\n";
+    }
+
+    // ── 11. P0 concurrency: two ledger objects on one data directory ────
+    // Cross-object serialization via flock + re-parse on every reserve:
+    // two node processes (or two objects in one process) must never
+    // double-assign a leaf.
+    {
+        const std::string path = "/tmp/vx_pq_leaf_race_" + std::to_string(::getpid()) + ".log";
+        ::unlink(path.c_str());
+        const auto r0 = xmss_root_tree(master, pub_seed, 0);
+        PqLeafLedger la(path);
+        PqLeafLedger lb(path);
+        std::vector<int> assigned(16, -99);
+        std::vector<std::thread> pool;
+        for (int i = 0; i < 16; ++i) {
+            PqLeafLedger *target = (i % 2 == 0) ? &la : &lb;
+            pool.emplace_back([&, i, target] { assigned[i] = target->reserve_for_tx(r0, 0); });
+        }
+        for (auto &t : pool)
+            t.join();
+        std::set<int> winners;
+        int losers = 0;
+        for (const int a : assigned) {
+            if (a < 0) {
+                ++losers;
+                continue;
+            }
+            assert(a <= 14);
+            winners.insert(a);
+        }
+        assert(losers == 1);
+        assert(winners.size() == 15);
+        // Rollback discipline: nothing in the API ever returns a reserved
+        // leaf to the pool - the burned set only grows.
+        assert(la.used_count(r0) == 15);
+        assert(lb.used_count(r0) == 15);
+        std::cout << "two-object flock race: 15 distinct leaves, rollback "
+                     "never frees OK\n";
+        ::unlink(path.c_str());
     }
 
     std::cout << "PQ ROLLOVER: all checks passed\n";

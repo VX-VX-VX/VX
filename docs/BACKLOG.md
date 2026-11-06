@@ -1518,10 +1518,16 @@ system's cryptographic security."
   changes nothing outside its domain, impact on every canonical seed,
   cross-platform determinism. The 2^-960 tail must be confirmed
   MATHEMATICALLY, not statistically. (Ties into 2.12(e).)
-- P0 XMSS leaf uniqueness: crash/concurrency tests - (1) crash after
-  reserve+fsync before signing; (2) after signing before persisting;
-  (3) two parallel RPC calls racing one leaf; rollback must NEVER
-  return a reserved leaf to the pool.
+- P0 XMSS leaf uniqueness: DONE (2026-11-06, sections 8-11 of
+  test_pq_rollover.cpp): (1) crash after reserve+fsync before signing -
+  the leaf stays burned after a reopen, the same request lands on the
+  next leaf; (2) crash after signing before the tx persists - no leaf
+  resurrection, the account continues on the next leaf; (3) 16 threads
+  racing one request - 15 distinct leaves (0..14), one refusal, leaf 15
+  never assigned under any schedule; (4) two ledger objects on one data
+  directory (flock + re-parse) - no double assignment; rollback never
+  returns a reserved leaf to the pool (no release API exists; the burned
+  set only grows). 32/32 ctest suites green.
 - P1 thread-local leaf cache: master_sk must NOT be part of the cache
   key (a secret in a cache key contradicts the MemoryVault threat
   model) - use an opaque generation identifier + pub_seed + window
