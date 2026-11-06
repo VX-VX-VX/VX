@@ -1141,14 +1141,18 @@ seed string; both addresses derive from one seed):
   zero Y trunk and is now refused (documented behavior change; the
   derivation itself stays frozen).
 - [x] Zero Z-trunk: a seed whose ACT I derivation produces Z_0 == 0
-  (cube_sum == rotl1024(PHI, Y_0 % 64)). Adversarially constructible
-  in principle because the cube map is 3-to-1 (3 | r-1); the checker
-  refuses the class. The regression suite pins the NEGATIVE evidence
-  (accepted seeds derive Z_0 != 0 — ACT I refactor: the Z_0 formula is
-  now the public derive_z0(), single source of truth for run() and the
-  checker, byte-identical); constructing a positive instance needs a
-  cube-root construction mod r (no inverse of 3 mod r-1) — queued as
-  an exercise in the same item.
+  (cube_sum == rotl1024(PHI, Y_0 % 64)). CONSTRUCTION CORRECTED
+  (2026-11-06, attack-experiment session): the earlier premise "the cube
+  map is 3-to-1 (3 | r-1); no inverse of 3 mod r-1" was WRONG - a
+  confusion of v2(R-1) = 3 (8 | R-1) with divisibility by 3. In fact
+  M-1 = 1 (mod 3) for every frozen modulus, cubing is a BIJECTION
+  (docs/CRT_COLLISION_ANALYSIS.md, Theorem 6), the inverse exponent
+  d = 3^-1 mod (r-1) exists, and the class is CLOSED-FORM constructible:
+  X0 = (rotl1024(PHI, Y0 % 64) - Y0^3)^d mod r gives derive_z0 == 0 for
+  any Y0. The checker's refusal of the class stays (fail-closed); the
+  regression suite now pins a POSITIVE instance (constructed seed,
+  derive_z0 == 0, refused by canonicalSeedError on both moduli sets)
+  instead of negative evidence only.
 - [x] Fixed-point PREMISE CORRECTED: the audit assumed power maps with
   fixed points 1 and P-1/Q-1/R-1. The actual per-step trunk map is
   AFFINE — (x ^ Phi_lock)*7+13 mod p (and 11+17 / 19+23 for Y/Z) — so
@@ -1398,7 +1402,11 @@ outside this repo by design (build tools are not consensus code).
   honestly NOT established; (b) empirical orbit-length probes
   over random starts, hunt for cycles below 2^64; (c) if any short
   cycle is found, the derivation must be re-pinned; (d) document
-  Pollard-rho O(sqrt|F|) as the generic bound, not a guarantee.
+  Pollard-rho O(sqrt|F|) as the generic bound, not a guarantee; (e2)
+  NAMED OPEN PROBLEM (2026-11-06): a solver for XOR/addition condition
+  systems joined across a mod-M fold - the ARX toolbox (S-systems,
+  ARX Toolkit, hashclash) does not cover the cube-mod-prime layer;
+  tracking in docs/CRT_COLLISION_ANALYSIS.md section 8.
 - Mining impact: PoGW search enumerates seeds (sponge), not step-map
   iterations; sponge preimage resistance keeps short attractor cycles
   unexploitable for block difficulty. 100/100 distinct top-384

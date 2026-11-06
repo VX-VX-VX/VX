@@ -210,7 +210,93 @@ Empirical cross-check (2026-11-05/06 runs): 12 seeds x 1000 iterations,
 5. The classic moduli set (all three composite) is a test fixture only
    (v0.0.16); every bound above is stated for the secure set.
 
-## 7. Verification status
+## 7. Theorem 6 (no multiplicative fold; the additive family is the only one)
+
+Attack hypothesis tested 2026-11-06 (owner directive: invent attacks, do
+not stop at "no known method"). If 3 divided M-1, the cube map
+x -> x^3 mod M would be 3-to-1: there would exist a nontrivial cube root
+of unity zeta with v and v*zeta reducing to identical cube inputs - a
+collision family INDEPENDENT of the additive DELTA seam, and one that no
+amount of canonicalization could remove because it lives inside the
+field, not in the tail.
+
+Refuted on the frozen set: every modulus satisfies M = 2 (mod 3), i.e.
+3 does not divide M-1 (P-1 = 1 mod 3, Q-1 = 1 mod 3, R-1 = 1 mod 3).
+The cube map is therefore a BIJECTION on each of Z_P, Z_Q, Z_R: the
+unique cube root is x^(3^-1 mod (M-1)) mod M. Brute-force confirmation:
+30,000 random full-range 1024-bit v per modulus, 0 non-additive cube
+collisions; additive gluing (v, v+M) confirmed for all three.
+
+This CORRECTS the earlier note (BACKLOG 2.10) claiming "the cube map is
+3-to-1 (3 | r-1)" - a confusion of v2(R-1) = 3 (meaning 8 | R-1) with
+divisibility by 3. Consequence: the additive DELTA families of
+Theorem 1 are the complete collision structure of every reduction seam;
+there is no second, field-internal family.
+
+Corollary used below: because cubing is a bijection, the cube-ROOT map
+is efficiently computable (exponent 3^-1 mod (M-1)), which is what makes
+the constructions of section 8 exact rather than merely existential.
+
+## 8. Constructive fold entry at step 1 (attack experiment; merge is the wall)
+
+The 2^-136 rarity of the Q-seam tail is a probability over RANDOM seeds.
+It is NOT a defense against a deliberate constructor. Two exact
+inversions, both enabled by Theorem 6, build seeds that LAND in the fold
+zone on purpose:
+
+1. **Z0 steering.** For any chosen Y0, the map
+   X0 -> derive_z0(X0, Y0) = ((X0^3 mod r + Y0^3 mod r) mod r) XOR
+   rotl1024(PHI, Y0 mod 64) is a bijection in the X0 residue. Given any
+   desired Z0, X0 = ((Z0 XOR rotl1024(PHI, Y0 mod 64)) - Y0^3)^d mod r
+   with d = 3^-1 mod (r-1) reproduces it exactly. (The same inversion
+   solves the previously "queued exercise" of BACKLOG 2.10: zero-Z0
+   seeds are CLOSED-FORM constructible - X0 = (rotl1024(PHI, Y0 mod 64)
+   - Y0^3)^d mod r gives derive_z0 == 0. The surface refusal of that
+   class stays; the degeneracy suite now pins a positive instance.)
+2. **arxY placement.** With Z0 chosen freely, the step-1 arxY layer
+   arxY = rotl1024((Y0 + Z0) mod 2^1024, Z0 mod 64) XOR Z0 inverts
+   algebraically: Y0 = rotr1024(arxY XOR Z0, Z0 mod 64) - Z0 mod 2^1024.
+
+Combining both, an attacker constructs TWO distinct seeds A, B whose
+step-1 arxY values are an exact additive fold pair, arxY_B = arxY_A + Q
+(w < 2^1024 - Q), so cubeY_A == cubeY_B identically - pinned in
+`VortexCrtSeamTheoremsTest` (T7). Fold entry is FREE.
+
+What saves the derivation is the MERGE wall. A full state merge at the
+step-1 output requires all three of
+
+    rotl(x_A, 13) XOR cubeY_A XOR phi_tA = rotl(x_B, 13) XOR cubeY_B XOR phi_tB
+    rotl(y_A, 29) XOR cubeZ_A XOR phi_tA = rotl(y_B, 29) XOR cubeZ_B XOR phi_tB
+    rotl(z_A, 43) XOR cubeX_A XOR phi_tA = rotl(z_B, 43) XOR cubeX_B XOR phi_tB
+
+and the lossless rotation paths carry the state difference forward:
+the constructed pair diverges in all three coordinates (verified in T7).
+One cheap sub-case is CLOSED by the same bijectivity: if the rotations
+classes matched (Y0_A mod 64 == Y0_B mod 64) and X0_A == X0_B were
+forced, the Z0 equation would give Y0_A^3 == Y0_B^3 mod r, hence
+Y0_A == Y0_B - the trivial seed. Literature calibration (2026-11-06 web
+survey, owner-requested): the ARX cryptanalysis toolbox DOES contain
+solvers for mixed XOR/rotation/addition equation systems - S-systems
+solved bit-by-bit from the LSB (Leurent, ASIACRYPT 2012), differential
+trails joined meet-in-the-middle (ARX Toolkit; hashclash, the SHA-1
+tooling), used against MD5/SHA-1/HAVAL/Tiger/BMW. None of that covers
+the cube-mod-prime layer: every known technique propagates LINEAR-ish
+XOR/additive differentials through ARX rounds, while the cube map over
+a prime field has no differentials except the additive DELTA seam
+itself (Theorem 6 - bijective, no zeta family). So the honest statement
+is narrower than "no known technique": a full merge must route a state
+difference THROUGH the seam fold while simultaneously satisfying all
+three output equations - an instance the published ARX tooling does not
+handle, but not a class proven impossible. A dedicated solver for
+XOR/addition conditions joined across a mod-M fold is the named open
+problem, and meet-in-the-middle over the remaining freedom is
+~2^1536 per seam. Threat-model summary: entry into the fold zone is
+constructible at will; exiting it (merging two trajectories into one
+state) remains preimage-hard, and converting a state collision into a
+seed collision additionally requires inverting ~1000 ARX+sponge rounds
+(section 5).
+
+## 9. Verification status
 
 - Owner's O(1) construction: verified 10/10 (2026-11-05 session).
 - All-1024-rotations canonical property (Theorem 2 fact): verified
@@ -219,3 +305,14 @@ Empirical cross-check (2026-11-05/06 runs): 12 seeds x 1000 iterations,
 - Fold-tail trajectory scan: 12 seeds, 36036 reductions, 0 tail hits.
 - Deterministic test pinning of Theorems 1/2/4 and the rotation fact:
   `tests/test_crt_seam_theorems.cpp` (this release).
+- Theorem 6 bijectivity (3 does not divide M-1 for P, Q, R; inversion
+  round trip; 90,000-sample non-additive collision hunt, 0 hits) and
+  Theorem 7 constructive fold pair (exact arxY placement, identical
+  step-1 cubeY, divergence at the step output, zero-Z0 positive
+  instance): pinned in the same suite and in
+  `test_attractor_degeneracy` (2026-11-06).
+- Merge-wall claim calibrated against the published ARX-cryptanalysis
+  literature (S-systems / Leurent 2012, ARX Toolkit, hashclash): those
+  solvers cover XOR/additive differential systems but not a mod-M fold
+  nonlinearity; the open problem is now NAMED rather than waved off
+  (section 8, 2026-11-06).

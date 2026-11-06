@@ -244,6 +244,38 @@ int main() {
         for (uint64_t c = 0; c < 10; ++c) {
             assert(VortexAttractor::canonicalSeedError(pseudoSeed(c, 512)).empty());
         }
+        // Zero-Z class, POSITIVE instance (2026-11-06): the cube map is a
+        // BIJECTION mod r (3 does not divide r-1), so for any Y0 the X0
+        // with derive_z0(X0, Y0) == 0 is the closed form
+        // X0 = (rotl1024(PHI, Y0 mod 64) - Y0^3)^(3^-1 mod (r-1)) mod r.
+        // This supersedes the earlier note's "no inverse of 3 mod r-1"
+        // premise (see docs/CRT_COLLISION_ANALYSIS.md, Theorem 6): the
+        // class is constructible in closed form, the surface refusal of
+        // it stays, and the suite now pins the positive evidence instead
+        // of the negative one only.
+        {
+            const mpz_class PHI = VortexAttractor::hexToBigInt(std::string(vx::core::PHI_1024_HEX));
+            mpz_class d_inv;
+            assert(mpz_invert(d_inv.get_mpz_t(), mpz_class(3).get_mpz_t(),
+                              mpz_class(moduli.r - 1).get_mpz_t()) == 1);
+            const mpz_class y0 = mpz_class("1234567890abcdef1234567890abcdef", 16);
+            const mpz_class rot = VortexAttractor::rotl1024(PHI, mpz_class(y0 % 64).get_ui());
+            mpz_class c = rot - (y0 * y0 * y0) % moduli.r;
+            c %= moduli.r;
+            mpz_class x0;
+            mpz_powm(x0.get_mpz_t(), c.get_mpz_t(), d_inv.get_mpz_t(), moduli.r.get_mpz_t());
+            assert(x0 > 0 && x0 < moduli.r);
+            assert(VortexAttractor::derive_z0(x0, y0, moduli, PHI) == 0);
+            const auto pad = [](const mpz_class &v) {
+                std::string h = v.get_str(16);
+                assert(h.size() <= 256);
+                return std::string(256 - h.size(), '0') + h;
+            };
+            const std::string seed = pad(x0) + pad(y0);
+            assert(seed.size() == 512);
+            assert(!VortexAttractor::canonicalSeedError(seed).empty());
+            assert(!VortexAttractor::canonicalSeedError(seed, moduli).empty());
+        }
         // Honest correction to the audit's fixed-point premise: the per-step
         // map is AFFINE ((x ^ Phi)*7+13 mod p), not a power map, so 1 and
         // p-1 are NOT fixed points of the dynamics; only ACT I cubes.

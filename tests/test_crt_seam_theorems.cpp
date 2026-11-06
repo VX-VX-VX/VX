@@ -157,6 +157,79 @@ int main() {
     std::cout << "T5 trajectory scan: " << reductions
               << " full-range reductions across 3 pinned seeds, 0 tail hits OK\n";
 
+    // -- T6: the cube map is a BIJECTION mod every frozen modulus ---------
+    // 3 does not divide M-1 for any frozen modulus (M-1 = 1 mod 3), so
+    // x -> x^3 mod M is 1-to-1: no nontrivial cube root of unity exists
+    // and there is NO multiplicative (v, v*zeta) collision family beside
+    // the additive DELTA fold. Corrects the earlier "3 | r-1 -> cubing
+    // 3-to-1" note (confusion with v2(R-1) = 3, i.e. 8 | R-1). Pinned
+    // through the real inversion path: d = 3^-1 mod (M-1) exists and
+    // (x^d mod M)^3 == x for deterministic pseudo-random x.
+    for (const mpz_class *m : {&moduli.p, &moduli.q, &moduli.r}) {
+        assert((*m - 1) % 3 == 1);
+        mpz_class d;
+        assert(mpz_invert(d.get_mpz_t(), mpz_class(3).get_mpz_t(), mpz_class(*m - 1).get_mpz_t()) ==
+               1);
+        mpz_class x = 7;
+        for (int k = 0; k < 8; ++k) {
+            x = (x * 6364136223846793005UL + 1442695040888963407UL) % *m;
+            mpz_class cube;
+            mpz_powm(cube.get_mpz_t(), x.get_mpz_t(), mpz_class(3).get_mpz_t(), m->get_mpz_t());
+            mpz_class root;
+            mpz_powm(root.get_mpz_t(), cube.get_mpz_t(), d.get_mpz_t(), m->get_mpz_t());
+            assert(root == x); // bijective: the cube root recovers x exactly
+        }
+    }
+    std::cout << "T6 cube bijectivity: M-1 = 1 mod 3 for P,Q,R; inversion "
+                 "round trip 8/8 per modulus OK\n";
+
+    // -- T7: fold-zone ENTRY is constructible at step 1 (merge is not) ----
+    // Z0 steering: for any chosen Y0 the residue map X0 -> derive_z0 is a
+    // bijection (T6), so X0 = target^(3^-1 mod (r-1)) reproduces ANY
+    // chosen Z0. With Z0 free, the step-1 arxY layer inverts algebraically
+    // (Y0 = rotr(arxY ^ Z0, Z0&63) - Z0), placing arxY at an exact value.
+    // Both members of the additive pair (w, w + Q) are thus constructible:
+    // two distinct seeds with IDENTICAL step-1 cubeY. The step output still
+    // diverges in all three coordinates - the lossless rotl paths carry
+    // the difference; entry into the fold zone is free, exit (merge) is
+    // not (docs/CRT_COLLISION_ANALYSIS.md section 8).
+    const mpz_class w = mpz_class("deadbeefcafebabe", 16);
+    const mpz_class Z0_A = mpz_class("a5a5a5a5b1b2b3b4c5c6c7c8d9dadbdc", 16);
+    const mpz_class Z0_B = mpz_class("5a5a5a5a1b2b3c4d5e6f70819293a4b5", 16);
+    mpz_class d_r;
+    assert(mpz_invert(d_r.get_mpz_t(), mpz_class(3).get_mpz_t(),
+                      mpz_class(moduli.r - 1).get_mpz_t()) == 1);
+    auto steer = [&](const mpz_class &z0, const mpz_class &targetArxY) {
+        const unsigned th = mpz_class(z0 & 63).get_ui();
+        // rotr1024 = rotl1024 by 1024 - th (rotl1024 reduces shift mod 1024)
+        mpz_class y0 = VortexAttractor::rotl1024(targetArxY ^ z0, 1024 - th) - z0;
+        y0 %= two1024;
+        if (y0 < 0)
+            y0 += two1024;
+        const mpz_class rot = VortexAttractor::rotl1024(PHI, mpz_class(y0 % 64).get_ui());
+        mpz_class c = ((z0 ^ rot) % moduli.r - (y0 * y0 * y0) % moduli.r) % moduli.r;
+        if (c < 0)
+            c += moduli.r;
+        mpz_class x0;
+        mpz_powm(x0.get_mpz_t(), c.get_mpz_t(), d_r.get_mpz_t(), moduli.r.get_mpz_t());
+        assert(x0 > 0 && y0 > 0); // non-degenerate trunks
+        // the steering is EXACT on the real derivation primitive
+        assert(VortexAttractor::derive_z0(x0, y0, moduli, PHI) == z0);
+        return std::pair<mpz_class, mpz_class>{x0, y0};
+    };
+    assert(w + moduli.q < two1024);
+    const auto [xa, ya] = steer(Z0_A, w);
+    const auto [xb, yb] = steer(Z0_B, w + moduli.q);
+    assert(xa != xb && ya != yb); // distinct seeds
+    const auto trA = VortexAttractor::step(xa, ya, Z0_A, 1, moduli, PHI);
+    const auto trB = VortexAttractor::step(xb, yb, Z0_B, 1, moduli, PHI);
+    assert(trA.arxY == w);
+    assert(trB.arxY == w + moduli.q);                           // exact additive fold pair
+    assert(trA.cubeY == trB.cubeY);                             // THE FOLD: identical cube inputs
+    assert(trA.x != trB.x && trA.y != trB.y && trA.z != trB.z); // no merge
+    std::cout << "T7 constructive fold entry: seeds with arxY_B = arxY_A + Q, "
+                 "cubeY equal, step output diverges OK\n";
+
     std::cout << "CRT SEAM THEOREMS: all pins passed\n";
     return 0;
 }

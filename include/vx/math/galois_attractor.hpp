@@ -83,12 +83,14 @@ public:
      *  - a trunk congruent to 0 mod its modulus (X_0 % p == 0 /
      *    Y_0 % q == 0): a non-zero word that collapses to a zero residue;
      *  - a seed whose ACT I derivation produces Z_0 == 0
-     *    (cube_sum == rotl1024(PHI, Y_0 % 64)) — adversarially
-     *    constructible because the cube map is 3-to-1 (3 | r-1).
+     *    (cube_sum == rotl1024(PHI, Y_0 % 64)) - closed-form
+     *    constructible: the cube map is a BIJECTION mod r (3 does not
+     *    divide r-1, docs/CRT_COLLISION_ANALYSIS.md Theorem 6), so
+     *    X0 = (rotl1024(PHI, Y0 % 64) - Y0^3)^(3^-1 mod (r-1)) mod r.
      *
-     * The 1-argument overload delegates with the classic moduli (the only
-     * production set), so callers upgrading automatically gain these
-     * checks.
+     * The 1-argument overload delegates with active_default() (the
+     * production set, v0.0.16), so callers upgrading automatically gain
+     * these checks.
      */
     static std::string canonicalSeedError(
         std::string_view seedHex, const core::AttractorModuli& moduli);
