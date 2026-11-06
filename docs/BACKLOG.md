@@ -1527,3 +1527,50 @@ system's cryptographic security."
   README/BACKLOG/release notes.
 - Note: the owner could not independently confirm the v0.0.16-alpha tag
   contents; future reports must cite tag + commit hash + zip together.
+
+### 2.16 OPSEC_SOVEREIGN_SHIELD — owner directive, 2026-11-06 (CLOSED this session)
+
+Owner directive: absolute forensic, network and regulatory sterility of the
+repository — no byte of code, binaries, Git metadata or docs may deanonymize
+the author or ground a regulator's claim. Six invariants, all verified in
+this session:
+
+- (1) Git metadata sterilization: commits are born UTC — `TZ=UTC` +
+  `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` epoch `+0000` via the new
+  `scripts/commit_utc.sh`; `git config core.hooksPath scripts/hooks` wires
+  the new gates. `scripts/hooks/pre-push` blocks any push whose outgoing
+  commits carry a non-`+0000` author/committer offset. Historical commits
+  and tags are `+0100` (host CET) and stay: rewriting them would break the
+  frozen release hashes — the gate applies from this commit forward.
+- (2) Zero-leakage build & release: `CMakeLists.txt` now maps source and
+  build dirs to relative paths in `__FILE__`, assert text and debug tables
+  (`-ffile-prefix-map` / `-fdebug-prefix-map` / `-fmacro-prefix-map`).
+  Release archives switched to deterministic `git archive` (commit-timestamp
+  mtimes, uid/gid 0, no host filesystem metadata) with a `.sha256` sidecar:
+  `scripts/make_release.sh`. v0.0.15-alpha (c708d91) and v0.0.16-alpha
+  (537f37d) zips were regenerated retroactively and re-uploaded together
+  with their `.sha256` and a SHA-256 "Archive verification" section in the
+  GitHub release notes (checksum = integrity; GPG tag = authenticity).
+- (3) Network invariant: `scripts/opsec_scan.sh` gates the whole published
+  surface on host-absolute user paths (Linux and macOS homes), private-range
+  IPs and Cyrillic — with two documented exceptions (127.0.0.1 loopback
+  defaults; the marked 10.0.0.x SIMULATION fixtures in swarm_node). Scan
+  result: clean. Default configs carry no personal bootstrap IPs (seed
+  lists are loopback/empty by design); no hardcoded author IP in history.
+- (4) Regulatory immunity: code audit — no admin keys, no dev fee/treasury
+  address, no centralized coordinator, no forced rollback/freeze anywhere
+  in src/ (grep-verified; now a standing claim, BACKLOG/README "protocol
+  neutrality"). LICENSE rewritten: the "Cypherpunk anti-state clause" was
+  REMOVED (as a non-removable additional restriction it violated AGPLv3
+  §7 and exposed the author) along with the "sovereign/anonymous"
+  rhetoric; added: Mathematical & Academic Specification Only, $0.00 total
+  liability cap, Strict Exclusion of Fiduciary Duties, Mandatory User
+  Indemnification, auditable Protocol Neutrality, and a historical note
+  recording the clause removal.
+- (5) Anti-stylometry: `.clang-format` checked in; `scripts/hooks/pre-commit`
+  enforces clang-format on staged line ranges (incremental — no big-bang
+  reformat of frozen consensus code), plus the Cyrillic/path/IP diff gate.
+  Commit messages follow Conventional Commits, dry technical English.
+- (6) Tree revision: complete; this BACKLOG entry is the session checklist
+  record. Ongoing duty: every future commit goes through the two hooks +
+  `commit_utc.sh`; every future release through `make_release.sh`.

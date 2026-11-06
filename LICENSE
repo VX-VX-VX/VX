@@ -1,5 +1,5 @@
 # Vortex Sovereign OS (VX L1) License
-## GNU AGPLv3 + Cypherpunk Anti-State / Anti-Military-Surveillance Clause
+## GNU AGPLv3 + Mathematical & Academic Specification Disclaimer
 
 ### 1. GNU Affero General Public License v3.0 (AGPLv3)
 Copyright (C) 2007 Free Software Foundation, Inc.
@@ -17,60 +17,77 @@ for more details.
 You should have received a copy of the GNU Affero General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-### 2. ABSOLUTE "AS IS" ALIBI DISCLAIMER
-THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. THE AUTHORS
-AND CONTRIBUTORS ACCEPT NO LIABILITY FOR ANY DAMAGES, DIRECT OR INDIRECT,
-ARISING FROM THE USE OF THIS SOFTWARE. ALL CRYPTOGRAPHIC OPERATIONS ARE THE
-SOLE RESPONSIBILITY OF THE USER. THE AUTHORS DO NOT GUARANTEE THAT THIS
-SOFTWARE IS SUITABLE FOR ANY PARTICULAR PURPOSE OR THAT IT IS FREE FROM
-ERRORS. USE AT YOUR OWN RISK.
+### 2. MATHEMATICAL & ACADEMIC SPECIFICATION ONLY
+This repository is a scientific and engineering publication. Its subject
+matter is the study and implementation of public algorithms: finite-field
+(Galois) arithmetic, attractor maps built on the Chinese Remainder Theorem,
+a deterministic gas model inspired by the Landauer principle, XMSS
+post-quantum signatures, and distributed consensus machinery.
 
-### 3. CYPHERPUNK ANTI-STATE / ANTI-MILITARY-SURVEILLANCE CLAUSE
-This software is released under a Cypherpunk license that explicitly
-prohibits use by state actors, military organizations, intelligence
-agencies, and surveillance contractors. By using this software, you agree:
+Nothing in this repository is a financial product, a financial service, an
+investment offering, an exchange, a transfer agent, or a custody service.
+The authors do not operate the network, do not hold, control, or transmit
+value on behalf of anyone, and do not solicit users. Compiling, running, or
+studying this code creates no contractual or other relationship with the
+authors. Any economic significance a third party assigns to tokens created
+by the network is that third party's own doing, outside this publication.
 
-(a) NOT to use, copy, modify, or distribute this software for the purpose
-    of mass surveillance, population tracking, biometric monitoring,
-    or any form of state oppression.
+### 3. NO WARRANTY; TOTAL LIABILITY CAP AT $0.00
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
 
-(b) NOT to integrate this software into weapons systems, autonomous
-    military platforms, or any technology designed to harm or control
-    civilian populations.
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE TOTAL AGGREGATE
+LIABILITY OF THE AUTHORS AND CONTRIBUTORS FOR ANY AND ALL CLAIMS ARISING
+OUT OF OR RELATING TO THIS SOFTWARE IS ZERO ($0.00 USD). THIS CAP IS
+ABSOLUTE AND COVERS ALL DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY,
+AND CONSEQUENTIAL DAMAGES, INCLUDING LOSS OF KEYS, LOSS OF TOKENS, LOSS OF
+DATA, LOSS OF EQUIPMENT, AND LOSS OF PROFITS, WHETHER IN CONTRACT, TORT
+(INCLUDING NEGLIGENCE), STRICT LIABILITY, OR OTHERWISE, EVEN IF ADVISED OF
+THE POSSIBILITY OF SUCH DAMAGES. ALL CRYPTOGRAPHIC OPERATIONS AND ALL
+CONSEQUENCES OF THEIR FAILURE ARE THE SOLE RESPONSIBILITY OF THE USER.
 
-(c) NOT to use this software to facilitate human rights abuses,
-    ethnic profiling, or authoritarian censorship.
+### 4. STRICT EXCLUSION OF FIDUCIARY DUTIES
+The authors and contributors owe no fiduciary, custodial, escrow, agency,
+or trust duty to any operator, user, or key holder, and none is created by
+compiling, running, or relying on this software. Without limitation, the
+authors have no obligation to:
+(a) restore or recover any access, key, password, or asset;
+(b) fix defects, issue updates, patches, or security advisories;
+(c) maintain, host, or operate any network node, explorer, or service;
+(d) support any particular version, fork, or protocol state.
 
-(d) TO RESIST any attempt by any state, corporation, or organization
-    to subvert this software for surveillance purposes.
+### 5. MANDATORY USER INDEMNIFICATION
+Any person or entity that compiles, runs, modifies, redistributes, or
+otherwise uses this software (an "Operator") does so at their sole risk and
+takes sole legal responsibility for compliance with the laws, regulations,
+and licensing requirements of their own jurisdiction, including any
+financial, tax, or data regulations that may apply to them. The Operator
+agrees to defend, indemnify, and hold harmless the authors, contributors,
+and copyright holders from and against any claim, demand, action,
+investigation, or proceeding by any third party, regulator, or authority
+arising out of or relating to the Operator's use, compilation, or
+redistribution of this software.
 
-(e) THAT any derivative work of this software must also be released
-    under these same terms, including this Cypherpunk clause.
+### 6. PROTOCOL NEUTRALITY (VERIFIABLE DESIGN CLAIMS)
+By design, verifiable in the source: there are no administrative keys, no
+developer fee or treasury address, no centralized coordinator, no
+protocol-level freeze function, and no forced state rollback. The source
+code is the sole arbiter of these claims; audit it.
 
-This clause is inseparable from the AGPLv3 license. If any part of this
-clause is found to be unenforceable, the remainder of the license
-remains in full force and effect.
-
-### 4. SOVEREIGN IDENTITY PROVISION
-This software implements cryptographic identity systems (NFA_V6 addresses,
-sovereign keyrings, zero-knowledge proofs). These identity systems are
-designed to be:
-- Self-custodial (user holds their own keys)
-- Hardware-bound (DNA binding to physical device)
-- Burn-on-consume (keys self-destruct after single use)
-- Anonymous by default (no central authority can deanonymize users)
-
-Users of this software are sovereign individuals. This software makes no
-assertions about the legal status of any cryptographic identity, and
-users are solely responsible for compliance with local laws.
-
-### 5. OPEN SOURCE COMMITMENT
+### 7. OPEN SOURCE COMMITMENT
 All source code, cryptographic primitives, and mathematical specifications
-in this repository are released under the terms of this license. There
-are no backdoors, no hidden master keys, and no remote kill switches.
-The protocol is fully auditable and reproducible.
+in this repository are released under the terms of this license. There are
+no backdoors, no hidden master keys, and no remote kill switches. The
+protocol is fully auditable and reproducible.
 
 ---
 
 For the full AGPLv3 text, see:
 https://www.gnu.org/licenses/agpl-3.0.txt
+
+Historical note: versions of this file published before 2026-11-06
+contained an "anti-state / anti-military" usage clause. That clause was
+removed: as a non-removable additional restriction on AGPLv3-licensed works
+it did not comply with AGPLv3 Section 7, and its removal restores the
+unmodified AGPLv3 grant. This note is part of the license record.

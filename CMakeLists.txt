@@ -6,6 +6,19 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# ── Forensic hygiene (OPSEC_SOVEREIGN_SHIELD, invariant 2) ───────────────────
+# Host-absolute paths must never reach __FILE__, assert() text, symbol or
+# debug tables of any published binary: every build maps the local source and
+# build directories to relative paths at the compiler level.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(
+        "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+        "-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=."
+        "-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=."
+        "-fdebug-prefix-map=${CMAKE_BINARY_DIR}=."
+    )
+endif()
+
 # ── Build edition ────────────────────────────────────────────────────────────
 # VX_BUILD_VAULT=OFF (default) → Public Core: portable, hardening features
 #   degrade gracefully; hardware binding uses synthetic fallback vectors.
