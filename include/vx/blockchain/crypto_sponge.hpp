@@ -332,4 +332,211 @@ private:
     uint8_t digest_cache_[DIGEST_SIZE]{};
 };
 
+/**
+ * @brief VortexSponge1024: the v3 sponge (owner directive 2026-11-06:
+ * "pull everything up to 1024 bits"). NOT wired into consensus or the
+ * frozen v1 wire - like VortexSponge512 it lands as a tested primitive so
+ * the address-format v2 fold (the BACKLOG 2.17 remedy for the palindromic
+ * xor-fold defect) has a certified 1024-bit home before any migration is
+ * designed on top.
+ *
+ * Design deltas vs VortexSponge512, each driven by the 2.17 remedy:
+ *  - 32 x 64-bit state (2048-bit) with a 128-byte rate: capacity 1024
+ *    bits, digest 1024 bits -> classical preimage ~2^1024, Grover ~2^512.
+ *    The digest is the 16 capacity words; squeezing fewer words from a
+ *    2048-bit state would be partially self-correlated, not independent
+ *    (the same argument that forced a new state size for v2).
+ *  - Initial state: capacity words 0..7 keep the v1 Golden Phi constants
+ *    (construction continuity); words 8..31 continue the SAME splitmix64
+ *    stream seeded from state_[7]'s constant (0x54d4f87a0229c15d) that
+ *    produced v2's rate words - so v3's words 8..15 EQUAL v2's rate words
+ *    8..15 (documented, reproducible, no hidden knobs).
+ *  - Permutation: 12 rounds of ChaCha-style column+diagonal quarter-
+ *    rounds over the 4x8 word matrix (state_[8*r + c]) - every word feeds
+ *    two distinct quarter-rounds per round; one round pair reaches 4 of
+ *    the 8 columns, two pairs reach all 32 words, and 12 rounds leave no
+ *    short path (the v2 connectivity argument scaled).
+ *  - Length-encoded padding identical to v2 (0x80 delimiter, then the
+ *    128-bit little-endian message bit-length), so H(m) == H(m||0...0)
+ *    is impossible regardless of alignment. Absorb-after-finalize still
+ *    aborts; finalize stays idempotent.
+ *  - Streaming contract identical: absorb(a); absorb(b) equals
+ *    absorb(a||b) IFF |a| is a multiple of the 128-byte rate.
+ *  - Digests are little-endian-dependent (mix_block loads uint64_t
+ *    words); no big-endian target is supported.
+ */
+class VortexSponge1024 {
+public:
+    static constexpr size_t DIGEST_SIZE = 128;
+    static constexpr size_t RATE_SIZE = 128;
+
+    explicit VortexSponge1024() noexcept {
+        reset();
+    }
+
+    void absorb(const uint8_t *data, size_t len) noexcept {
+        if (finalized_) {
+            // Same misuse rule as v1/v2: fail loud, never silently corrupt.
+            std::fputs("VortexSponge1024: absorb() after finalize() - misuse\n", stderr);
+            std::abort();
+        }
+        size_t offset = 0;
+        while (offset < len) {
+            size_t chunk = std::min(len - offset, sizeof(block_buf_));
+            std::memset(block_buf_, 0, sizeof(block_buf_));
+            std::memcpy(block_buf_, data + offset, chunk);
+            mix_block();
+            msg_bits_ += uint64_t(chunk) * 8;
+            offset += chunk;
+        }
+    }
+
+    template <typename T> void absorb_obj(const T &obj) noexcept {
+        absorb(reinterpret_cast<const uint8_t *>(&obj), sizeof(T));
+    }
+
+    void finalize(uint8_t out[DIGEST_SIZE]) noexcept {
+        if (!finalized_) {
+            // Length-encoded padding, identical to v2: delimiter, then the
+            // 128-bit little-endian message bit-length. The length is
+            // snapshotted BEFORE the pad bytes enter the sponge.
+            const uint64_t bits = msg_bits_;
+            uint64_t pad = 0x80ULL;
+            absorb(reinterpret_cast<const uint8_t *>(&pad), 1);
+            const uint8_t len_bytes[16] = {
+                static_cast<uint8_t>(bits & 0xFF),
+                static_cast<uint8_t>((bits >> 8) & 0xFF),
+                static_cast<uint8_t>((bits >> 16) & 0xFF),
+                static_cast<uint8_t>((bits >> 24) & 0xFF),
+                static_cast<uint8_t>((bits >> 32) & 0xFF),
+                static_cast<uint8_t>((bits >> 40) & 0xFF),
+                static_cast<uint8_t>((bits >> 48) & 0xFF),
+                static_cast<uint8_t>((bits >> 56) & 0xFF),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0, // 128-bit width: high 64 reserved
+            };
+            absorb(len_bytes, sizeof(len_bytes));
+
+            // Digest = the first 16 state words (128 bytes = 1024 bits),
+            // mirroring the v1/v2 convention (v1 outputs words 0..3 of its
+            // 8-word state; v2 outputs words 0..7 of its 16-word state).
+            // Preimage ~2^1024 classical / ~2^512 Grover; collision floor
+            // ~2^512 by the birthday bound over the 1024-bit output.
+            for (size_t i = 0; i < 16; ++i) {
+                uint64_t w = state_[i];
+                for (int b = 0; b < 8; ++b) {
+                    digest_cache_[i * 8 + b] = static_cast<uint8_t>((w >> (b * 8)) & 0xFF);
+                }
+            }
+            finalized_ = true;
+        }
+        std::memcpy(out, digest_cache_, DIGEST_SIZE);
+    }
+
+    static void compute(const uint8_t *data, size_t len, uint8_t out[DIGEST_SIZE]) noexcept {
+        VortexSponge1024 sponge;
+        sponge.absorb(data, len);
+        sponge.finalize(out);
+    }
+
+private:
+    void reset() noexcept {
+        // Capacity words 0..7: v1 Golden Phi constants (construction
+        // continuity with VortexSponge256/512).
+        state_[0] = 0x9e3779b97f4a7c15ULL;
+        state_[1] = 0xf39cc0605cedc834ULL;
+        state_[2] = 0x1082276bf3a27251ULL;
+        state_[3] = 0xf86c6a11d0c18e95ULL;
+        state_[4] = 0x276707e7869666c0ULL;
+        state_[5] = 0x7166e4a2e5576ac6ULL;
+        state_[6] = 0xc5a08e06385cfd4fULL;
+        state_[7] = 0x54d4f87a0229c15dULL;
+        // Words 8..31: splitmix64 continuation of the SAME stream seeded
+        // from state_[7] that produced v2's rate words - words 8..15 are
+        // byte-identical to VortexSponge512's rate words by construction.
+        state_[8] = 0x496d7c86d3c4000eULL;
+        state_[9] = 0x751e08b0ecdb2548ULL;
+        state_[10] = 0xf4f5c5f721f14c6aULL;
+        state_[11] = 0xc4ff36f927e895ecULL;
+        state_[12] = 0x44f18c0086600f6eULL;
+        state_[13] = 0x2884f75fdc6d6de6ULL;
+        state_[14] = 0x3f471154b29cccaaULL;
+        state_[15] = 0x9c053b16ccea3a8fULL;
+        state_[16] = 0xfc4fae945f25f94fULL;
+        state_[17] = 0x4b59936b779c37d2ULL;
+        state_[18] = 0xb9e769d478a3c4e6ULL;
+        state_[19] = 0x08439c4758dc6e9fULL;
+        state_[20] = 0xb7452c56682fd6f0ULL;
+        state_[21] = 0x41556ea207a8307aULL;
+        state_[22] = 0x7427dc40b7c60bc6ULL;
+        state_[23] = 0xd7e09368502f4c14ULL;
+        state_[24] = 0xa6c3ae620d6190b2ULL;
+        state_[25] = 0xaee72760514ec9f6ULL;
+        state_[26] = 0x6cb044b781e895daULL;
+        state_[27] = 0xc8edeec148b8e20cULL;
+        state_[28] = 0x86a459ddee0b19afULL;
+        state_[29] = 0xb1c840d0e2eb75a1ULL;
+        state_[30] = 0x5d04c467845bc92eULL;
+        state_[31] = 0x0db98abe10ad0c77ULL;
+        std::memset(block_buf_, 0, sizeof(block_buf_));
+        msg_bits_ = 0;
+    }
+
+    static constexpr uint64_t rotl64(uint64_t x, unsigned int r) noexcept {
+        return (x << (r & 63)) | (x >> ((64 - (r & 63)) & 63));
+    }
+
+    static void quarter_round(uint64_t &a, uint64_t &b, uint64_t &c, uint64_t &d) noexcept {
+        a += b;
+        d ^= a;
+        d = rotl64(d, 16);
+        c += d;
+        b ^= c;
+        b = rotl64(b, 12);
+        a += b;
+        d ^= a;
+        d = rotl64(d, 8);
+        c += d;
+        b ^= c;
+        b = rotl64(b, 7);
+    }
+
+    void mix_block() noexcept {
+        // Load the 128-byte rate block into rate words 16..31.
+        const auto *words = reinterpret_cast<const uint64_t *>(block_buf_);
+        for (size_t i = 0; i < 16; ++i)
+            state_[16 + i] ^= words[i];
+
+        // 12 rounds over the 4x8 word matrix (state_[8*r + c]): column
+        // quarter-rounds then diagonal quarter-rounds - every word feeds
+        // two distinct quarter-rounds per round, the ChaCha connectivity
+        // argument scaled to 32 words (a single flipped input bit reaches
+        // all 32 state words within two round pairs).
+        for (int r = 0; r < 12; ++r) {
+            (void)r;
+            // columns: stride 8 through the matrix
+            for (int c = 0; c < 8; ++c) {
+                quarter_round(state_[c], state_[8 + c], state_[16 + c], state_[24 + c]);
+            }
+            // diagonals: column offsets rotate by 1, 2, 3 mod 8
+            for (int c = 0; c < 8; ++c) {
+                quarter_round(state_[c], state_[8 + ((c + 1) & 7)], state_[16 + ((c + 2) & 7)],
+                              state_[24 + ((c + 3) & 7)]);
+            }
+        }
+    }
+
+    uint64_t state_[32]{};
+    uint8_t block_buf_[RATE_SIZE]{};
+    uint64_t msg_bits_ = 0;
+    bool finalized_ = false;
+    uint8_t digest_cache_[DIGEST_SIZE]{};
+};
+
 } // namespace vx::blockchain

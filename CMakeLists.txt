@@ -153,6 +153,11 @@ target_link_libraries(test_fold_window PRIVATE vx_core)
 add_executable(test_sponge512 tests/test_sponge512.cpp)
 target_link_libraries(test_sponge512 PRIVATE vx_core gtest gtest_main)
 
+# VortexSponge1024 (v3 sponge) contract tests - owner directive 2026-11-06,
+# the certified home for the address-v2 fold (BACKLOG 2.17 remedy)
+add_executable(test_sponge1024 tests/test_sponge1024.cpp)
+target_link_libraries(test_sponge1024 PRIVATE vx_core gtest gtest_main)
+
 # Attractor degeneracy hunt - BACKLOG 2.8
 add_executable(test_attractor_degeneracy tests/test_attractor_degeneracy.cpp)
 target_link_libraries(test_attractor_degeneracy PRIVATE vx_core)
@@ -291,7 +296,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_chain_stress test_boundary_torture test_crash_torture
             test_rpc_auth test_key_import
             test_apply_integrity test_mempool_admission test_fold_window
-            test_sponge512 test_attractor_degeneracy test_pq_rollover
+            test_sponge512 test_sponge1024 test_attractor_degeneracy test_pq_rollover
             test_crt_seam_theorems test_derivation_migration
             test_digest_uniformity)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
@@ -301,6 +306,7 @@ enable_testing()
 add_test(NAME VortexMathTest COMMAND test_vortex)
 add_test(NAME VortexFoldWindowTest COMMAND test_fold_window)
 add_test(NAME VortexSponge512Test COMMAND test_sponge512)
+add_test(NAME VortexSponge1024Test COMMAND test_sponge1024)
 add_test(NAME VortexAttractorDegeneracyTest COMMAND test_attractor_degeneracy)
 add_test(NAME VortexCrtSeamTheoremsTest COMMAND test_crt_seam_theorems)
 add_test(NAME VortexDerivationMigrationTest COMMAND test_derivation_migration)

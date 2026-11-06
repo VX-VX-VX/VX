@@ -495,7 +495,7 @@ point is that it is *public*.
 
 ## Test suite
 
-32 ctest entries; all pass in **both** build editions:
+35 ctest entries; all pass in **both** build editions:
 
 | Target | Coverage |
 |---|---|

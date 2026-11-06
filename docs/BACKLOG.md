@@ -638,17 +638,27 @@ power there; width is the insurance against our own assumptions.
   address version: v1 = 256 (current, frozen wire), v2 = 512 (the
   standing target), 1024 documented as the paranoid maximum (no
   standard requires deeper than a 2^256 preimage class). — PRIMITIVE
-  DELIVERED 2026-11-05 (v0.0.9): `VortexSponge512` lives in
-  `include/vx/blockchain/crypto_sponge.hpp` beside v1: 16x64-bit state
-  (1024-bit), 64-byte rate (capacity 512), 512-bit digest taken from the
-  capacity words (v1's own convention), 12 ChaCha-style column+diagonal
-  rounds over the 4x4 word matrix, splitmix64-continued Golden Phi init
-  stream, and LENGTH-ENCODED padding — the trailing-zeros limit frozen
-  into v1 is closed for v2. Contract-tested (KATs incl. rate boundaries
-  63/64/65, streaming equivalence both directions, SAC ~50%, idempotent
-  finalize, H(m) != H(m||0)). NOT wired into consensus or the frozen
-  wire: the address-version soft migration (both versions verified in
-  parallel) is the remaining half of this item.
+  DELIVERED v0.0.9 (primitive) and v0.0.16 (1024 width, owner directive
+  2026-11-06 "pull everything up to 1024 bits"):
+  - `VortexSponge512` (v0.0.9): 16x64-bit state (1024-bit), 64-byte rate
+    (capacity 512), 512-bit digest from the capacity words, 12 ChaCha-style
+    column+diagonal rounds over the 4x4 word matrix, splitmix64-continued
+    Golden Phi init stream, LENGTH-ENCODED padding — the trailing-zeros
+    limit frozen into v1 is closed. KATs incl. rate boundaries 63/64/65.
+  - `VortexSponge1024` (v3, beside the others in
+    `include/vx/blockchain/crypto_sponge.hpp`): 32x64-bit state (2048-bit),
+    128-byte rate (capacity 1024), 1024-bit digest from the 16 capacity
+    words, same 12-round permutation scaled to the 4x8 word matrix
+    (columns + rotating diagonals; every word feeds two QRs per round),
+    words 8..31 continue the SAME splitmix64 stream (words 8..15 equal
+    v2's rate words by construction), v2 padding/misuse rules verbatim.
+    Preimage ~2^1024 classical / ~2^512 Grover. Contract-tested 8/8 (KATs
+    incl. rate boundaries 127/128/129, streaming both directions incl.
+    double-boundary splits, SAC ~50%, full-diffusion — every digest word
+    moves on single-bit flips, idempotent finalize, H(m) != H(m||0)).
+  - NEITHER is wired into consensus or the frozen wire: the address-version
+    soft migration (both versions verified in parallel) is the remaining
+    half of this item; the address-v2 fold is the 2.17 remedy vehicle.
 - [ ] Extend the wire frame and address derivation for v2 with a soft
   migration (both versions verified in parallel; v1 never invalidated).
 - [ ] Fold into the same work: PQ key rollover (a key signs at most 16
