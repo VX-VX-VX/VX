@@ -21,7 +21,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             echo "  Re-commit via: scripts/commit_utc.sh (TZ=UTC, epoch dates)"
             fail=1
         fi
-    done < <(git log --format='%H|%ai|%ci' "$range" | awk -F'|' '{split($2,a," ");split($3,c," ");print $1"|"a[2]"|"c[2]}')
+    done < <(git log --format='%H|%ai|%ci' "$range" | awk -F'|' '{split($2,a," ");split($3,c," ");print $1"|"a[3]"|"c[3]}')
 done
 
 if [ "$fail" -eq 0 ]; then
