@@ -1371,6 +1371,23 @@ outside this repo by design (build tools are not consensus code).
     only on the ~2^-960 tail, genesis vectors must be re-pinned
     byte-identical before any adoption. Decision + tests = next
     session; do not rush the fix.
+    RESOLVED AS ANALYSIS (2026-11-06, P0 closed): full formal analysis
+    landed as docs/CRT_COLLISION_ANALYSIS.md with deterministic pins in
+    tests/test_crt_seam_theorems.cpp (VortexCrtSeamTheoremsTest).
+    Key results: fold measure D(M) = 2^1024 - M per full-range
+    reduction (pigeonhole minimum; P: 2^64+1747, Q: 2^888+3943,
+    R: 2^512+267799); 3005 full-range reductions per 1000-iteration
+    derivation (2 z0 + 3000 cubes + 3 lock); Guard proved injective on
+    canonical inputs but RELOCATES the fold family - for branch-B states
+    (x ^ Phi >= P) the glued pair becomes (x, (x mod P) ^ Phi); the
+    original (u, u-P) family is killed, an equally constructible family
+    persists (20/20 verified). CORRECTED per-derivation exposure: the
+    earlier P-only union bound of 2^-947 applied DELTA(P) to every seam;
+    the honest Q-seam-dominated total is < 2^-126 per derivation
+    (1001 x 2^-136), still an exposure bound with no known
+    seed-exploitation path. DECISION: derivation stays frozen (many-to-one
+    KDF by construction); the Guard remains a documented candidate tied to
+    the genesis migration protocol, not adopted.
 - Work items: (a) compute ord_P(7) and the affine-coefficient orders
   over the odd part of each (M-1). FIRST MEASUREMENT (2026-11-05,
   P_secure): P-1 = 2^2 x 83 x 3769 x 3218807 x C, C = 1004-bit COMPOSITE

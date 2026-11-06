@@ -495,7 +495,7 @@ point is that it is *public*.
 
 ## Test suite
 
-31 ctest entries; all pass in **both** build editions:
+32 ctest entries; all pass in **both** build editions:
 
 | Target | Coverage |
 |---|---|
@@ -519,8 +519,10 @@ point is that it is *public*.
 Newer suites added since the first release wave (each a full
 regression suite; `tests/` is the source of truth): PQ tree rollover
 certificates (`VortexPqRolloverTest`), the algebraic degeneracy hunt
-at the seed surface, boundary torture (block/tx limits, U128 edges,
-the 15-leaf PQ economy), a 1000-block chain stress with full
+at the seed surface, the CRT seam collision theorems
+(`VortexCrtSeamTheoremsTest` - deterministic pins for
+`docs/CRT_COLLISION_ANALYSIS.md`), boundary torture (block/tx limits,
+U128 edges, the 15-leaf PQ economy), a 1000-block chain stress with full
 ledger-model cross-check, the deterministic bifurcation oracle,
 crash/recovery torture, the reorg carousel, ASERT retarget, RPC
 auth, C5 key import (fail-closed, constant-time), apply-path
@@ -534,7 +536,7 @@ integrity, and mempool admission.
 include/vx/          public headers (blockchain, consensus, crypto, core,
                      math, net, rpc, state, storage, vm, wif)
 src/                 implementation, one directory per subsystem
-tests/               31 test targets (GoogleTest + plain runners)
+tests/               32 test targets (GoogleTest + plain runners)
 web/                 React + TypeScript PWA console (+ Electron wrapper)
 .github/workflows/   CI: both C++ editions + web, archlinux container
 CMakeLists.txt       edition option, targets, tests
