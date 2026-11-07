@@ -896,21 +896,19 @@ Remaining (honest gaps, not hidden):
     leaf record, which the ledger already refuses - the wallet must
     keep the discarded cert's witness or re-derive an equivalent one;
     documented as a wallet-policy obligation, not a consensus problem).
-  - Carrier (DECISION NEEDED from the owner, both keep the 112-byte
-    wire layout frozen):
+  - Carrier (DECIDED by the owner, 2026-11-07: option B):
     A. Zero-amount self-send marker: sender == receiver == the PQA
        address, amount == 0, fee normal. Today "zero transfer" is
        refused for user senders; the wiring carves exactly this shape
        out as a ROLLOVER INTENT whose authorization comes entirely
        from the cert witness (the keyless cocoon digest is irrelevant
        for a valueless self-send). No wire change, no new tx type.
-    B. A dedicated wire tag for a certificate record (a VX60 format
-       addition per the standing freeze rule - heavier process, new
-       format tag, old/new node separation through the migration
-       protocol).
-    Recommendation: A - smallest change, the marker is unambiguous
-    (amount 0 + self + PQ-bound sender), and the cert witness is
-    verified independently of the tx proof either way.
+    B. **CHOSEN**: a dedicated wire tag for a certificate record (a
+       VX60 format addition per the standing freeze rule - new format
+       tag, old/new node separation through the migration protocol,
+       DERIVATION_VERSION discipline). Cleaner semantics: certificates
+       never mix with value transfers; the tx marker hack is off the
+       table.
   - Registry side: a parallel cert store (candidates keyed by sender,
     same fail-closed verification discipline as register_witness) +
     durable sidecar record type; sender_roots_ overwrite semantics
