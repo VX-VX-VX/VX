@@ -538,7 +538,9 @@ substitution guarantee - docs/ADDRESS_FORMATS_V2.md).
 include/vx/          public headers (blockchain, consensus, crypto, core,
                      math, net, rpc, state, storage, vm, wif)
 src/                 implementation, one directory per subsystem
-tests/               32 test targets (GoogleTest + plain runners)
+tests/               36 targets: 35 test suites (36 ctest entries,
+                     GoogleTest + plain runners) + 1 manual benchmark
+                     (bench_pq)
 web/                 React + TypeScript PWA console (+ Electron wrapper)
 .github/workflows/   CI: both C++ editions + web, archlinux container
 CMakeLists.txt       edition option, targets, tests

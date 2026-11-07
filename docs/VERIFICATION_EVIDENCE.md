@@ -1517,6 +1517,53 @@ Notes on fidelity:
 
 ---
 
+## Appendix H - the PQ benchmark, exact figures (P2, 2026-11-07)
+
+A reproducible benchmark ships as `tests/bench_pq.cpp` (target `bench_pq`,
+manual - benchmarks do not gate CI). It measures the four cost centers of
+the WOTS+ (w=16, L=67) / XMSS (H=4) witness path with fixed inputs and
+fixed iteration counts, splitting COLD (first touch of a window: 16 leaf
+computations fill the window cache) from WARM (cache-hit steady state).
+Recorded from a Release build (GCC, -O2) on the development host, two
+consecutive runs:
+
+```
+VX PQ benchmark (WOTS+ w=16 L=67, XMSS H=4, 16 leaves/window)
+warm runs: sign=45 verify=45 (verified 45/45); cold builds=40; cold signs=5
+cold window build               9.945      8.443     13.985   (ms, mean/min/max)
+cold sign (fresh window)       10.383      9.369     10.968   (ms, mean/min/max)
+warm sign                       0.337      0.308      0.358   (ms, mean/min/max)
+warm verify                     0.268      0.259      0.286   (ms, mean/min/max)
+ratios (means): warm verify / warm sign = 1.26x | cold build / warm sign = 29.5x
+
+run 2:
+cold window build               8.786      8.147     10.997   (ms, mean/min/max)
+cold sign (fresh window)        9.592      8.746     10.257   (ms, mean/min/max)
+warm sign                       0.353      0.318      0.439   (ms, mean/min/max)
+warm verify                     0.299      0.253      0.354   (ms, mean/min/max)
+ratios (means): warm verify / warm sign = 1.18x | cold build / warm sign = 24.9x
+```
+
+CORRECTED CLAIM (the earlier "~30x verify speedup" arithmetic is
+misattributed): the 8.5 ms figure is the COLD WINDOW BUILD (one-time
+per-window initialization, 16 WOTS+ leaf derivations), and the 0.3 ms
+figure is the WARM DETACHED VERIFY. 8.5/0.3 does not compare sign to
+verify. The honest account:
+
+- warm sign ~0.34 ms, warm verify ~0.28 ms - the real verify/sign
+  ratio is ~1.2x, not ~30x;
+- the ~9 ms cold build is a ONE-TIME cost per window per account
+  (amortized over that window's 15 transaction leaves);
+- verification's real advantage is structural, not temporal: verify
+  holds no secret key material, burns no leaf, and runs on every
+  receiving node, while sign runs once per account leaf.
+
+The earlier rounded quotient (30.6x) and the corrected arithmetic
+(8.5/0.3 = 28.3x) are both superseded by the measured figures above -
+the ratio they tried to express does not exist as stated.
+
+---
+
 ## 10. Changelog of this verification pass
 
 | Commit | Content |

@@ -1568,17 +1568,33 @@ system's cryptographic security."
   prime moduli). The classic fixture set is pinned COMPOSITE
   (definitely-composite verdict for all three), so it can never
   silently become a derivation set.
-- P1 genesis migration: byte-identical vectors via a dedicated
-  migration protocol - pin the old canonical vectors, generate new ones
-  under the Guard, compare all 3072 bits plus every derived address,
-  version the derivation algorithm, forbid silent switching, define
-  old/new node compatibility.
-- P2 XMSS benchmark: reproducible measurements with full precision
-  (the owner's arithmetic: 8.5/0.3 is ~28.3x, not 30.6x - publish exact
-  figures or rounded-quotient honesty).
-- Documentation drift: the README on main still describes Landauer-based
-  gas, an old test count and the old Vault model - sync
-  README/BACKLOG/release notes.
+- P1 genesis migration: DONE (2026-11-06, docs/DERIVATION_MIGRATION.md
+  ratified as process): DERIVATION_VERSION = 1 marker; version-1
+  reference vectors pinned (4 vectors x full 3072-bit final states +
+  both addresses, unlocked and locked orientations); vector-dump and
+  label-by-label comparator pinned in test_derivation_migration; rule
+  "no silent edit - versioned migration only"; fail-closed foreign-
+  version refusal, dual-verification windows are explicit owner
+  decisions. First customer: address-format v2 (BACKLOG 2.17).
+- P2 XMSS benchmark: DONE (2026-11-07, tests/bench_pq.cpp, target
+  bench_pq, manual - not a ctest gate; figures recorded in
+  VERIFICATION_EVIDENCE Appendix H). Exact measured figures (Release,
+  GCC -O2, two runs): cold window build ~8.4-9.9 ms mean (one-time
+  per-window 16-leaf initialization), cold sign ~9.4-10.4 ms, warm sign
+  ~0.34 ms, warm verify ~0.28 ms, warm verify/warm sign ratio ~1.2x.
+  THE 8.5/0.3 = 28.3x (or 30.6x) ARITHMETIC IS SUPERSEDED: 8.5 ms is
+  the cold window build and 0.3 ms the warm verify - the ratio compared
+  initialization to verification. Verification's real advantage is
+  structural (no secret key, no leaf burn, runs on every node), not a
+  ~30x speedup.
+- Documentation drift: RESOLVED (2026-11-07 audit): the Landauer gas
+  prose is ACCURATE (VortexVM ships deterministic metering
+  base_opcode_cost + erased_bits*960 + flips*3 - BACKLOG 2.13 corrected
+  account); the Vault model prose is ACCURATE (MemoryVault shipped,
+  Nakamoto Vault the opt-in edition); the only real drift was the test
+  count (README said 32 targets - now 35 targets / 36 ctest entries,
+  fixed). README/BACKLOG stay in sync going forward; every release
+  notes update cites tag + commit + zip.
 - Note: the owner could not independently confirm the v0.0.16-alpha tag
   contents; future reports must cite tag + commit hash + zip together.
 

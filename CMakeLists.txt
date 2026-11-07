@@ -268,6 +268,11 @@ target_link_libraries(test_pq_signatures PRIVATE vx_core gtest gtest_main)
 add_executable(test_pq_rollover tests/test_pq_rollover.cpp)
 target_link_libraries(test_pq_rollover PRIVATE vx_core)
 
+# PQ benchmark (BACKLOG P2): reproducible root/sign/verify measurements.
+# A manual target, NOT a ctest entry - benchmarks do not gate CI.
+add_executable(bench_pq tests/bench_pq.cpp)
+target_link_libraries(bench_pq PRIVATE vx_core)
+
 # ASERT PoGW difficulty retarget test suite (BACKLOG 0.9 remainder)
 add_executable(test_retarget tests/test_retarget.cpp)
 target_link_libraries(test_retarget PRIVATE vx_core gtest gtest_main)
