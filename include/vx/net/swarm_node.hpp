@@ -327,8 +327,10 @@ private:
     // Live TCP connections: address -> socket fd
     std::unordered_map<std::string, int> peer_fds_;
 
-    // Listener socket
-    int listen_fd_ = -1;
+    // Listener socket. Atomic: emergency_stop() closes/rewrites it while
+    // listener_loop() reads it on its own thread (TSan-reported race, fixed
+    // 2026-11-07); the shutdown()-based unblock design is unchanged.
+    std::atomic<int> listen_fd_{-1};
     std::atomic<uint16_t> listen_port_{0};
 
     // Accepted connection sockets, tracked so emergency_stop() can shut them

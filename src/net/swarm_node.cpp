@@ -145,10 +145,11 @@ void SwarmNode::emergency_stop() {
     if (!was_running)
         return;
 
-    if (listen_fd_ >= 0) {
-        ::shutdown(listen_fd_, SHUT_RDWR);
-        ::close(listen_fd_);
-        listen_fd_ = -1;
+    if (listen_fd_.load() >= 0) {
+        const int fd = listen_fd_.load();
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+        listen_fd_.store(-1);
     }
 
     // Unblock the listener thread if it is blocked in a recv on an accepted
@@ -683,11 +684,12 @@ void SwarmNode::shutdown_accepted() {
 
 void SwarmNode::listener_loop() {
     while (!emergency_stop_requested_.load()) {
-        if (listen_fd_ < 0) {
+        const int lfd = listen_fd_.load();
+        if (lfd < 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
-        int c = ::accept(listen_fd_, nullptr, nullptr);
+        int c = ::accept(lfd, nullptr, nullptr);
         if (c < 0) {
             if (errno == EINTR)
                 continue;
@@ -697,6 +699,15 @@ void SwarmNode::listener_loop() {
             continue;
         }
         {
+            // Stop-race guard: accept() may have been blocked on an fd that
+            // emergency_stop() shut down and closed while a concurrently
+            // opened socket reused its number. Without this re-check such a
+            // connection would be registered AFTER shutdown_accepted() and
+            // leak past teardown (TSan fix follow-up, 2026-11-07).
+            if (emergency_stop_requested_.load()) {
+                ::close(c);
+                break;
+            }
             std::lock_guard<std::mutex> lock(accepted_mu_);
             accepted_fds_.insert(c);
         }
