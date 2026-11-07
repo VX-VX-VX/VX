@@ -205,6 +205,11 @@ target_link_libraries(test_reorg PRIVATE vx_core gtest gtest_main)
 add_executable(test_crash_torture tests/test_crash_torture.cpp)
 target_link_libraries(test_crash_torture PRIVATE vx_core gtest gtest_main)
 
+# WAL intent marker: crash-consistent append for BlockStore (recovery
+# matrix: torn frame healed, fsynced frame kept, fail-closed paths pinned).
+add_executable(test_wal_marker tests/test_wal_marker.cpp)
+target_link_libraries(test_wal_marker PRIVATE vx_core gtest gtest_main)
+
 # Boundary-value torture on the money math: exact-balance drains, dust
 # boundary, UINT64_MAX amounts, UINT32_MAX fees, coinbase claims (0, floor,
 # 1001 VX), GENESIS_2 mint edges, 580-tx block, PQ 16-leaf cap.
@@ -306,6 +311,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
             test_chain_stress test_boundary_torture test_crash_torture
+            test_wal_marker
             test_rpc_auth test_key_import
             test_apply_integrity test_mempool_admission test_fold_window
             test_sponge512 test_sponge1024 test_address_v2
@@ -350,6 +356,7 @@ add_test(NAME VxBifurcationOracleTest COMMAND test_bifurcation)
 add_test(NAME VortexChainStressTest COMMAND test_chain_stress)
 add_test(NAME VortexBoundaryTortureTest COMMAND test_boundary_torture)
 add_test(NAME VxCrashTortureTest COMMAND test_crash_torture)
+add_test(NAME VortexWalMarkerTest COMMAND test_wal_marker)
 add_test(NAME VortexRpcAuthTest COMMAND test_rpc_auth)
 add_test(NAME VortexKeyImportTest COMMAND test_key_import)
 add_test(NAME VortexApplyIntegrityTest COMMAND test_apply_integrity)

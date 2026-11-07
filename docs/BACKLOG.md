@@ -1266,6 +1266,44 @@ rewrites the file after a rollback but never shrinks history), and
   auto-roll-back to the last valid undo record (O(1) recovery instead
   of a full replay scan). CRC32C on undo records is the companion
   integrity check.
+- [x] Phase 0a (delivered 2026-11-07) — the STORE-append torn-frame
+  window, the sibling of the Phase 0 apply window: the append path was
+  ftruncate -> pwrite -> fsync, so a crash between the ftruncate and the
+  fsync left a torn frame whose file size still lands on the 65536
+  boundary (invisible to the size check; the old open then died with
+  "corrupted ledger" and needed operator hands). Now a 32-byte
+  write-ahead marker in the sidecar `<ledger>.walmark` ("VXWALMK1" =
+  state + height + frame-CRC32C + record-CRC32C) makes the append
+  crash-consistent: INTENT fsynced BEFORE the ledger is touched,
+  COMMITTED fsynced after the ledger fsync (3 fsyncs per append instead
+  of 1 - the honest price of "a reported success survived a power cut").
+  Recovery on open: INTENT + CRC-matching frame = the crash hit between
+  the ledger fsync and the COMMITTED flip, the frame stays; INTENT +
+  CRC mismatch = torn frame, healed by truncation; COMMITTED + CRC
+  mismatch at the tip = the durable marker and the disk disagree - real
+  corruption, fail closed (never silently drop a durable block); a
+  marker naming a frame that is not on disk, or a stale record naming
+  history, is RESOLVED (cleared) without authorizing healing - the
+  surviving chain is always re-judged by validate_region (the first
+  draft failed the reorg-heal reopen closed - the crash-torture gate
+  caught it: legitimate truncations below a marker exist, the marker
+  only speaks about the append frontier); a corrupt or torn
+  sidecar record falls back to the pre-marker fail-closed behavior
+  (full validate_region, torn frame = refuse to start - no healing from
+  untrusted metadata, but no bypass either). rollback_last_append clears
+  the marker (a leftover would poison the next open). The directory is
+  fsynced once at open so a fresh sidecar's directory entry is durable.
+  Regression: VortexWalMarkerTest, 9 sections pinning the whole recovery
+  matrix by writing marker bytes exactly the way a crashed writer would
+  have left them; SAN lane 9/9 (ASan+UBSan). Adversarial security review
+  of the marker (2026-11-07): no findings above threshold - the crafted
+  marker path is operator-local tamper only (local file write already
+  implies the same capability), no recovery return can elevate a frame
+  past validate_region, CRC-only acceptance is unreachable, the byte
+  gate precedes recovery. Recorded residual (hardening, below threshold):
+  a second BlockStore instance racing the microsecond INTENT window could
+  truncate where the pre-marker code would have thrown - an flock on the
+  sidecar would close it under the already-broken two-writer premise.
 
 ### 2.7 Landauer gas: temperature is abstract (owner question, 2026-11-05)
 
