@@ -1,27 +1,41 @@
 #!/usr/bin/env bash
 # OPSEC_SOVEREIGN_SHIELD — pre-push gate (invariant 1).
-# Blocks the push if ANY commit in the outgoing range carries an author or
-# committer timestamp offset other than +0000. Every pushed byte must be
-# timezone-sterile; host-local time must never reach the public history.
+# Blocks the push if ANY NEWLY PUBLISHED commit carries an author or
+# committer timestamp offset other than +0000, or if a pushed annotated
+# tag carries a non-+0000 tagger offset. "Newly published" = reachable
+# from the pushed ref but from NO local ref (branch and tag pushes
+# alike) — the ratified exception for historical +0100 commits (they
+# stay, they are never rewritten) must not re-trigger on tag pushes.
 set -uo pipefail
 zero=0000000000000000000000000000000000000000
 fail=0
 
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$zero" ] && continue          # deletion, nothing to check
-    if [ "$remote_sha" = "$zero" ]; then
-        # new ref: check the pushed tip commit itself
-        range="$local_sha"
-    else
-        range="$remote_sha..$local_sha"
+
+    # Annotated tag object: the tagger offset is pushed metadata too.
+    if [ "$(git cat-file -t "$local_sha" 2>/dev/null)" = "tag" ]; then
+        toff=$(git cat-file -p "$local_sha" | awk '/^tagger /{print $NF}')
+        if [ "$toff" != "+0000" ]; then
+            echo "OPSEC pre-push: BLOCKED - tag $local_ref has non-UTC tagger offset ($toff)."
+            echo "  Re-tag with: TZ=UTC git tag -s ..."
+            fail=1
+        fi
     fi
+
+    # Newly published commits only: reachable from the pushed sha but
+    # from no origin remote-tracking ref (i.e. new to the server). A
+    # bare `git log <sha>` would scan the whole reachable history and
+    # re-flag the ratified +0100 legacy commits.
     while IFS='|' read -r sha aoff coff; do
+        [ -n "$sha" ] || continue
         if [ "$aoff" != "+0000" ] || [ "$coff" != "+0000" ]; then
             echo "OPSEC pre-push: BLOCKED - commit $sha has non-UTC offsets (author=$aoff committer=$coff)."
             echo "  Re-commit via: scripts/commit_utc.sh (TZ=UTC, epoch dates)"
             fail=1
         fi
-    done < <(git log --format='%H|%ai|%ci' "$range" | awk -F'|' '{split($2,a," ");split($3,c," ");print $1"|"a[3]"|"c[3]}')
+    done < <(git log --format='%H|%ai|%ci' "$local_sha" --not --remotes=origin |
+             awk -F'|' '{split($2,a," ");split($3,c," ");print $1"|"a[3]"|"c[3]}')
 done
 
 if [ "$fail" -eq 0 ]; then
