@@ -227,13 +227,25 @@ bool SwarmNode::connect_peer_tcp(const std::string &host, uint16_t port) {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(peers_mutex_);
-    peer_fds_[host + ":" + std::to_string(port)] = fd;
+    const std::string label = host + ":" + std::to_string(port);
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        peer_fds_[label] = fd;
+    }
     // Reader thread: our outgoing socket must also ingest — otherwise blocks
     // broadcast back to us by the dialed peer are never received.
-    const std::string label = host + ":" + std::to_string(port);
-    std::lock_guard<std::mutex> readers_lock(readers_mu_);
-    peer_readers_.emplace_back(&SwarmNode::peer_reader_loop, this, fd, label);
+    {
+        std::lock_guard<std::mutex> readers_lock(readers_mu_);
+        peer_readers_.emplace_back(&SwarmNode::peer_reader_loop, this, fd, label);
+    }
+    // Security review P0-1 (2.11 third checkbox): the connect side effect
+    // fires OUTSIDE both locks, mirroring the inbound fire_connected
+    // discipline - the retention serve re-enters peers_mutex_ through
+    // send_witnesses_to, and it also takes state_mutex_ first, so firing
+    // under peers_mutex_ would self-deadlock AND invert the documented
+    // state_mutex_ -> peers_mutex_ order on the dialing thread.
+    if (peer_connected_callback_)
+        peer_connected_callback_(label);
     return true;
 }
 
@@ -495,6 +507,55 @@ void SwarmNode::set_witness_callback(WitnessCallback cb) {
     witness_callback_ = std::move(cb);
 }
 
+void SwarmNode::set_peer_connected_callback(PeerConnectedCallback cb) {
+    peer_connected_callback_ = std::move(cb);
+}
+
+bool SwarmNode::send_witnesses_to(const std::string &peer_label,
+                                  const std::span<const uint8_t, 65536> &frame) {
+    auto *raw = reinterpret_cast<const blockchain::RawBlock *>(frame.data());
+    const uint32_t count =
+        raw->header.tx_count > blockchain::MAX_TX_PER_BLOCK ? 0u : raw->header.tx_count;
+    std::vector<std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)>> payloads;
+    for (uint32_t i = 0; i < count; ++i) {
+        const blockchain::Transaction &tx = raw->transactions[i];
+        const char *s = reinterpret_cast<const char *>(tx.sender_nfa);
+        if (std::strncmp(s, "GENESIS", 7) == 0 || std::strncmp(s, "MINER_", 6) == 0)
+            continue; // system senders carry no witness
+        const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+        vx::crypto::pq::PqSignatureWitness w;
+        if (!vx::crypto::pq::PqWitnessRegistry::instance().lookup(digest, w))
+            continue; // nothing to relay for this tx
+        std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)> payload{};
+        std::memcpy(payload.data(), digest.data(), 32);
+        std::memcpy(payload.data() + 32, tx.sender_nfa, 42);
+        std::memcpy(payload.data() + 74, &w, sizeof(w));
+        payloads.push_back(payload);
+    }
+    int fd = -1;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        auto it = peer_fds_.find(peer_label);
+        if (it == peer_fds_.end())
+            return false;
+        // Security review P2-5 (2.11 third checkbox): unlike the inbound
+        // retention path (the caller IS the fd owner there), a serve for an
+        // OUTBOUND peer runs on the dialer thread while the fd's owner is
+        // the reader thread - if the remote hangs up mid-serve, the owner
+        // closes the fd and the number can be recycled into a new
+        // connection mid-send. Duplicate the descriptor under the lock and
+        // send on the dup: both share the file description, so a shutdown()
+        // by the health loop still kills the send, but close() by the owner
+        // cannot swap the target out from under us.
+        fd = ::fcntl(it->second, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0)
+            return false;
+    }
+    const bool ok = send_payloads_to(fd, payloads);
+    ::close(fd);
+    return ok;
+}
+
 void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536> &frame) {
     auto *raw = reinterpret_cast<const blockchain::RawBlock *>(frame.data());
     const uint32_t count =
@@ -526,27 +587,36 @@ void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536> &f
             fds.push_back(fd);
         }
     }
-    for (int fd : fds) {
-        for (const auto &payload : payloads) {
-            WireHeader hdr =
-                make_header(WireMsgType::PQ_WITNESS, static_cast<uint32_t>(payload.size()),
-                            session_nonce_.fetch_add(1));
-            hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
-            ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-            if (n != static_cast<ssize_t>(sizeof(hdr)))
-                break;
-            size_t off = 0;
-            while (off < payload.size()) {
-                n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
-                if (n <= 0) {
-                    if (n < 0 && errno == EINTR)
-                        continue;
-                    break;
-                }
-                off += static_cast<size_t>(n);
+    for (int fd : fds)
+        send_payloads_to(fd, payloads);
+}
+
+// Sends PQ_WITNESS packets for the prebuilt payloads on one socket.
+// A short header send desyncs the peer's stream, so it is fatal there;
+// here that surfaces as returning false (the caller logs or drops).
+bool SwarmNode::send_payloads_to(
+    int fd,
+    const std::vector<std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)>>
+        &payloads) {
+    for (const auto &payload : payloads) {
+        WireHeader hdr = make_header(WireMsgType::PQ_WITNESS, static_cast<uint32_t>(payload.size()),
+                                     session_nonce_.fetch_add(1));
+        hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
+        ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
+        if (n != static_cast<ssize_t>(sizeof(hdr)))
+            return false;
+        size_t off = 0;
+        while (off < payload.size()) {
+            n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR)
+                    continue;
+                return false;
             }
+            off += static_cast<size_t>(n);
         }
     }
+    return true;
 }
 
 // BACKLOG 1.5: relay a certified one-window key rotation. Payload layout
@@ -603,7 +673,7 @@ void SwarmNode::handle_incoming_frame(const std::string &from_peer,
         return;
     }
     if (frame_hook_)
-        frame_hook_(frame.data(), frame.size());
+        frame_hook_(frame.data(), frame.size(), from_peer);
     // Further block-relay policy (apply / re-broadcast) lives in the hook.
 }
 
@@ -630,6 +700,19 @@ void SwarmNode::ban_peer(const std::string &address, int score_increment) {
             return;
         }
     }
+}
+
+void SwarmNode::report_withhold(const std::string &peer_address, int score_increment) {
+    ban_peer(peer_address, score_increment);
+}
+
+bool SwarmNode::peer_is_banned(const std::string &peer_address) const {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    for (const auto &p : peer_table_) {
+        if (p.address == peer_address)
+            return p.is_banned;
+    }
+    return false;
 }
 
 void SwarmNode::simulate_fork() {
@@ -743,9 +826,12 @@ void SwarmNode::serve_connection(int c) {
     // that was connected TO can relay back over the accepted socket.
     std::string peer_label = "loopback";
     bool registered = false;
-    auto promote = [&]() {
+    // Returns true only on the call that actually registered the peer, so
+    // callers can fire one-shot connect side effects (retention re-serve)
+    // without re-triggering them on every later packet.
+    auto promote = [&]() -> bool {
         if (registered)
-            return;
+            return false;
         sockaddr_in sa{};
         socklen_t sl = sizeof(sa);
         uint16_t rport = 0;
@@ -764,6 +850,14 @@ void SwarmNode::serve_connection(int c) {
         peer.last_seen = std::chrono::system_clock::now();
         peer_table_.insert(peer);
         registered = true;
+        return true;
+    };
+    // Fired OUTSIDE the promote lock: the callback serves the witness
+    // retention window, which re-enters peers_mutex_ through
+    // send_witnesses_to - calling it under the lock would self-deadlock.
+    auto fire_connected = [&]() {
+        if (peer_connected_callback_)
+            peer_connected_callback_(peer_label);
     };
     for (;;) {
         WireHeader hdr{};
@@ -772,21 +866,24 @@ void SwarmNode::serve_connection(int c) {
             break;
         const auto type = static_cast<WireMsgType>(hdr.msg_type);
         if (type == WireMsgType::PING) {
-            promote();
+            if (promote())
+                fire_connected();
             WireHeader pong = make_header(WireMsgType::PONG, 0, session_nonce_.fetch_add(1));
             pong.crc32c = compute_wire_crc32c(nullptr, 0);
             ::send(c, &pong, sizeof(pong), MSG_NOSIGNAL);
             continue;
         }
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
-            promote();
+            if (promote())
+                fire_connected();
             handle_incoming_frame(peer_label,
                                   std::span<const uint8_t, 65536>(payload.data(), payload.size()));
             continue;
         }
         if (type == WireMsgType::PQ_WITNESS &&
             payload.size() == 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)) {
-            promote();
+            if (promote())
+                fire_connected();
             vx::crypto::pq::PqSignatureWitness w;
             std::memcpy(&w, payload.data() + 74, sizeof(w));
             std::array<uint8_t, 32> digest{};
@@ -798,7 +895,8 @@ void SwarmNode::serve_connection(int c) {
             continue;
         }
         if (type == WireMsgType::ROLLOVER_CERT) {
-            promote();
+            if (promote())
+                fire_connected();
             handle_rollover_cert_payload(payload);
             continue;
         }

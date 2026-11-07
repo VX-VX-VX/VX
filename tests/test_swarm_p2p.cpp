@@ -209,8 +209,10 @@ TEST(VortexSwarmP2PTest, ListenerRelaysVerifiedFrameToHook) {
     std::atomic<int> frames_seen{0};
     std::vector<uint8_t> captured;
     std::mutex cap_mu;
-    receiver.set_frame_hook([&](const uint8_t* frame, size_t len) {
-        if (len != 65536) return;
+    receiver.set_frame_hook([&](const uint8_t *frame, size_t len, const std::string &peer_label) {
+        EXPECT_FALSE(peer_label.empty());
+        if (len != 65536)
+            return;
         std::lock_guard<std::mutex> lock(cap_mu);
         captured.assign(frame, frame + len);
         frames_seen.fetch_add(1);
@@ -235,4 +237,114 @@ TEST(VortexSwarmP2PTest, ListenerRelaysVerifiedFrameToHook) {
     EXPECT_EQ(frames_seen.load(), 1);
     ASSERT_EQ(captured.size(), 65536u);
     EXPECT_EQ(std::memcmp(captured.data(), frame.data(), 65536), 0);
+}
+
+// ── 7. Withhold escalation to ban (BACKLOG 2.11 third checkbox) ─────────────
+
+TEST(VortexSwarmP2PTest, WithholdEscalatesToBan) {
+    // Free port probe: bind port 0, read the assigned port, close.
+    int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(probe, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ASSERT_EQ(::bind(probe, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0);
+    socklen_t alen = sizeof(addr);
+    ::getsockname(probe, reinterpret_cast<sockaddr *>(&addr), &alen);
+    const uint16_t port = ntohs(addr.sin_port);
+    ::close(probe);
+
+    vx::net::SwarmNode receiver;
+    ASSERT_TRUE(receiver.bind_p2p_listener(port));
+    receiver.start();
+
+    // A client that PINGs gets promoted into the peer table (that is what
+    // makes report_withhold scoring possible at all: the score lives on the
+    // PeerInfo entry).
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+    socklen_t clen = sizeof(sa);
+    ::getsockname(fd, reinterpret_cast<sockaddr *>(&sa), &clen);
+    const std::string label = "127.0.0.1:" + std::to_string(ntohs(sa.sin_port));
+
+    WireHeader ping = vx::net::SwarmNode::make_header(WireMsgType::PING, 0, 77);
+    ping.crc32c = vx::net::compute_wire_crc32c(nullptr, 0);
+    ASSERT_EQ(::send(fd, &ping, sizeof(ping), 0), static_cast<ssize_t>(sizeof(ping)));
+
+    // The PONG proves the reader thread processed the PING (and promoted us).
+    bool got_pong = false;
+    for (int i = 0; i < 100 && !got_pong; ++i) {
+        WireHeader h{};
+        ssize_t n = ::recv(fd, &h, sizeof(h), MSG_DONTWAIT);
+        if (n != static_cast<ssize_t>(sizeof(h))) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+        if (h.msg_type == static_cast<uint8_t>(WireMsgType::PONG))
+            got_pong = true;
+    }
+    ASSERT_TRUE(got_pong) << "peer was never promoted; the escalation test is vacuous";
+    EXPECT_FALSE(receiver.peer_is_banned(label));
+
+    // Three withhold strikes (34 each) cross the >=100 ban threshold.
+    receiver.report_withhold(label, 34);
+    EXPECT_FALSE(receiver.peer_is_banned(label));
+    receiver.report_withhold(label, 34);
+    EXPECT_FALSE(receiver.peer_is_banned(label));
+    receiver.report_withhold(label, 34);
+    EXPECT_TRUE(receiver.peer_is_banned(label));
+
+    receiver.emergency_stop();
+    ::close(fd);
+}
+
+// ── 8. Outbound dial fires the connect callback WITHOUT deadlocking ────────
+// (security review P0-1, 2.11 third checkbox: the retention serve re-enters
+// peers_mutex_ and takes state_mutex_ first, so the callback must fire
+// outside both locks on the dialing path too - the pre-fix code held
+// peers_mutex_ while firing and froze the whole node on the first dial).
+
+TEST(VortexSwarmP2PTest, OutboundDialFiresConnectedCallback) {
+    int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(probe, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ASSERT_EQ(::bind(probe, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)), 0);
+    socklen_t alen = sizeof(addr);
+    ::getsockname(probe, reinterpret_cast<sockaddr *>(&addr), &alen);
+    const uint16_t port = ntohs(addr.sin_port);
+    ::close(probe);
+
+    vx::net::SwarmNode listener; // no callbacks: plain receiver
+    ASSERT_TRUE(listener.bind_p2p_listener(port));
+    listener.start();
+
+    // The DIALING node carries the connect callback (as HttpServer does
+    // once the retention wiring is installed). Pre-fix this call sequence
+    // self-deadlocked the dialing thread under peers_mutex_.
+    vx::net::SwarmNode dialer;
+    std::atomic<int> connects{0};
+    std::string seen_label;
+    dialer.set_peer_connected_callback([&](const std::string &label) {
+        seen_label = label;
+        connects.fetch_add(1);
+    });
+    ASSERT_TRUE(dialer.connect_peer_tcp("127.0.0.1", port));
+
+    for (int i = 0; i < 50 && connects.load() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    EXPECT_EQ(connects.load(), 1) << "callback must fire exactly once per dial";
+    EXPECT_EQ(seen_label, "127.0.0.1:" + std::to_string(port));
+
+    dialer.emergency_stop();
+    listener.emergency_stop();
 }

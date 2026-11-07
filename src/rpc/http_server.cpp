@@ -189,12 +189,19 @@ void HttpServer::stop() {
 
 void HttpServer::attach_p2p(uint16_t p2p_port,
                             const std::vector<std::string>& peer_endpoints) {
-    swarm_node_->set_frame_hook([this](const uint8_t* frame, size_t len) {
-        if (len == 65536) apply_remote_frame(frame);
-    });
+    swarm_node_->set_frame_hook(
+        [this](const uint8_t *frame, size_t len, const std::string &peer_label) {
+            if (len == 65536)
+                apply_remote_frame(frame, peer_label);
+        });
     // BACKLOG 2.11 stage 2: retry parked frames when their witnesses arrive.
     swarm_node_->set_witness_callback(
         [this](const std::array<uint8_t, 32> &digest) { on_witness_arrived(digest); });
+    // BACKLOG 2.11 third checkbox: a newly promoted peer gets the witness
+    // retention window re-served (fire-and-forget gossip alone leaves a
+    // peer that connected mid-stream permanently unable to verify).
+    swarm_node_->set_peer_connected_callback(
+        [this](const std::string &peer_label) { serve_witness_retention(peer_label); });
     if (p2p_port != 0 && !swarm_node_->bind_p2p_listener(p2p_port)) {
         std::cerr << "[NODE] VX60 P2P bind failed on port " << p2p_port
                   << " — continuing RPC-only\n";
@@ -273,15 +280,26 @@ HttpServer::RemoteApply HttpServer::try_apply_remote_frame(const uint8_t *bytes,
         ParkedFrame pf;
         std::memcpy(pf.bytes.data(), bytes, 65536);
         pf.arrived = std::chrono::steady_clock::now();
+        // Security review P2-3: remember who delivered this frame so a
+        // retry that MISMATCHes scores the origin, not a constant label.
+        pf.peer_label = peer;
         parked_witness_frames_.push_back(std::move(pf));
         return RemoteApply::PARKED;
     }
     if (wstatus == vx::blockchain::WitnessRootStatus::MISMATCH) {
         // Withholding becomes attribution: the commitment names a witness
         // set no canonical rule produces. Scored per peer; escalation to a
-        // mute/ban lives on the SwarmNode reputation surface (the third
-        // 2.11 checkbox builds on this counter).
+        // mute/ban rides the SwarmNode reputation surface.
         ++witness_withhold_score_[peer];
+        // Security review P2-4 (2.11 third checkbox): the map is bounded -
+        // churned labels must not accumulate forever. Drop the first entry
+        // (key order) when full; an attacker buying evictions only churns
+        // other attackers' entries.
+        if (witness_withhold_score_.size() > kMaxWithholdScoreEntries)
+            witness_withhold_score_.erase(witness_withhold_score_.begin());
+        // BACKLOG 2.11 third checkbox: the counter now has a consumer -
+        // three strikes (34 each) cross the SwarmNode ban threshold.
+        swarm_node_->report_withhold(peer, 34);
         return RemoteApply::REFUSED;
     }
 
@@ -309,8 +327,8 @@ HttpServer::RemoteApply HttpServer::try_apply_remote_frame(const uint8_t *bytes,
     return RemoteApply::APPLIED;
 }
 
-bool HttpServer::apply_remote_frame(const void *frame) {
-    return try_apply_remote_frame(static_cast<const uint8_t *>(frame), "wire") ==
+bool HttpServer::apply_remote_frame(const void *frame, const std::string &peer_label) {
+    return try_apply_remote_frame(static_cast<const uint8_t *>(frame), peer_label) ==
            RemoteApply::APPLIED;
 }
 
@@ -353,7 +371,10 @@ void HttpServer::on_witness_arrived(const std::array<uint8_t, 32> &digest) {
     // Retry OUTSIDE the state lock: try_apply_remote_frame takes
     // state_mutex_ -> seal_mutex_ itself (same order as the live path).
     for (auto &pf : candidates) {
-        const auto outcome = try_apply_remote_frame(pf.bytes.data(), "parked-retry");
+        // Retry under the frame's ORIGINAL delivery label (security review
+        // P2-3): a MISMATCH on retry must land on the peer that submitted
+        // the frame, not on the meaningless "parked-retry" constant.
+        const auto outcome = try_apply_remote_frame(pf.bytes.data(), pf.peer_label);
         if (outcome == RemoteApply::PARKED) {
             // Witnesses are still incomplete: re-park. pf.arrived still
             // holds the ORIGINAL arrival time, so the TTL keeps ticking
@@ -375,6 +396,59 @@ void HttpServer::on_witness_arrived(const std::array<uint8_t, 32> &digest) {
 size_t HttpServer::parked_witness_count() {
     std::lock_guard<std::mutex> state_lock(state_mutex_);
     return parked_witness_frames_.size();
+}
+
+void HttpServer::serve_witness_retention(const std::string &peer_label) {
+    // Security review P1-2 (2.11 third checkbox): a 24-byte PING buys up to
+    // 16 frames' worth of witness sends, so the window is served at most
+    // once per source IP per kWitnessRetentionInterval - a reconnect storm
+    // (new ephemeral port per connect) cannot keep re-pulling it, and the
+    // rate map itself is bounded.
+    std::string ip = peer_label;
+    const auto colon = ip.rfind(':');
+    if (colon != std::string::npos)
+        ip.resize(colon);
+    const auto now = std::chrono::steady_clock::now();
+    // Snapshot the retention window UNDER state_mutex_ (the same mutex that
+    // guards append_block, so no torn read of a sealing tip), then do the
+    // network sends OUTSIDE it - send_witnesses_to takes the SwarmNode's
+    // peers_mutex_, and no I/O belongs under the state lock.
+    std::vector<std::array<uint8_t, 65536>> frames;
+    {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        auto served = retention_served_at_.find(ip);
+        if (served != retention_served_at_.end() &&
+            now - served->second < kWitnessRetentionInterval)
+            return;
+        if (retention_served_at_.size() >= kMaxRetentionRateEntries) {
+            // Bounded: first drop every lapsed entry, then (if a single
+            // window is genuinely saturated with fresh IPs) the first key.
+            for (auto it = retention_served_at_.begin(); it != retention_served_at_.end();) {
+                if (now - it->second >= kWitnessRetentionInterval)
+                    it = retention_served_at_.erase(it);
+                else
+                    ++it;
+            }
+            if (retention_served_at_.size() >= kMaxRetentionRateEntries)
+                retention_served_at_.erase(retention_served_at_.begin());
+        }
+        retention_served_at_[ip] = now;
+
+        const uint64_t h = store_.chain_height();
+        const uint64_t first = h > kWitnessRetentionBlocks ? h - kWitnessRetentionBlocks : 0;
+        frames.reserve(static_cast<size_t>(h - first));
+        for (uint64_t b = first; b < h; ++b) {
+            const auto *raw = store_.get_block(b);
+            if (!raw)
+                continue;
+            frames.emplace_back();
+            std::memcpy(frames.back().data(), raw, 65536);
+        }
+    }
+    for (auto &f : frames) {
+        swarm_node_->send_witnesses_to(peer_label,
+                                       std::span<const uint8_t, 65536>(f.data(), f.size()));
+    }
 }
 
 uint64_t HttpServer::witness_withhold_count(const std::string &peer) {

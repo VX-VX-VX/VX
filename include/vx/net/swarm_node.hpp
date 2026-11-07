@@ -228,7 +228,11 @@ public:
     // arrives over the P2P listener. The node layer (RPC server / main) owns
     // the decision to apply, relay or drop the frame; the wire layer only
     // guarantees CRC32C integrity and the BLOCK_MAGIC prefix.
-    using FrameHook = std::function<void(const uint8_t *frame, size_t len)>;
+    // The label names the sending peer (IP:port) so the intake layer can
+    // attribute witness-commitment violations per peer (BACKLOG 2.11
+    // third checkbox).
+    using FrameHook =
+        std::function<void(const uint8_t *frame, size_t len, const std::string &peer_label)>;
     void set_frame_hook(FrameHook hook);
 
     // BACKLOG 2.11 stage 2: fired on BOTH reader loops after a PQ_WITNESS
@@ -240,6 +244,31 @@ public:
     // peers_mutex_ last, which is consistent with the existing hook).
     using WitnessCallback = std::function<void(const std::array<uint8_t, 32> &digest)>;
     void set_witness_callback(WitnessCallback cb);
+
+    // BACKLOG 2.11 third checkbox (retention): fired once when a peer
+    // connection is promoted to a tracked broadcast target - inbound
+    // after its first verified packet, outbound right after the dial
+    // registers. The node layer uses it to serve the witness-retention
+    // window to the freshly connected peer.
+    using PeerConnectedCallback = std::function<void(const std::string &peer_label)>;
+    void set_peer_connected_callback(PeerConnectedCallback cb);
+
+    // Sends the PQ witnesses this node holds for ONE block frame to a
+    // single peer (the retention backfill path; broadcast_witnesses_for
+    // remains the one-hop gossip fan-out). Returns false when the label
+    // names no connected peer.
+    bool send_witnesses_to(const std::string &peer_label,
+                           const std::span<const uint8_t, 65536> &frame);
+
+    // BACKLOG 2.11 third checkbox: the intake layer reports a peer whose
+    // block header committed a witness set no canonical rule produces
+    // (withholding / lying commitment). Reuses the DoS reputation
+    // machinery: dos_score += score_increment, auto-ban at 100. The
+    // recommended strike weight is 34 (three strikes ban).
+    void report_withhold(const std::string &peer_address, int score_increment);
+
+    // True when the peer's DoS reputation crossed the ban threshold.
+    bool peer_is_banned(const std::string &peer_address) const;
 
     // ── VX60 wire protocol ────────────────────────────────────────
 
@@ -364,6 +393,7 @@ private:
     // Callback for verified inbound block frames (set by the node layer)
     FrameHook frame_hook_;
     WitnessCallback witness_callback_;
+    PeerConnectedCallback peer_connected_callback_;
 
     // VX60 wire statistics (atomic: updated from multiple threads)
     std::atomic<uint64_t> corrupted_packets_dropped_{0};
@@ -409,6 +439,10 @@ private:
 
     // Ban peer for DoS
     void ban_peer(const std::string &address, int score_increment);
+    bool send_payloads_to(
+        int fd,
+        const std::vector<std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)>>
+            &payloads);
 
     // Resolve split-brain fork using heaviest cumulative work
     void resolve_fork(const PeerInfo &challenger);

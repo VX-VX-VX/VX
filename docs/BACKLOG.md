@@ -1399,21 +1399,27 @@ FACT: the block frame is fixed at 65536 B, a transaction is 112 B, a
 detached WOTS+/XMSS witness is 2376 B — 30 witnesses (71280 B) exceed
 the block itself, so witnesses necessarily travel out-of-band today.
 
-- [ ] Audit apply_remote_frame: what happens when a block arrives whose
-  PQ-backed senders' witnesses have NOT arrived (or arrive late)?
-  Is the block admitted, rejected, or parked pending witnesses?
-  VERIFIED 2026-11-05: a missing witness makes verify_transaction_proof
-  fail Tier 1 → apply_block refuses → rollback_last_append → the block
-  is REJECTED (fail-closed, never admitted witness-less) — but the
-  failure mode is a liveness stall, and the NEW-sender case looks
-  unserveable: `sender_roots_` is fed ONLY by tx-verified local
-  registrations (round-7 rule: wire registrations must not flip a
-  sender into the PQ class), so a remote sender's FIRST transaction
-  arrives with no binding at all → Tier 2 rejects unbound user
-  senders → every remote block containing a brand-new PQ sender is
-  rejected until that sender registers locally. Needs a designed
-  first-seen binding path (e.g., block-carried witness registration
-  bound to the accepted block) rather than an accidental stall.
+- [x] VERIFIED 2026-11-05 (reject-forever), then SUPERSEDED twice and
+  CLOSED 2026-11-07: (1) the liveness stall itself is gone — stage 2
+  parks MISSING_WITNESS frames and retries on witness arrival; (2) the
+  "new-sender case looks unserveable" claim was STALE: the designed
+  first-seen binding path has existed since the rounds 7-9 commit
+  (589f38a) — LedgerState's self-certifying branch binds a PQA sender
+  on its first witnessed spend (the address commits its own key root;
+  derive_pq_address(w.pq_pubkey_root) == sender is enforced, the
+  binding is collected as new_bindings_ and committed only after the
+  WHOLE block validates). VortexWitnessDeliveryTest.
+  RemoteFirstSpendBindsAndContinues pins the full remote lifecycle:
+  brand-new PQA account funded by a bound sender, first spend arrives
+  in a remote frame, parks on the missing witness, applies on wire
+  arrival, the ledger binds the address, and the follow-up remote
+  spend goes through the bound-root path. RESIDUAL (recorded, not a
+  beta blocker): a sender whose address is NOT self-certifying and
+  NOT in the genesis seed table still cannot be remotely onboarded -
+  classic-format addresses need a designed registration story if any
+  user class beyond PQA is meant to spend; today every user-facing
+  address generation is PQA, so the residual is a policy question
+  more than a defect.
 - [x] STAGE 1 DELIVERED 2026-11-07 (VXC7 frame format): the header grew
   472 -> 504 B (witness_merkle_root[32] at offset 0x1D8),
   BLOCK_MAGIC 0x58564336 -> 0x58564337; VXC6 frames are REFUSED at
@@ -1472,15 +1478,45 @@ the block itself, so witnesses necessarily travel out-of-band today.
   archives/notes/witness-delivery-stage2-design.md. Tests:
   VortexWitnessDeliveryTest, 6 sections (park-then-retry, mismatch
   refused and attributed, cap eviction, TTL expiry, tip-move kills a
-  parked frame, unrelated witness does not retry). Honest notes: (a) a
-  brand-new REMOTE sender's first transaction still has no binding and
-  would park to expiry — the first-seen binding path (first checkbox)
-  remains open; (b) the withhold counter logs only, no ban yet; (c) a
-  dedicated WITNESS_REQUEST pull is a follow-up only if one-hop
+  parked frame, unrelated witness does not retry). Honest notes, updated
+  2026-11-07: (a) CLOSED - the first-seen binding worry was stale: the
+  self-certifying binding path (the is_pq_address branch in ledger_state,
+  present since 589f38a) binds a brand-new PQA sender on its first
+  witnessed spend, verified e2e by RemoteFirstSpendBindsAndContinues (a
+  remote first-spend parks, its witness arrives, the frame applies, and
+  the binding persists for the follow-up spend); (b) CLOSED by the third
+  checkbox below (report_withhold escalation + retention window); (c) a
+  dedicated WITNESS_REQUEST pull remains a follow-up only if one-hop
   witness gossip does not converge on deeper topologies.
-- [ ] Define the witness-retention window: how long a node must serve
-  witnesses for blocks it proposes, and the ban/score for a peer that
-  repeatedly proposes blocks whose witnesses never arrive.
+- [x] CLOSED (2026-11-07): the retention window is live and the withhold
+  counter escalates. A newly promoted peer (one-shot per promote(), fired
+  outside peers_mutex_) is re-served the witnesses of the last
+  kWitnessRetentionBlocks = 16 stored blocks (HttpServer::serve_witness_retention:
+  snapshot under state_mutex_, sends outside it) through
+  SwarmNode::send_witnesses_to; a MISMATCH frame now feeds
+  report_withhold(peer, 34) - three strikes cross the >=100 dos_score ban
+  threshold and health_loop disconnects the banned peer. Security review
+  of the diff (adversarial, zero-trust) found and fixed BEFORE commit:
+  P0-1 the OUTBOUND dial fired peer_connected_callback_ under
+  peers_mutex_ - a guaranteed self-deadlock of the whole node on the
+  first configured --peer (fixed: fire outside both locks, mirroring the
+  inbound fire_connected discipline + regression test
+  OutboundDialFiresConnectedCallback); P1-2 retention is a real
+  amplifier (one 24-byte PING bought up to ~23 MB of sends and a 1 MiB
+  snapshot under state_mutex_) - now rate-limited to one serve per
+  source IP per 60 s with a bounded rate map (regression pinned by the
+  second-connect branch of RetentionServedOnConnect); P2-3 a parked
+  frame's retry MISMATCH was scored against the constant "parked-retry"
+  label, voiding the strike - ParkedFrame now carries the origin label;
+  P2-4 witness_withhold_score_ is bounded (1024 entries, first-key
+  eviction); P2-5 send_witnesses_to now sends on an F_DUPFD_CLOEXEC dup
+  of the peer fd so an owner-thread close cannot recycle the fd mid-send
+  (the pre-existing same-shape pattern in broadcast_witnesses_for is
+  noted as residual). Honest residual: bans remain keyed on the
+  connection label (ip:port), so a reconnect on a new ephemeral port
+  starts with a clean score - durable identity-based bans wait for a
+  richer handshake (node_id is still 0); the state_mutex_-held 1 MiB
+  snapshot is rate-bounded, not eliminated.
 
 ### 2.8 Seed canonicalization: fail-closed format at the CLI/RPC surface (degeneracy hunt, 2026-11-05 — first findings fixed in v0.0.10)
 
@@ -1796,6 +1832,55 @@ outside this repo by design (build tools are not consensus code).
   test_pq_rollover section 12 - a stale digest can never be served as
   success. Honest note: auth-path sibling hashes are still recomputed
   per signature, but they are cheap node hashes, not chains.
+
+## 0.1.x beta gate (drafted 2026-11-07, owner ladder: witness root -> leaf cache -> 0.1.8 -> DKSAP)
+
+The witness-root and leaf-cache ladder items closed on 2026-11-07
+(2.11 stages 1+2; the per-window leaf cache shipped 2026-11-06). This
+section pins what must be TRUE before the version scheme moves from
+v0.0.x to beta 0.1.x. Drafted from the open P0/P1 items - the owner
+amends the list as needed.
+
+- [x] **2.11 first-seen binding path** — CLOSED (2026-11-07): the
+  checkbox was stale. The self-certifying binding path (is_pq_address
+  branch in ledger_state, present since 589f38a) already binds a
+  brand-new remote PQA sender on its first witnessed spend; the new e2e
+  test RemoteFirstSpendBindsAndContinues pins it (park -> witness
+  arrives -> frame applies -> binding persists). Residual (policy, not a
+  blocker): classic (non-PQA) addresses have no remote onboarding path.
+- [ ] **1.5 P0 GATE: cert delivery/backfill** (see 1.5): a node that
+  misses a relayed rollover cert diverges permanently. A beta network
+  with wallets running rollovers cannot ship without cert INV +
+  GET_CERTS over VX60 and replay-on-demand from the durable sidecar.
+  The gate stands until this closes - no wallet emits certificates
+  before it does.
+- [ ] **1.5 wallet policy**: rollover trigger on window exhaustion,
+  publication/relay trigger from RPC/wallet, and the leaf-log record
+  widening for window-1 leaves (a store-format change through the
+  migration protocol).
+- [x] **2.11 third checkbox: retention window + withhold ban/score** —
+  CLOSED (2026-11-07): every newly promoted peer gets the witnesses of
+  the last 16 stored blocks re-served (serve_witness_retention ->
+  send_witnesses_to, one-shot per promote()), and the MISMATCH path now
+  feeds report_withhold(peer, 34) - three strikes cross the >=100 ban
+  threshold and the health loop disconnects the peer. Honest residual:
+  bans are keyed on the connection label (ip:port); a reconnect on a
+  fresh port starts clean until a richer handshake carries a durable
+  node identity.
+- [ ] **2.6 WAL flock residual**: the two-instance INTENT-window race
+  hardening (below-threshold review residual; cheap, do it before
+  beta rather than after).
+- [ ] **2.11 refinement: SSE drop shutdown(fd, SHUT_RDWR)** (owner
+  II.2): the SSE slow-consumer drop currently relies on close()
+  semantics; the refinement is a small, contained change.
+- Owner-decision items (NOT beta blockers, tracked in the Q2-Q4
+  directive): the 2.12(e) Guard decision, ord_P(7) ECM analysis, the
+  CRT-collision formal proof. These gate the NEXT major release, not
+  the beta flip.
+- Versioning note: the flip itself is a release-engineering act
+  (scripts/make_release.sh, version scheme 0.0.x -> 0.1.x); it happens
+  only when every box above is checked and all three lanes are green
+  on the release tree.
 
 ## Owner priority table for the next release (audit of v0.0.16, 2026-11-05 late)
 

@@ -20,16 +20,22 @@
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/genesis.hpp"
 #include "vx/crypto/pq_signature.hpp"
+#include "vx/net/swarm_node.hpp"
 #include "vx/rpc/http_server.hpp"
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <memory>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace vx::blockchain;
 using vx::core::U128;
@@ -354,4 +360,267 @@ TEST(VortexWitnessDeliveryTest, UnrelatedWitnessDoesNotRetry) {
     c.server->on_witness_arrived(vx::crypto::pq::tx_msg_digest(other));
     EXPECT_EQ(c.server->parked_witness_count(), 1u)
         << "an unrelated witness must not touch the parked frame";
+}
+
+// -- BACKLOG 2.11 first checkbox, verified end to end: a brand-new REMOTE
+// sender (a PQA address no node has ever bound) spends for the first time
+// in a remotely-arrived block. The frame parks on the missing witness,
+// the witness arrives over the wire, and the block applies THROUGH the
+// self-certifying binding path: the address commits its own key root, so
+// the first witnessed spend binds it - no local registration needed.
+TEST(VortexWitnessDeliveryTest, RemoteFirstSpendBindsAndContinues) {
+    DeliveryChain c("vx_wd_firstseen");
+    ASSERT_TRUE(c.server != nullptr);
+
+    // A brand-new PQA account nobody has bound: address derived from its
+    // own key root.
+    const PqAccount newcomer = make_pq_account("VX_WD_NEWCOMER_SK_V1");
+    ASSERT_EQ(0, std::memcmp(newcomer.addr.data(), newcomer.addr.data(), 42));
+
+    // The demo spender funds the newcomer (the RECEIVER side needs no
+    // binding), locally applied so the tip advances.
+    {
+        BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
+        Transaction fund = make_tx(c.spender, newcomer.addr, 5000000000u, 0);
+        ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(fund, c.demo.sk));
+        ASSERT_TRUE(b.add_transaction(fund));
+        ASSERT_EQ(1u, b.bind_canonical_witnesses(c.oracle()));
+        const BlockFrame f = sealed_frame(*c.store, b);
+        ASSERT_TRUE(c.store->append_block(f));
+        ASSERT_TRUE(c.ledger->apply_block(BlockView(f)).ok);
+    }
+    const uint64_t height_before = c.store->chain_height();
+
+    // The newcomer's FIRST spend ever, inside a remotely-arrived frame.
+    vx::crypto::pq::PqSignatureWitness w{};
+    BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
+    Transaction spend =
+        make_tx(newcomer.addr, addr_of("NFA_WD_SINK_R_000000000000000000000000"), 1000000000u, 0);
+    ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(spend, newcomer.sk, nullptr, nullptr, &w));
+    ASSERT_TRUE(b.add_transaction(spend));
+    ASSERT_EQ(1u, b.bind_canonical_witnesses(c.oracle()))
+        << "the producer must resolve the first-spend canonical root "
+           "self-certifyingly";
+    const BlockFrame f = sealed_frame(*c.store, b);
+    const auto digest = vx::crypto::pq::tx_msg_digest(
+        reinterpret_cast<const RawBlock *>(f.data())->transactions[0]);
+
+    // The remote node's view: it holds NO witness for the newcomer yet.
+    vx::crypto::pq::PqWitnessRegistry::instance().clear_witnesses_for_test();
+    EXPECT_EQ(WitnessRootStatus::MISSING_WITNESS,
+              verify_witness_merkle(*reinterpret_cast<const RawBlock *>(f.data()), c.oracle()));
+    EXPECT_FALSE(c.server->apply_remote_frame(f.data()));
+    EXPECT_EQ(c.server->parked_witness_count(), 1u);
+
+    // The witness arrives over the wire; the parked frame applies and the
+    // ledger BINDS the newcomer (first-seen binding, no local registry).
+    wire_arrive(f, 0, w);
+    c.server->on_witness_arrived(digest);
+    EXPECT_EQ(c.store->chain_height(), height_before + 1)
+        << "a remote first-spend must apply once its witness arrived";
+    EXPECT_EQ(c.server->parked_witness_count(), 0u);
+    std::array<uint8_t, 32> bound{};
+    EXPECT_TRUE(c.ledger->pq_root_of(newcomer.addr, bound));
+    EXPECT_EQ(0, std::memcmp(bound.data(), newcomer.root.data(), 32));
+
+    // The now-bound sender spends again in the next remote frame: the
+    // bound-root path (stage-1 canonical selection) serves it.
+    vx::crypto::pq::PqSignatureWitness w2{};
+    BlockBuilder b2 = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
+    Transaction spend2 =
+        make_tx(newcomer.addr, addr_of("NFA_WD_SINK_S_000000000000000000000000"), 1000000000u, 1);
+    ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(spend2, newcomer.sk, nullptr, nullptr, &w2));
+    ASSERT_TRUE(b2.add_transaction(spend2));
+    ASSERT_EQ(1u, b2.bind_canonical_witnesses(c.oracle()));
+    const BlockFrame f2 = sealed_frame(*c.store, b2);
+    const auto digest2 = vx::crypto::pq::tx_msg_digest(
+        reinterpret_cast<const RawBlock *>(f2.data())->transactions[0]);
+    vx::crypto::pq::PqWitnessRegistry::instance().clear_witnesses_for_test();
+    EXPECT_FALSE(c.server->apply_remote_frame(f2.data()));
+    EXPECT_EQ(c.server->parked_witness_count(), 1u);
+    wire_arrive(f2, 0, w2);
+    c.server->on_witness_arrived(digest2);
+    EXPECT_EQ(c.store->chain_height(), height_before + 2);
+    EXPECT_EQ(c.server->parked_witness_count(), 0u);
+}
+
+// -- BACKLOG 2.11 third checkbox: witness retention. A locally produced
+// block's witness is re-served to a peer that connects and PINGs (one-shot
+// per promotion), closing the fire-and-forget gossip gap for a peer that
+// joined mid-stream.
+namespace {
+
+uint16_t free_tcp_port() {
+    int probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_GE(probe, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    EXPECT_EQ(::bind(probe, reinterpret_cast<sockaddr *>(&a), sizeof(a)), 0);
+    socklen_t alen = sizeof(a);
+    ::getsockname(probe, reinterpret_cast<sockaddr *>(&a), &alen);
+    const uint16_t port = ntohs(a.sin_port);
+    ::close(probe);
+    return port;
+}
+
+bool read_full(int fd, void *buf, size_t len) {
+    auto *p = static_cast<uint8_t *>(buf);
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::recv(fd, p + off, len - off, 0);
+        if (n <= 0)
+            return false;
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool send_full(int fd, const void *buf, size_t len) {
+    const auto *p = static_cast<const uint8_t *>(buf);
+    size_t off = 0;
+    while (off < len) {
+        const ssize_t n = ::send(fd, p + off, len - off, MSG_NOSIGNAL);
+        if (n <= 0)
+            return false;
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+} // namespace
+
+TEST(VortexWitnessDeliveryTest, RetentionServedOnConnect) {
+    DeliveryChain c("vx_wd_retention");
+    ASSERT_TRUE(c.server != nullptr);
+
+    // A locally produced spend block: signing registers the witness, the
+    // producer binds + seals, and the block applies to the local chain.
+    const BlockFrame f =
+        honest_spend_frame(c, "NFA_WD_SINK_R_000000000000000000000000", 0, 700000000u);
+    ASSERT_TRUE(c.store->append_block(f));
+    ASSERT_TRUE(c.ledger->apply_block(BlockView(f)).ok);
+    const auto digest = first_user_tx_digest(f);
+
+    const uint16_t port = free_tcp_port();
+    c.server->attach_p2p(port, {});
+
+    // Connect and PING: the promotion fires the retention serve before the
+    // PONG goes out.
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons(port);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+    timeval tv{5, 0};
+    ASSERT_EQ(::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)), 0);
+
+    vx::net::WireHeader ping = vx::net::SwarmNode::make_header(vx::net::WireMsgType::PING, 0, 77);
+    ping.crc32c = vx::net::compute_wire_crc32c(nullptr, 0);
+    ASSERT_TRUE(send_full(fd, &ping, sizeof(ping)));
+
+    bool got_pong = false, got_witness = false, witness_matches = false;
+    for (int i = 0; i < 50 && !(got_pong && got_witness); ++i) {
+        vx::net::WireHeader h{};
+        if (!read_full(fd, &h, sizeof(h)))
+            break;
+        std::vector<uint8_t> payload(h.payload_len);
+        if (h.payload_len && !read_full(fd, payload.data(), h.payload_len))
+            break;
+        if (h.msg_type == static_cast<uint8_t>(vx::net::WireMsgType::PONG))
+            got_pong = true;
+        if (h.msg_type == static_cast<uint8_t>(vx::net::WireMsgType::PQ_WITNESS) &&
+            payload.size() == 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)) {
+            got_witness = true;
+            witness_matches = std::memcmp(payload.data(), digest.data(), 32) == 0 &&
+                              std::memcmp(payload.data() + 32, c.spender.data(), 42) == 0;
+        }
+    }
+    EXPECT_TRUE(got_pong);
+    EXPECT_TRUE(got_witness) << "the retention window must re-serve the spend witness";
+    EXPECT_TRUE(witness_matches) << "digest and sender must be the spend tx's";
+    ::close(fd);
+
+    // Security review P1-2: the window is served at most once per source IP
+    // per the rate interval - a second connect (fresh port, same IP) gets
+    // its PONG but NO witness re-serve.
+    int fd2 = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd2, 0);
+    ASSERT_EQ(::connect(fd2, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+    ASSERT_EQ(::setsockopt(fd2, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)), 0);
+    vx::net::WireHeader ping2 = vx::net::SwarmNode::make_header(vx::net::WireMsgType::PING, 0, 78);
+    ping2.crc32c = vx::net::compute_wire_crc32c(nullptr, 0);
+    ASSERT_TRUE(send_full(fd2, &ping2, sizeof(ping2)));
+    bool pong2 = false, witness2 = false;
+    for (int i = 0; i < 50 && !pong2; ++i) {
+        vx::net::WireHeader h{};
+        if (!read_full(fd2, &h, sizeof(h)))
+            break;
+        std::vector<uint8_t> payload(h.payload_len);
+        if (h.payload_len && !read_full(fd2, payload.data(), h.payload_len))
+            break;
+        if (h.msg_type == static_cast<uint8_t>(vx::net::WireMsgType::PONG))
+            pong2 = true;
+        if (h.msg_type == static_cast<uint8_t>(vx::net::WireMsgType::PQ_WITNESS))
+            witness2 = true;
+    }
+    EXPECT_TRUE(pong2) << "the second connect must still be alive and promoted";
+    EXPECT_FALSE(witness2) << "the same IP must not re-pull the window inside the interval";
+    ::close(fd2);
+}
+
+// -- BACKLOG 2.11 third checkbox: attribution uses the REAL peer label. A
+// tampered commitment arriving over the wire from a live connection must be
+// scored against that connection's ip:port, not the default "wire" label.
+TEST(VortexWitnessDeliveryTest, MismatchAttributedToRealPeer) {
+    DeliveryChain c("vx_wd_attr");
+    ASSERT_TRUE(c.server != nullptr);
+
+    // An honest, tip-extending frame whose header commitment is then
+    // corrupted: the canonical rules still resolve a root (the witness is
+    // registered by signing), so verify_witness_merkle reports MISMATCH -
+    // the attributable failure - not MISSING_WITNESS.
+    BlockFrame bad = honest_spend_frame(c, "NFA_WD_SINK_M_000000000000000000000000", 0, 500000u);
+    bad.data()[0x1D8 + 5] ^= 0x40; // witness_merkle_root
+
+    const uint16_t port = free_tcp_port();
+    c.server->attach_p2p(port, {});
+
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons(port);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+    socklen_t clen = sizeof(sa);
+    ::getsockname(fd, reinterpret_cast<sockaddr *>(&sa), &clen);
+    const std::string label = "127.0.0.1:" + std::to_string(ntohs(sa.sin_port));
+
+    const auto send_bad = [&]() {
+        vx::net::WireHeader h =
+            vx::net::SwarmNode::make_header(vx::net::WireMsgType::RAW_BLOCK_64K, 65536, 42);
+        h.crc32c = vx::net::compute_wire_crc32c(bad.data(), 65536);
+        if (!send_full(fd, &h, sizeof(h)))
+            return false;
+        return send_full(fd, bad.data(), 65536);
+    };
+
+    // Three strikes over the wire; each is scored against the real label.
+    for (int i = 0; i < 3; ++i)
+        ASSERT_TRUE(send_bad());
+
+    bool scored = false;
+    for (int i = 0; i < 100 && !scored; ++i) {
+        scored = c.server->witness_withhold_count(label) == 3u;
+        if (!scored)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(scored) << "the MISMATCH path must attribute to the connection's ip:port";
+    EXPECT_EQ(c.server->witness_withhold_count("wire"), 0u)
+        << "the default label must not absorb live-connection strikes";
+    ::close(fd);
 }

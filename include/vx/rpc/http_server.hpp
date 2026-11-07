@@ -153,7 +153,7 @@ public:
     // whose header commitment does not match any canonical resolution
     // (MISMATCH) is refused outright and counted against the sending peer:
     // the header commitment makes withholding attributable.
-    bool apply_remote_frame(const void* frame);
+    bool apply_remote_frame(const void *frame, const std::string &peer_label = "wire");
 
     // Stage-2 retry seam: called by the SwarmNode witness callback (and
     // directly by tests). Scans the parked frames for one that carries a
@@ -161,6 +161,13 @@ public:
     // apply path. Runs on swarm reader threads - takes state_mutex_ and
     // seal_mutex_ itself, in the established order.
     void on_witness_arrived(const std::array<uint8_t, 32> &digest);
+
+    // BACKLOG 2.11 third checkbox: witness retention window. Fires on the
+    // SwarmNode peer-connected callback (one-shot per promotion): re-serves
+    // the witnesses of the last kWitnessRetentionBlocks stored blocks to the
+    // newly promoted peer, closing the gap left by fire-and-forget witness
+    // gossip (a peer that connected mid-stream cannot heal without this).
+    void serve_witness_retention(const std::string &peer_label);
 
     // Test/diagnostic surface for the parking window.
     size_t parked_witness_count();
@@ -181,12 +188,32 @@ private:
     struct ParkedFrame {
         std::array<uint8_t, 65536> bytes{};
         std::chrono::steady_clock::time_point arrived;
+        // Security review P2-3 (2.11 third checkbox): the label of the peer
+        // that delivered the frame. A retry that now MISMATCHes must score
+        // the origin connection, not the constant "parked-retry" (which
+        // matches no PeerInfo and silently voids the strike).
+        std::string peer_label;
     };
     // Bounded park for frames whose witnesses are still in flight (DoS cap:
     // oldest frame evicted when full). Guarded by state_mutex_.
     static constexpr size_t kMaxParkedWitnessFrames = 32;
+    // Witness retention window (blocks): how far back a newly connected
+    // peer is re-served witnesses for.
+    static constexpr uint64_t kWitnessRetentionBlocks = 16;
+    // Security review P1-2 (2.11 third checkbox): retention is a real
+    // amplification surface (one 24-byte PING -> up to 16 frames' worth of
+    // witness sends), so each source IP may pull the window at most once
+    // per this interval, and the rate map itself is bounded.
+    static constexpr auto kWitnessRetentionInterval = std::chrono::seconds(60);
+    static constexpr size_t kMaxRetentionRateEntries = 1024;
+    // Security review P2-4: the withhold score map is bounded too - churned
+    // labels must not accumulate forever.
+    static constexpr size_t kMaxWithholdScoreEntries = 1024;
     std::vector<ParkedFrame> parked_witness_frames_;
     std::map<std::string, uint64_t> witness_withhold_score_;
+    // ip (label without port) -> last retention serve. Guarded by
+    // state_mutex_.
+    std::map<std::string, std::chrono::steady_clock::time_point> retention_served_at_;
     std::chrono::milliseconds witness_park_ttl_{60000};
 
     HttpRequest parse_request(int client_fd, bool& ok);
