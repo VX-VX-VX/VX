@@ -33,20 +33,20 @@ namespace vx::crypto::pq {
 inline constexpr uint32_t PQ_CHAIN_ID = 0x58564336u; // low 32 bits of "VXC6" chain id
 inline constexpr unsigned WOTS_W = 16;               // Winternitz base (4-bit nibbles)
 inline constexpr unsigned WOTS_STEPS = 15;           // w - 1 chain steps
-inline constexpr size_t   WOTS_MSG_NIBBLES = 64;     // l1: 256-bit msg as 64 nibbles
-inline constexpr size_t   WOTS_CKSUM_NIBBLES = 3;    // l2: C <= 960 < 16^3
-inline constexpr size_t   WOTS_CHAINS = WOTS_MSG_NIBBLES + WOTS_CKSUM_NIBBLES; // 67
-inline constexpr size_t   XMSS_H = 4;                // tree height
-inline constexpr size_t   XMSS_LEAVES = size_t(1) << XMSS_H;                   // 16
+inline constexpr size_t WOTS_MSG_NIBBLES = 64;       // l1: 256-bit msg as 64 nibbles
+inline constexpr size_t WOTS_CKSUM_NIBBLES = 3;      // l2: C <= 960 < 16^3
+inline constexpr size_t WOTS_CHAINS = WOTS_MSG_NIBBLES + WOTS_CKSUM_NIBBLES; // 67
+inline constexpr size_t XMSS_H = 4;                                          // tree height
+inline constexpr size_t XMSS_LEAVES = size_t(1) << XMSS_H;                   // 16
 
 struct PqSignatureWitness {
-    uint32_t leaf_index = 0;                            // nonce & 0xF
-    uint32_t subtree_index = 0;                         // nonce >> XMSS_H
-    std::array<uint8_t, 32> pub_seed{};                 // public mask seed
-    std::array<uint8_t, 32> pq_pubkey_root{};           // XMSS root (account PQ key)
+    uint32_t leaf_index = 0;                                     // nonce & 0xF
+    uint32_t subtree_index = 0;                                  // nonce >> XMSS_H
+    std::array<uint8_t, 32> pub_seed{};                          // public mask seed
+    std::array<uint8_t, 32> pq_pubkey_root{};                    // XMSS root (account PQ key)
     std::array<std::array<uint8_t, 32>, WOTS_CHAINS> wots_sig{}; // 67 chains (2144 B)
     std::array<std::array<uint8_t, 32>, XMSS_H> auth_path{};     // Merkle path (128 B)
-    std::array<uint8_t, 32> witness_digest{};           // 256-bit witness commitment
+    std::array<uint8_t, 32> witness_digest{};                    // 256-bit witness commitment
 };
 
 static_assert(sizeof(PqSignatureWitness) == 2376, "witness must be exactly 2376 bytes");
@@ -54,7 +54,7 @@ static_assert(sizeof(PqSignatureWitness) == 2376, "witness must be exactly 2376 
 // ── Canonical message digest ─────────────────────────────────────────────────
 // M = Sponge256("VX_PQ_TX_MSG_V1" || sender[42] || receiver[42] || amount[8]
 //               || fee[4] || nonce[4] || chain_id[4]) — 32 bytes.
-std::array<uint8_t, 32> tx_msg_digest(const blockchain::Transaction& tx) noexcept;
+std::array<uint8_t, 32> tx_msg_digest(const blockchain::Transaction &tx) noexcept;
 
 // ── Winternitz base vector ───────────────────────────────────────────────────
 // B = [m_0..m_63, c_0, c_1, c_2] where C = Σ(15 - m_i), max C = 960.
@@ -66,13 +66,13 @@ void wots_base_vector(const uint8_t msg[32], uint8_t out_b[WOTS_CHAINS]) noexcep
 // ── Masked hash chains ───────────────────────────────────────────────────────
 // mask = Sponge256("VX_WOTS_MASK" || pub_seed || u16(ci) || u8(s))
 // next = Sponge256("VX_WOTS_STEP" || (x ^ mask) || pub_seed || u16(ci) || u8(s))
-std::array<uint8_t, 32> chain_step(const std::array<uint8_t, 32>& x,
-                                   const std::array<uint8_t, 32>& pub_seed,
-                                   uint16_t chain_idx, uint8_t step) noexcept;
+std::array<uint8_t, 32> chain_step(const std::array<uint8_t, 32> &x,
+                                   const std::array<uint8_t, 32> &pub_seed, uint16_t chain_idx,
+                                   uint8_t step) noexcept;
 
 // Applies `steps` steps starting from chain position `start`.
-std::array<uint8_t, 32> chain_run(const std::array<uint8_t, 32>& x, unsigned start,
-                                  unsigned steps, const std::array<uint8_t, 32>& pub_seed,
+std::array<uint8_t, 32> chain_run(const std::array<uint8_t, 32> &x, unsigned start, unsigned steps,
+                                  const std::array<uint8_t, 32> &pub_seed,
                                   uint16_t chain_idx) noexcept;
 
 // ── Key material ─────────────────────────────────────────────────────────────
@@ -80,26 +80,26 @@ std::array<uint8_t, 32> chain_run(const std::array<uint8_t, 32>& x, unsigned sta
 // global_leaf = (subtree_index << XMSS_H) | leaf_idx so keys never repeat
 // across subtrees. pk_i = Chain(sk_i, 0, 15); leaf root compresses 67 pk_i.
 std::array<uint8_t, 32> wots_leaf_pk_root(uint32_t global_leaf,
-                                          const std::array<uint8_t, 32>& master_sk,
-                                          const std::array<uint8_t, 32>& pub_seed) noexcept;
+                                          const std::array<uint8_t, 32> &master_sk,
+                                          const std::array<uint8_t, 32> &pub_seed) noexcept;
 
 // parent = Sponge256("VX_XMSS_NODE" || pub_seed || u8(level) || u16(node_idx)
 //                     || left || right)
 std::array<uint8_t, 32> xmss_node_hash(uint8_t level, uint16_t node_idx,
-                                       const std::array<uint8_t, 32>& pub_seed,
-                                       const std::array<uint8_t, 32>& left,
-                                       const std::array<uint8_t, 32>& right) noexcept;
+                                       const std::array<uint8_t, 32> &pub_seed,
+                                       const std::array<uint8_t, 32> &left,
+                                       const std::array<uint8_t, 32> &right) noexcept;
 
 // Builds the full H=4 tree (16 WOTS+ leaves) and returns its root — the
 // account's post-quantum public key (pq_pubkey_root).
-std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32>& master_sk,
-                                  const std::array<uint8_t, 32>& pub_seed) noexcept;
+std::array<uint8_t, 32> xmss_root(const std::array<uint8_t, 32> &master_sk,
+                                  const std::array<uint8_t, 32> &pub_seed) noexcept;
 
 /// The public mask seed for a master secret key, derived exactly as
 /// pq_sign_transaction derives it internally ("VX_PQ_PUBSEED_V1" || sk).
 /// Exposed so protocol code can compute an account's XMSS root (its
 /// PQ binding) without signing anything.
-std::array<uint8_t, 32> pub_seed_from_sk(const std::array<uint8_t, 32>& sk) noexcept;
+std::array<uint8_t, 32> pub_seed_from_sk(const std::array<uint8_t, 32> &sk) noexcept;
 
 /// P1 hardening of the per-window leaf cache (BACKLOG 1.5): the cache key
 /// holds an opaque 256-bit generation tag, never master_sk bytes. Call to
@@ -146,15 +146,15 @@ inline constexpr unsigned PQ_ROLLOVER_CERT_LEAF = XMSS_LEAVES - 1; // leaf 15
 
 // Root of window t — the PQ public key a rollover certificate publishes for
 // the target window. Equals xmss_root() for t == 0 (frozen epoch 0).
-std::array<uint8_t, 32> xmss_root_tree(const std::array<uint8_t, 32>& master_sk,
-                                       const std::array<uint8_t, 32>& pub_seed,
+std::array<uint8_t, 32> xmss_root_tree(const std::array<uint8_t, 32> &master_sk,
+                                       const std::array<uint8_t, 32> &pub_seed,
                                        uint32_t tree_index) noexcept;
 
 // M = Sponge256("VX_PQ_ROLLOVER_V1" || old_root[32] || u32(from_tree)
 //               || u32(to_tree) || new_root[32]) — 32 bytes.
-std::array<uint8_t, 32> rollover_binding_digest(
-    const std::array<uint8_t, 32>& old_root, uint32_t from_tree, uint32_t to_tree,
-    const std::array<uint8_t, 32>& new_root) noexcept;
+std::array<uint8_t, 32> rollover_binding_digest(const std::array<uint8_t, 32> &old_root,
+                                                uint32_t from_tree, uint32_t to_tree,
+                                                const std::array<uint8_t, 32> &new_root) noexcept;
 
 // Signs the rollover certificate window from_tree -> to_tree: a full
 // PqSignatureWitness by leaf 15 of window from_tree over the binding
@@ -169,18 +169,41 @@ std::array<uint8_t, 32> rollover_binding_digest(
 // caller keeps full responsibility for the burn.
 // Refuses from_tree == to_tree or any index beyond PQ_MAX_SUBTREE_INDEX
 // by returning a default witness whose verification fails.
-PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32>& master_sk,
-                                    uint32_t from_tree, uint32_t to_tree,
-                                    class PqLeafLedger* leaf_ledger = nullptr) noexcept;
+PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32> &master_sk, uint32_t from_tree,
+                                    uint32_t to_tree,
+                                    class PqLeafLedger *leaf_ledger = nullptr) noexcept;
 
 // Verifies a rollover certificate end-to-end: the leaf and window policy
 // (leaf 15 of from_tree), the certificate root equals old_root, the
 // transported witness commitment matches the content, and the WOTS+/XMSS
 // chain verifies over the binding digest of THIS (old_root, from, to,
 // new_root) tuple. Fail-closed: any disagreement refuses.
-bool pq_verify_rollover(const std::array<uint8_t, 32>& old_root, uint32_t from_tree,
-                        uint32_t to_tree, const std::array<uint8_t, 32>& new_root,
-                        const PqSignatureWitness& cert) noexcept;
+bool pq_verify_rollover(const std::array<uint8_t, 32> &old_root, uint32_t from_tree,
+                        uint32_t to_tree, const std::array<uint8_t, 32> &new_root,
+                        const PqSignatureWitness &cert) noexcept;
+
+// ── Rollover certificate record (BACKLOG 1.5 consensus wiring) ──────────────
+// A certificate TRAVELS as its own record (wire type ROLLOVER_CERT, the
+// owner-decided carrier) and is verified as a self-contained cryptographic
+// object: the leaf-15 witness commits (old_root, from, to, new_root), so
+// the claimed new root cannot be substituted. Consensus accepts a rotated
+// root only through a SEQUENTIAL chain of such records walked from the
+// account's bound (anchor) root - see PqWitnessRegistry::advance_root_chain.
+struct PqRolloverCert {
+    std::array<uint8_t, 42> sender{}; // the PQA address being rotated
+    uint32_t from_window = 0;
+    uint32_t to_window = 0;
+    std::array<uint8_t, 32> old_root{}; // the certifying window's root
+    std::array<uint8_t, 32> new_root{}; // the target window's root
+    PqSignatureWitness witness{};       // leaf 15 of window `from_window`
+};
+
+// Maximum certified hops a verification walks from the anchor: the
+// same-address identity supports this many key rotations before the
+// wallet policy re-anchors it on a fresh PQA address (the address commits
+// the anchor root by construction). Bounds the per-transaction
+// verification cost under adversarial cert relay.
+inline constexpr size_t PQ_MAX_CERT_CHAIN_DEPTH = 16;
 
 // ── Sign / verify ────────────────────────────────────────────────────────────
 // Signs `msg` with leaf `leaf_idx` of the tree whose key material is
@@ -188,9 +211,9 @@ bool pq_verify_rollover(const std::array<uint8_t, 32>& old_root, uint32_t from_t
 // and witness_digest. For rollover trees pass tree_sk/tree_pub_seed — the
 // witness is then coherent inside THAT tree (see the rollover section).
 PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
-                                   const std::array<uint8_t, 32>& master_sk,
-                                   const std::array<uint8_t, 32>& pub_seed,
-                                   const std::array<uint8_t, 32>& msg) noexcept;
+                                   const std::array<uint8_t, 32> &master_sk,
+                                   const std::array<uint8_t, 32> &pub_seed,
+                                   const std::array<uint8_t, 32> &msg) noexcept;
 
 // Pure WOTS+ + XMSS verification (no anchor): recomputes B from `msg`, walks
 // each chain forward 15 - B[i] steps, rebuilds the root through the auth path
@@ -201,13 +224,12 @@ PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
 // SegPQ anchor layer — pq_verify_transaction() recomputes the commitment
 // from the witness content and refuses a witness whose transported digest
 // field disagrees.
-bool pq_verify_wots_xmss(const std::array<uint8_t, 32>& msg,
-                         const PqSignatureWitness& w) noexcept;
+bool pq_verify_wots_xmss(const std::array<uint8_t, 32> &msg, const PqSignatureWitness &w) noexcept;
 
 // Recomputes the 256-bit witness commitment from the witness content. The
 // same sponge the signer runs; exposed so tests and tooling can check that
 // a transported witness_digest field matches the witness it travels with.
-std::array<uint8_t, 32> witness_commitment(const PqSignatureWitness& w) noexcept;
+std::array<uint8_t, 32> witness_commitment(const PqSignatureWitness &w) noexcept;
 
 // Full SegPQ verification: WOTS+/XMSS + the 256-bit anchor check against
 // tx.cocoon_proof (trunc12 of the VX_SEGPQ_ANCHOR_V1 binding).
@@ -216,11 +238,9 @@ std::array<uint8_t, 32> witness_commitment(const PqSignatureWitness& w) noexcept
 /// witness_digest)). Used when a node reconstructs a client-supplied
 /// transaction — the anchor is derived from the witness, never trusted from
 /// the wire.
-void pq_set_transaction_anchor(blockchain::Transaction& tx,
-                               const PqSignatureWitness& w) noexcept;
+void pq_set_transaction_anchor(blockchain::Transaction &tx, const PqSignatureWitness &w) noexcept;
 
-bool pq_verify_transaction(const blockchain::Transaction& tx,
-                           const PqSignatureWitness& w) noexcept;
+bool pq_verify_transaction(const blockchain::Transaction &tx, const PqSignatureWitness &w) noexcept;
 
 // ── SegPQ transaction signing (MemoryVault-protected) ──────────────────────
 
@@ -255,11 +275,10 @@ struct PqSignTimings {
 // reserved (all 16 consumed, or the durable log failed validation —
 // signing must not proceed). Without a ledger the call never fails and
 // offers no reuse protection (legacy in-memory behavior).
-bool pq_sign_transaction(blockchain::Transaction& tx,
-                         const std::array<uint8_t, 32>& master_sk,
-                         PqSignTimings* timings = nullptr,
-                         class PqLeafLedger* leaf_ledger = nullptr,
-                         PqSignatureWitness* out_witness = nullptr) noexcept;
+bool pq_sign_transaction(blockchain::Transaction &tx, const std::array<uint8_t, 32> &master_sk,
+                         PqSignTimings *timings = nullptr,
+                         class PqLeafLedger *leaf_ledger = nullptr,
+                         PqSignatureWitness *out_witness = nullptr) noexcept;
 
 // ── PqLeafLedger (one-time-leaf lifecycle) ───────────────────────────────────
 
@@ -283,8 +302,7 @@ bool pq_sign_transaction(blockchain::Transaction& tx,
 // directory.
 // std::hash has no std::array overload — byte-mixing hasher for map keys.
 struct PqArrayHash {
-    template <size_t N>
-    size_t operator()(const std::array<uint8_t, N>& a) const noexcept {
+    template <size_t N> size_t operator()(const std::array<uint8_t, N> &a) const noexcept {
         uint64_t h = 1469598103934665603ull;
         for (size_t i = 0; i < N; ++i) {
             h ^= a[i];
@@ -300,14 +318,14 @@ public:
 
     explicit PqLeafLedger(std::string path = "");
     ~PqLeafLedger();
-    PqLeafLedger(const PqLeafLedger&) = delete;
-    PqLeafLedger& operator=(const PqLeafLedger&) = delete;
+    PqLeafLedger(const PqLeafLedger &) = delete;
+    PqLeafLedger &operator=(const PqLeafLedger &) = delete;
 
     // Reserve a leaf for `key_root`: `requested_leaf` when free, otherwise
     // the lowest free leaf of that key. Returns the assigned leaf index
     // (0..15), or -1 when all leaves are consumed (or, in durable mode,
     // when the log cannot be trusted).
-    int reserve(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf);
+    int reserve(const std::array<uint8_t, 32> &key_root, unsigned requested_leaf);
 
     // TRANSACTION reservation (kernel invariant, owner directive
     // 2026-11-05): leaf 15 is RESERVED for rollover certificates and is
@@ -315,25 +333,25 @@ public:
     // fails, and the lowest-free search skips 15. Returns -1 when no
     // allowed leaf is available (or the log cannot be trusted).
     static constexpr unsigned kReservedCertLeaf = 15;
-    int reserve_for_tx(const std::array<uint8_t, 32>& key_root, unsigned requested_leaf);
+    int reserve_for_tx(const std::array<uint8_t, 32> &key_root, unsigned requested_leaf);
 
     // CERTIFICATE reservation: reserves EXACTLY leaf 15 (the rollover
     // certificate leaf) under `key_root`; -1 when it is already consumed
     // or the log cannot be trusted. append+fsync happens BEFORE the
     // certificate signature is produced (the same fail-closed ordering as
     // every transaction leaf).
-    int reserve_cert_leaf(const std::array<uint8_t, 32>& key_root);
+    int reserve_cert_leaf(const std::array<uint8_t, 32> &key_root);
 
     // Number of consumed leaves for this key (0..16).
-    size_t used_count(const std::array<uint8_t, 32>& key_root) const;
+    size_t used_count(const std::array<uint8_t, 32> &key_root) const;
 
 private:
     bool parse_log_locked(); // rebuilds used_ from the file; false = corrupt
-    bool append_locked(const std::array<uint8_t, 32>& key_root, unsigned leaf);
+    bool append_locked(const std::array<uint8_t, 32> &key_root, unsigned leaf);
 
     // Shared reservation core; `allowed_mask` bit i permits leaf i.
-    int reserve_impl(const std::array<uint8_t, 32>& key_root,
-                     unsigned requested_leaf, unsigned allowed_mask);
+    int reserve_impl(const std::array<uint8_t, 32> &key_root, unsigned requested_leaf,
+                     unsigned allowed_mask);
 
     mutable std::mutex mu_;
     std::unordered_map<std::array<uint8_t, 32>, std::bitset<kLeaves>, PqArrayHash> used_;
@@ -351,7 +369,7 @@ private:
 
 class PqWitnessRegistry {
 public:
-    static PqWitnessRegistry& instance() noexcept;
+    static PqWitnessRegistry &instance() noexcept;
 
     // Hardening (external round-7 review): the registry is a CACHE, never an
     // authority - nothing enters it unverified, duplicates are not stored
@@ -359,21 +377,26 @@ public:
     // occupy a slot and censor the honest witness.
     static constexpr size_t kMaxWitnessesPerDigest = 8;
     static constexpr size_t kMaxDigestEntries = 50000;
+    // Rollover certificates: same cache discipline. A sender's certified
+    // chain is bounded by PQ_MAX_CERT_CHAIN_DEPTH anyway; the extra slack
+    // tolerates out-of-order relay, and the sender cap bounds the map RAM
+    // under relay flooding (only cryptographically valid records get in,
+    // but unverified-then-evicted churn is still bounded this way).
+    static constexpr size_t kMaxCertsPerSender = 32;
+    static constexpr size_t kMaxCertSenders = 50000;
 
     // Binds a freshly signed witness to its message digest and sender.
     // Verifies the FULL WOTS+/XMSS + anchor chain against the tx first;
     // returns false (and registers nothing) when the witness is invalid.
-    bool register_witness(const blockchain::Transaction& tx,
-                          const PqSignatureWitness& w);
+    bool register_witness(const blockchain::Transaction &tx, const PqSignatureWitness &w);
 
     // Registers a witness that arrived WITHOUT its transaction (wire
     // WITNESS records, peer relay): the sender and the message digest are
     // carried explicitly. Also used by the durable-log replay. Verifies the
     // witness commitment and the WOTS+/XMSS chain against the CLAIMED
     // digest before storing; returns false otherwise.
-    bool register_witness_bytes(const std::array<uint8_t, 32>& msg_digest,
-                                const uint8_t sender_nfa[42],
-                                const PqSignatureWitness& w);
+    bool register_witness_bytes(const std::array<uint8_t, 32> &msg_digest,
+                                const uint8_t sender_nfa[42], const PqSignatureWitness &w);
 
     // Durable witness sidecar (BACKLOG 0.8): <ledger>.pqw holds
     // "VXPQWT1" + digest(32) + sender(42) + witness(2376) records, appended
@@ -382,27 +405,52 @@ public:
     // record stops the replay (fail-closed: partial witnesses are not
     // trusted). Registration without an attached log stays memory-only
     // (tests, one-shot tools).
-    void attach_durable_log(const std::string& path);
+    void attach_durable_log(const std::string &path);
+
+    // ── Rollover certificate store (BACKLOG 1.5 wiring) ──────────────────
+    // Certificates follow the witness discipline: nothing unverified is
+    // stored, candidates are keyed by the rotated address, and the store
+    // feeds a deterministic sequential-chain walk.
+    //
+    // Verifies the FULL certificate object before storing: leaf 15 of
+    // from_window, to_window == from_window + 1, both roots match the
+    // witness, the commitment matches, and pq_verify_rollover passes over
+    // THIS (old_root, from, to, new_root) tuple. Returns false otherwise.
+    bool register_rollover_cert(const PqRolloverCert &cert);
+
+    // Walks the certified chain from the anchor root (window 0) as far as
+    // valid sequential certificates reach, capped at
+    // PQ_MAX_CERT_CHAIN_DEPTH. Deterministic: at most one cryptographically
+    // valid certificate exists per (old_root, from, to) transition
+    // (deterministic WOTS+ signing; the signature commits new_root).
+    // out_root/out_window report the deepest reached root/window; returns
+    // false when no certificate applies at the first hop.
+    bool advance_root_chain(const uint8_t sender_nfa[42], const std::array<uint8_t, 32> &anchor,
+                            std::array<uint8_t, 32> &out_root, uint32_t &out_window) const;
+
+    // Durable certificate sidecar: <ledger>.pqr holds "VXPQRT1" +
+    // sender(42) + from(4) + to(4) + old_root(32) + new_root(32) +
+    // witness(2376) records, appended and fsync'd on every accepted
+    // registration. Replay is fail-closed exactly like the witness log.
+    void attach_durable_cert_log(const std::string &path);
 
     // Is this sender backed by a post-quantum key?
     bool is_pq_sender(const uint8_t sender_nfa[42]) const;
 
     // Witness lookup by canonical message digest (first candidate —
     // compatibility/diagnostics use).
-    bool lookup(const std::array<uint8_t, 32>& msg_digest,
-                PqSignatureWitness& out) const;
+    bool lookup(const std::array<uint8_t, 32> &msg_digest, PqSignatureWitness &out) const;
 
     // Consensus lookup: returns the first candidate for this transaction's
     // digest that passes the FULL WOTS+/XMSS + SegPQ-anchor verification
     // against THIS tx. A digest may hold several candidates (an attacker
     // can register a cryptographically valid signature for a digest they
     // predict - it just will not verify against the honest transaction).
-    bool lookup_verifying(const blockchain::Transaction& tx,
-                          PqSignatureWitness& out) const;
+    bool lookup_verifying(const blockchain::Transaction &tx, PqSignatureWitness &out) const;
 
     // Last signed transaction + witness (RPC demo state).
-    void set_last(const blockchain::Transaction& tx, const PqSignatureWitness& w);
-    bool get_last(blockchain::Transaction& tx, PqSignatureWitness& w) const;
+    void set_last(const blockchain::Transaction &tx, const PqSignatureWitness &w);
+    bool get_last(blockchain::Transaction &tx, PqSignatureWitness &w) const;
 
     size_t registered_count() const;
 
@@ -411,19 +459,24 @@ private:
         PqSignatureWitness witness;
         std::array<uint8_t, 42> sender{};
     };
-    bool append_durable_locked(const std::array<uint8_t, 32>& digest,
-                               const std::array<uint8_t, 42>& sender,
-                               const PqSignatureWitness& w);
+    bool append_durable_locked(const std::array<uint8_t, 32> &digest,
+                               const std::array<uint8_t, 42> &sender, const PqSignatureWitness &w);
+    bool append_cert_durable_locked(const PqRolloverCert &c);
 
     mutable std::mutex mutex_;
     std::unordered_map<std::array<uint8_t, 32>, std::vector<Entry>, PqArrayHash> by_digest_;
     std::unordered_map<std::array<uint8_t, 42>, std::array<uint8_t, 32>, PqArrayHash> sender_roots_;
+    std::unordered_map<std::array<uint8_t, 42>, std::vector<PqRolloverCert>, PqArrayHash>
+        cert_by_sender_;
     blockchain::Transaction last_tx_{};
     PqSignatureWitness last_witness_{};
     bool has_last_ = false;
     int durable_fd_ = -1;
     std::string durable_path_;
     bool durable_locked_ = false; // flock held on the sidecar
+    int cert_fd_ = -1;
+    std::string cert_path_;
+    bool cert_locked_ = false;
 };
 
 } // namespace vx::crypto::pq

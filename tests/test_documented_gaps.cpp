@@ -35,6 +35,15 @@
 //      472-byte header, leaving vm/PoGW tail metadata outside the
 //      commitment.
 //
+// BACKLOG 1.5 wiring (v0.0.18) — certified PQ key rollover:
+//
+//  12. RolloverChainAccepted     — a window-1 spend is attributed through
+//      a sequential certificate chain walked from the anchor root.
+//  13. RolloverWithoutCertRejected — the same spend without the
+//      certificate is refused (fail-closed).
+//  14. RolloverCertLeafSpenderRejected — a witness on the reserved
+//      certificate leaf (15) never verifies as a transaction.
+//
 // All originate from / are confirmed by external review.
 
 #include <gtest/gtest.h>
@@ -55,6 +64,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -64,20 +74,20 @@ using vx::core::U128;
 
 namespace {
 
-std::string temp_dir(const char* tag) {
+std::string temp_dir(const char *tag) {
     auto dir = std::filesystem::temp_directory_path() /
                (std::string(tag) + "_" + std::to_string(::getpid()));
     std::filesystem::create_directories(dir);
     return dir.string();
 }
 
-Address addr_of(const std::string& s) {
+Address addr_of(const std::string &s) {
     Address a{};
     std::memcpy(a.data(), s.data(), s.size() < 42 ? s.size() : 42);
     return a;
 }
 
-Address payload_of(const std::string& nfa) { // strips the "NFA_V6_" prefix
+Address payload_of(const std::string &nfa) { // strips the "NFA_V6_" prefix
     Address a{};
     std::memcpy(a.data(), nfa.data() + 7, 42);
     return a;
@@ -92,10 +102,10 @@ struct PqAccount {
     Address addr{};
 };
 
-PqAccount make_pq_account(const char* tag) {
+PqAccount make_pq_account(const char *tag) {
     PqAccount acc;
-    VortexSponge256::compute(reinterpret_cast<const uint8_t*>(tag),
-                             std::strlen(tag), acc.sk.data());
+    VortexSponge256::compute(reinterpret_cast<const uint8_t *>(tag), std::strlen(tag),
+                             acc.sk.data());
     const auto pub_seed = vx::crypto::pq::pub_seed_from_sk(acc.sk);
     acc.root = vx::crypto::pq::xmss_root(acc.sk, pub_seed);
     derive_pq_address(acc.root.data(), acc.addr.data());
@@ -104,12 +114,12 @@ PqAccount make_pq_account(const char* tag) {
 
 // Signs a transaction with the account's PQ key (registers the witness in
 // the PqWitnessRegistry, exactly like a real client would).
-bool pq_sign(Transaction& tx, const PqAccount& acc) {
+bool pq_sign(Transaction &tx, const PqAccount &acc) {
     return vx::crypto::pq::pq_sign_transaction(tx, acc.sk);
 }
 
-Transaction make_tx(const Address& sender, const Address& receiver,
-                    uint64_t amount, uint32_t nonce) {
+Transaction make_tx(const Address &sender, const Address &receiver, uint64_t amount,
+                    uint32_t nonce) {
     Transaction tx{};
     std::memcpy(tx.sender_nfa, sender.data(), 42);
     std::memcpy(tx.receiver_nfa, receiver.data(), 42);
@@ -122,17 +132,18 @@ Transaction make_tx(const Address& sender, const Address& receiver,
 // Append + ledger-apply a builder's frame, in one step. The frame is sealed
 // (PoGW nonce search at the store's required difficulty) before the gate
 // sees it — the same work rule every production producer follows.
-bool push_block(vx::storage::BlockStore& store, vx::state::LedgerState& ledger,
-                BlockBuilder& b) {
+bool push_block(vx::storage::BlockStore &store, vx::state::LedgerState &ledger, BlockBuilder &b) {
     b.finalize();
     BlockFrame frame;
     std::memcpy(frame.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
-    if (!seal_pogw_nonce(frame, store.required_pogw_bits())) return false;
-    if (!store.append_block(frame)) return false;
+    if (!seal_pogw_nonce(frame, store.required_pogw_bits()))
+        return false;
+    if (!store.append_block(frame))
+        return false;
     return ledger.apply_block(BlockView(frame)).ok;
 }
 
-BlockBuilder next_block(vx::storage::BlockStore& store, uint64_t ts) {
+BlockBuilder next_block(vx::storage::BlockStore &store, uint64_t ts) {
     BlockBuilder b;
     b.set_height(store.chain_height());
     b.set_timestamp(ts);
@@ -158,10 +169,10 @@ TEST(VortexDocumentedGapsTest, NoWorkBlockAccepted) {
     vx::state::LedgerState ledger;
 
     // Bring the ledger up to the store's auto-seeded genesis first.
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     BlockBuilder b = next_block(store, std::time(nullptr));
@@ -193,18 +204,17 @@ TEST(VortexDocumentedGapsTest, KeylessTheftRejected) {
     vx::state::LedgerState ledger;
 
     // Apply genesis so its mint receiver holds a real balance.
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // The victim: the genesis mint receiver. We hold NO key for it
     // (there is no key - the address is not PQ-bound yet).
     Address victim{};
     std::memcpy(victim.data(), g->transactions[0].receiver_nfa, 42);
-    const Address attacker = addr_of(
-        "NFA_THIEF_NO_KEY_NEEDED_00000000000000000000000000");
+    const Address attacker = addr_of("NFA_THIEF_NO_KEY_NEEDED_00000000000000000000000000");
 
     ASSERT_GT(ledger.balance_of(victim), U128{})
         << "victim must be funded by the genesis mint for this pin";
@@ -235,8 +245,7 @@ TEST(VortexDocumentedGapsTest, KeylessTheftRejected) {
     // Nothing moved: the attacker was not credited, the victim keeps all.
     EXPECT_EQ(ledger.balance_of(tx_address(theft.receiver_nfa)), U128{})
         << "attacker must not be credited without a PQ witness";
-    EXPECT_GT(ledger.balance_of(victim), U128{})
-        << "the genesis receiver keeps its balance";
+    EXPECT_GT(ledger.balance_of(victim), U128{}) << "the genesis receiver keeps its balance";
 
     std::cout << "  [closed] keyless theft rejected: the genesis receiver is"
               << " PQ-bound to an OFFLINE key (secret not in the repo) and no"
@@ -255,10 +264,10 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     vx::state::LedgerState ledger;
 
     // Height 0: apply genesis.
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // Height 1: the GENESIS_2 mint is now bound to its exact protocol
@@ -271,14 +280,15 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
     // the pinned receiver payload — NOT the PQA address its key derives.
     PqAccount sender_acc = make_pq_account("VX_DEMO_SPENDER_SK_V1");
     sender_acc.addr = vx::blockchain::genesis2_mint_receiver_payload();
-    const Address& sender = sender_acc.addr;
-    ASSERT_EQ(std::memcmp(sender.data(),
-                          vx::blockchain::genesis2_mint_receiver_payload().data(), 42), 0)
-        << "the pinned mint receiver must be the demo spender address";    const Address sink = addr_of("NFA_DSPEND_SINK_0000000000000000000000000000");
+    const Address &sender = sender_acc.addr;
+    ASSERT_EQ(
+        std::memcmp(sender.data(), vx::blockchain::genesis2_mint_receiver_payload().data(), 42), 0)
+        << "the pinned mint receiver must be the demo spender address";
+    const Address sink = addr_of("NFA_DSPEND_SINK_0000000000000000000000000000");
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
-        Transaction mint = make_tx(addr_of("GENESIS_2"), sender,
-                                   vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
+        Transaction mint =
+            make_tx(addr_of("GENESIS_2"), sender, vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
         sign_transaction(mint);
         ASSERT_TRUE(b.add_transaction(mint));
         ASSERT_TRUE(push_block(store, ledger, b));
@@ -316,8 +326,7 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
 
         // No mutation: sender still holds exactly 100,000 VX, no phantom
         // supply.
-        EXPECT_EQ(ledger.balance_of(sender),
-                  U128(vx::blockchain::GENESIS_2_MINT_ATOMICS));
+        EXPECT_EQ(ledger.balance_of(sender), U128(vx::blockchain::GENESIS_2_MINT_ATOMICS));
         EXPECT_EQ(ledger.total_supply(), ledger.total_supply()); // sane path
         std::cout << "  [fixed] intra-block double spend rejected with"
                   << " 'insufficient funds'; no U128 underflow, no phantom"
@@ -341,14 +350,13 @@ TEST(VortexDocumentedGapsTest, CoinbaseReplayRejected) {
     vx::storage::BlockStore store(dir + "/cbreplay.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
-    const Address miner_recv =
-        addr_of("NFA_FAKE_MINER_EMISSION_00000000000000000000000");
+    const Address miner_recv = addr_of("NFA_FAKE_MINER_EMISSION_00000000000000000000000");
 
     // The honest block: coinbase bound to (receiver, height 1, current tip).
     uint8_t tip[32];
@@ -356,7 +364,8 @@ TEST(VortexDocumentedGapsTest, CoinbaseReplayRejected) {
     BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction cb{};
     std::memcpy(cb.sender_nfa, "MINER_", 6);
-    for (size_t i = 6; i < 42; ++i) cb.sender_nfa[i] = '0';
+    for (size_t i = 6; i < 42; ++i)
+        cb.sender_nfa[i] = '0';
     std::memcpy(cb.receiver_nfa, miner_recv.data(), 42);
     tx_set_amount(cb, 50ULL * 100000000ULL); // the guaranteed floor reward: valid for any hash
     tx_set_fee(cb, 0);
@@ -373,18 +382,17 @@ TEST(VortexDocumentedGapsTest, CoinbaseReplayRejected) {
     // (fabricated) tip, so the tag commits the OTHER chain position.
     {
         BlockFrame fork = f;
-        auto* fork_raw = reinterpret_cast<RawBlock*>(fork.data());
+        auto *fork_raw = reinterpret_cast<RawBlock *>(fork.data());
         uint8_t fake_tip[32];
-        for (size_t i = 0; i < 32; ++i) fake_tip[i] = static_cast<uint8_t>(tip[i] ^ 0x5A);
+        for (size_t i = 0; i < 32; ++i)
+            fake_tip[i] = static_cast<uint8_t>(tip[i] ^ 0x5A);
         std::memcpy(fork_raw->header.prev_block_hash, fake_tip, 32);
         ASSERT_TRUE(seal_pogw_nonce(fork, store.required_pogw_bits()));
         const auto res = ledger.apply_block(BlockView(fork));
         EXPECT_FALSE(res.ok) << "a coinbase replayed across forks was accepted!";
-        EXPECT_NE(res.error.find("coinbase is not bound to this chain position"),
-                  std::string::npos)
+        EXPECT_NE(res.error.find("coinbase is not bound to this chain position"), std::string::npos)
             << "expected the chain-position refusal, got: " << res.error;
-        EXPECT_EQ(ledger.balance_of(miner_recv), U128{})
-            << "the replayed coinbase must not mint";
+        EXPECT_EQ(ledger.balance_of(miner_recv), U128{}) << "the replayed coinbase must not mint";
     }
 
     // THEN: the honest block goes through and the producer is credited.
@@ -410,19 +418,20 @@ TEST(VortexDocumentedGapsTest, SecondGenesisMintInBlockRejected) {
     vx::storage::BlockStore store(dir + "/gen2x2.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
     const U128 supply_before = ledger.total_supply();
 
     const Address r1 = vx::blockchain::genesis2_mint_receiver_payload(); // the pinned receiver
     const Address r2 = addr_of("NFA_GEN2_MINT_TARGET_B_0000000000000000000");
-    auto mint_tx = [](const Address& to) {
+    auto mint_tx = [](const Address &to) {
         Transaction tx{};
         std::memcpy(tx.sender_nfa, "GENESIS_2", 9);
-        for (size_t i = 9; i < 42; ++i) tx.sender_nfa[i] = '0';
+        for (size_t i = 9; i < 42; ++i)
+            tx.sender_nfa[i] = '0';
         std::memcpy(tx.receiver_nfa, to.data(), 42);
         tx_set_amount(tx, vx::blockchain::GENESIS_2_MINT_ATOMICS); // 100k VX each
         sign_transaction(tx);
@@ -465,13 +474,13 @@ TEST(VortexDocumentedGapsTest, SecondGenesisMintInBlockRejected) {
 // computed from.
 namespace {
 
-bool apply_coinbase_block(vx::state::LedgerState& ledger, uint64_t amount_atoms,
-                          const Address& recv, std::string* err,
-                          uint64_t nonce = 0, uint8_t* frame_hash_out = nullptr,
-                          std::time_t ts = 0) {
+bool apply_coinbase_block(vx::state::LedgerState &ledger, uint64_t amount_atoms,
+                          const Address &recv, std::string *err, uint64_t nonce = 0,
+                          uint8_t *frame_hash_out = nullptr, std::time_t ts = 0) {
     Transaction cb{};
     std::memcpy(cb.sender_nfa, "MINER_", 6);
-    for (size_t i = 6; i < 42; ++i) cb.sender_nfa[i] = '0';
+    for (size_t i = 6; i < 42; ++i)
+        cb.sender_nfa[i] = '0';
     std::memcpy(cb.receiver_nfa, recv.data(), 42);
     tx_set_amount(cb, amount_atoms);
     tx_set_fee(cb, 0);
@@ -492,11 +501,11 @@ bool apply_coinbase_block(vx::state::LedgerState& ledger, uint64_t amount_atoms,
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
     if (frame_hash_out) {
-        vx::blockchain::VortexSponge256::compute(f.data(), BLOCK_SIZE_BYTES,
-                                                 frame_hash_out);
+        vx::blockchain::VortexSponge256::compute(f.data(), BLOCK_SIZE_BYTES, frame_hash_out);
     }
     const auto res = ledger.apply_block(BlockView(f));
-    if (err) *err = res.error;
+    if (err)
+        *err = res.error;
     return res.ok;
 }
 
@@ -517,20 +526,21 @@ TEST(VortexDocumentedGapsTest, EmissionRewardTiersAndCap) {
         std::array<uint8_t, 32> h{};
         h.fill(0xFF);
         const uint64_t full = z / 8;
-        for (uint64_t i = 0; i < full && i < 32; ++i) h[i] = 0;
-        if (full < 32) h[full] = static_cast<uint8_t>(0xFF >> (z % 8));
+        for (uint64_t i = 0; i < full && i < 32; ++i)
+            h[i] = 0;
+        if (full < 32)
+            h[full] = static_cast<uint8_t>(0xFF >> (z % 8));
         return h;
     };
-    for (const uint64_t z : {uint64_t{0}, uint64_t{1}, uint64_t{7},
-                             uint64_t{8}, uint64_t{19}, uint64_t{20},
-                             uint64_t{23}, uint64_t{24}, uint64_t{27},
-                             uint64_t{28}, uint64_t{31}, uint64_t{32},
-                             uint64_t{39}, uint64_t{40}, uint64_t{63}}) {
+    for (const uint64_t z :
+         {uint64_t{0}, uint64_t{1}, uint64_t{7}, uint64_t{8}, uint64_t{19}, uint64_t{20},
+          uint64_t{23}, uint64_t{24}, uint64_t{27}, uint64_t{28}, uint64_t{31}, uint64_t{32},
+          uint64_t{39}, uint64_t{40}, uint64_t{63}}) {
         EXPECT_EQ(leading_zero_bits(hash_with_zeros(z).data()), z) << z;
     }
 
     EXPECT_EQ(block_reward_vx(hash_with_zeros(0).data()), 50ULL);
-    EXPECT_EQ(block_reward_vx(hash_with_zeros(19).data()), 50ULL);   // below tier 1: the floor
+    EXPECT_EQ(block_reward_vx(hash_with_zeros(19).data()), 50ULL); // below tier 1: the floor
     EXPECT_EQ(block_reward_vx(hash_with_zeros(20).data()), 75ULL);
     EXPECT_EQ(block_reward_vx(hash_with_zeros(23).data()), 75ULL);
     EXPECT_EQ(block_reward_vx(hash_with_zeros(24).data()), 100ULL);
@@ -577,29 +587,26 @@ TEST(VortexDocumentedGapsTest, CoinbaseEntitlementEnforced) {
     for (uint64_t nonce = 0; nonce < 1000; ++nonce) {
         vx::state::LedgerState probe;
         probe.set_next_height(1);
-        if (apply_coinbase_block(probe, 50ULL * ATOMS_PER_VX + 1, recv, &err,
-                                 nonce, frame_hash, ts)) {
+        if (apply_coinbase_block(probe, 50ULL * ATOMS_PER_VX + 1, recv, &err, nonce, frame_hash,
+                                 ts)) {
             continue; // that rare frame earned a bonus tier; try the next nonce
         }
-        EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos)
-            << err;
+        EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos) << err;
         pinned = nonce;
         break;
     }
     ASSERT_LT(pinned, 1000ULL) << "no sub-tier nonce found in 1000 probes";
 
     // One atom above the floor is over-entitled at that frame's hash.
-    EXPECT_FALSE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX + 1, recv,
-                                      &err, pinned, nullptr, ts))
+    EXPECT_FALSE(
+        apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX + 1, recv, &err, pinned, nullptr, ts))
         << "a coinbase above the emission entitlement was accepted!";
     EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos)
         << "expected the entitlement refusal, got: " << err;
-    EXPECT_EQ(ledger.balance_of(recv), U128{})
-        << "a refused coinbase must not credit its receiver";
+    EXPECT_EQ(ledger.balance_of(recv), U128{}) << "a refused coinbase must not credit its receiver";
 
     // The exact floor reward mints and is booked as issuance.
-    EXPECT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err,
-                                     pinned, nullptr, ts))
+    EXPECT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err, pinned, nullptr, ts))
         << err;
     EXPECT_EQ(ledger.balance_of(recv), U128(50ULL * ATOMS_PER_VX));
     EXPECT_EQ(ledger.issued_supply(), U128(50ULL * ATOMS_PER_VX))
@@ -607,10 +614,9 @@ TEST(VortexDocumentedGapsTest, CoinbaseEntitlementEnforced) {
 
     // The jackpot is the absolute maximum: 1,001 VX is refused even if the
     // hash had earned a tier (it cannot earn more than 1,000 VX).
-    EXPECT_FALSE(apply_coinbase_block(ledger, 1001ULL * ATOMS_PER_VX, recv,
-                                      &err, pinned, nullptr, ts));
-    EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos)
-        << err;
+    EXPECT_FALSE(
+        apply_coinbase_block(ledger, 1001ULL * ATOMS_PER_VX, recv, &err, pinned, nullptr, ts));
+    EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos) << err;
 }
 
 // The cap is load-bearing: with the issued counter one VX short of
@@ -627,25 +633,21 @@ TEST(VortexDocumentedGapsTest, SupplyCapHardStopsIssuance) {
     std::string err;
 
     // The exact floor reward is under every hash: it always mints.
-    ASSERT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err))
-        << err;
+    ASSERT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err)) << err;
     const U128 cap(vx::blockchain::max_supply_atoms());
     const U128 leave = U128(1ULL * ATOMS_PER_VX);
     ledger.adjust_issued_supply(cap - leave - ledger.issued_supply(), true);
 
     // A 2 VX claim is under the 50 VX floor for every hash, so the
     // entitlement check passes and the refusal below is purely the cap.
-    EXPECT_FALSE(apply_coinbase_block(ledger, 2ULL * ATOMS_PER_VX, recv, &err,
-                                      0, nullptr, ts))
+    EXPECT_FALSE(apply_coinbase_block(ledger, 2ULL * ATOMS_PER_VX, recv, &err, 0, nullptr, ts))
         << "issuance beyond the 7,000,000,000 VX cap was accepted!";
     EXPECT_NE(err.find("supply cap exceeded"), std::string::npos)
         << "expected the supply-cap refusal, got: " << err;
 
-    EXPECT_TRUE(apply_coinbase_block(ledger, 1ULL * ATOMS_PER_VX, recv, &err,
-                                     0, nullptr, ts))
+    EXPECT_TRUE(apply_coinbase_block(ledger, 1ULL * ATOMS_PER_VX, recv, &err, 0, nullptr, ts))
         << err;
-    EXPECT_EQ(ledger.issued_supply(), cap)
-        << "the final partial reward must close the cap exactly";
+    EXPECT_EQ(ledger.issued_supply(), cap) << "the final partial reward must close the cap exactly";
 
     EXPECT_TRUE(apply_coinbase_block(ledger, 0, recv, &err, 0, nullptr, ts)) << err;
     EXPECT_FALSE(apply_coinbase_block(ledger, 1, recv, &err, 0, nullptr, ts));
@@ -665,8 +667,7 @@ TEST(VortexDocumentedGapsTest, RewardIndependentOfHeight) {
     const Address recv = addr_of("NFA_EMISSION_TAIL_A_000000000000000000");
     std::string err;
 
-    EXPECT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err))
-        << err;
+    EXPECT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err)) << err;
     EXPECT_EQ(ledger.issued_supply(), U128(50ULL * ATOMS_PER_VX))
         << "the floor reward must mint at any height";
     EXPECT_EQ(ledger.balance_of(recv), U128(50ULL * ATOMS_PER_VX));
@@ -689,10 +690,10 @@ TEST(VortexDocumentedGapsTest, UndoJournalByteFormatRoundTrip) {
     const Address recv_b = addr_of("NFA_UNDO_MINER_B_0000000000000000000000");
     {
         vx::state::UndoEngine undo(dir, store, ledger);
-        auto* g = store.get_block(0);
+        auto *g = store.get_block(0);
         ASSERT_NE(g, nullptr);
         BlockFrame gf;
-        std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+        std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
         ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
         undo.apply_block(BlockView(gf));
 
@@ -702,7 +703,8 @@ TEST(VortexDocumentedGapsTest, UndoJournalByteFormatRoundTrip) {
             BlockBuilder b = next_block(store, std::time(nullptr));
             vx::blockchain::Transaction cb{};
             std::memcpy(cb.sender_nfa, "MINER_", 6);
-            for (size_t k = 6; k < 42; ++k) cb.sender_nfa[k] = '0';
+            for (size_t k = 6; k < 42; ++k)
+                cb.sender_nfa[k] = '0';
             std::memcpy(cb.receiver_nfa, (i == 0 ? recv_a : recv_b).data(), 42);
             vx::blockchain::tx_set_amount(cb, 10ULL * 100000000ULL);
             vx::blockchain::tx_set_fee(cb, 0);
@@ -770,15 +772,17 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     vx::state::LedgerState ledger;
     const std::string jpath = dir + "/undo/undo.vxl";
     std::filesystem::create_directories(dir + "/undo");
-    auto put_u64 = [](std::vector<uint8_t>& v, uint64_t x) {
-        for (int i = 0; i < 8; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i)));
+    auto put_u64 = [](std::vector<uint8_t> &v, uint64_t x) {
+        for (int i = 0; i < 8; ++i)
+            v.push_back(static_cast<uint8_t>(x >> (8 * i)));
     };
-    auto put_u32 = [](std::vector<uint8_t>& v, uint32_t x) {
-        for (int i = 0; i < 4; ++i) v.push_back(static_cast<uint8_t>(x >> (8 * i)));
+    auto put_u32 = [](std::vector<uint8_t> &v, uint32_t x) {
+        for (int i = 0; i < 4; ++i)
+            v.push_back(static_cast<uint8_t>(x >> (8 * i)));
     };
-    auto write_file = [&](const std::vector<uint8_t>& bytes) {
+    auto write_file = [&](const std::vector<uint8_t> &bytes) {
         std::ofstream f(jpath, std::ios::binary);
-        f.write(reinterpret_cast<const char*>(bytes.data()),
+        f.write(reinterpret_cast<const char *>(bytes.data()),
                 static_cast<std::streamsize>(bytes.size()));
         ASSERT_TRUE(f.good());
     };
@@ -793,15 +797,17 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
         EXPECT_FALSE(undo.rollback_to_height(0)); // nothing journaled, no crash
-        EXPECT_FALSE(std::filesystem::exists(jpath))
-            << "a foreign journal file survived open";
+        EXPECT_FALSE(std::filesystem::exists(jpath)) << "a foreign journal file survived open";
     }
 
     // (b) Right magic, unknown version: refused the same way.
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(99); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.push_back(99);
+        bytes.push_back(0);
+        bytes.push_back(0);
+        bytes.push_back(0);
         bytes.insert(bytes.end(), 64, 0xFF);
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
@@ -815,7 +821,10 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.push_back(1);
+        bytes.push_back(0);
+        bytes.push_back(0);
+        bytes.push_back(0);
         bytes.insert(bytes.end(), 80, 0x00); // one well-formed zero-tx record
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
@@ -829,7 +838,10 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(2); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.push_back(2);
+        bytes.push_back(0);
+        bytes.push_back(0);
+        bytes.push_back(0);
         bytes.insert(bytes.end(), 200, 0xFF);
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
@@ -844,7 +856,10 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(2); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+        bytes.push_back(2);
+        bytes.push_back(0);
+        bytes.push_back(0);
+        bytes.push_back(0);
         bytes.insert(bytes.end(), 5, 0xFF);
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
@@ -860,15 +875,19 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(2); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
-        put_u64(bytes, 1);                    // height 1
-        put_u64(bytes, 0);                    // timestamp
-        bytes.insert(bytes.end(), 32, 0x00);  // prev tip hash
-        put_u64(bytes, 0); put_u64(bytes, 0); // prev supply
-        put_u64(bytes, 0);                    // prev accounts count
-        put_u64(bytes, 0);                    // tx_count = 0
-        put_u64(bytes, 0);                    // created_count = 0 (v2 field)
-        bytes.insert(bytes.end(), 10, 0xAB);  // torn tail
+        bytes.push_back(2);
+        bytes.push_back(0);
+        bytes.push_back(0);
+        bytes.push_back(0);
+        put_u64(bytes, 1);                   // height 1
+        put_u64(bytes, 0);                   // timestamp
+        bytes.insert(bytes.end(), 32, 0x00); // prev tip hash
+        put_u64(bytes, 0);
+        put_u64(bytes, 0);                   // prev supply
+        put_u64(bytes, 0);                   // prev accounts count
+        put_u64(bytes, 0);                   // tx_count = 0
+        put_u64(bytes, 0);                   // created_count = 0 (v2 field)
+        bytes.insert(bytes.end(), 10, 0xAB); // torn tail
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
         ASSERT_TRUE(std::filesystem::exists(jpath));
@@ -884,9 +903,9 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     // crash and never a trustful replay.
     {
         const std::string dpath = dir + "/undo/displaced.vxd";
-        auto write_disp = [&](const std::vector<uint8_t>& bytes) {
+        auto write_disp = [&](const std::vector<uint8_t> &bytes) {
             std::ofstream f(dpath, std::ios::binary);
-            f.write(reinterpret_cast<const char*>(bytes.data()),
+            f.write(reinterpret_cast<const char *>(bytes.data()),
                     static_cast<std::streamsize>(bytes.size()));
             ASSERT_TRUE(f.good());
         };
@@ -906,7 +925,10 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
         {
             std::vector<uint8_t> bytes;
             bytes.insert(bytes.end(), {'V', 'X', 'D', 'I', 'S', 'P', 'L', 'C'});
-            bytes.push_back(1); bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
+            bytes.push_back(1);
+            bytes.push_back(0);
+            bytes.push_back(0);
+            bytes.push_back(0);
             put_u64(bytes, 7);
             put_u32(bytes, 65536);
             write_disp(bytes);
@@ -933,17 +955,17 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
     auto store = std::make_unique<vx::storage::BlockStore>(store_path, "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store->get_block(0);
+    const auto *g = store->get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // The pinned GENESIS_2 mint pays the demo spender (Address #2), so the
     // fork's sender IS the demo spender: its public key signs the spends.
     PqAccount sender_acc = make_pq_account("VX_DEMO_SPENDER_SK_V1");
     sender_acc.addr = vx::blockchain::genesis2_mint_receiver_payload();
-    const Address& sender = sender_acc.addr;
+    const Address &sender = sender_acc.addr;
     const Address sink = addr_of("NFA_REORG_SINK_0000000000000000000000000");
     const uint64_t ts = std::time(nullptr);
     std::vector<BlockFrame> fork; // the displaced fork, in order
@@ -954,8 +976,8 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
         // Height 1: fund the sender (the protocol-shaped GENESIS_2 mint).
         {
             BlockBuilder b = next_block(*store, ts);
-            Transaction mint = make_tx(addr_of("GENESIS_2"), sender,
-                                       vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
+            Transaction mint =
+                make_tx(addr_of("GENESIS_2"), sender, vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
             sign_transaction(mint);
             ASSERT_TRUE(b.add_transaction(mint));
             b.finalize();
@@ -995,8 +1017,7 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
         // so both balances are zero AND untracked (an address the fork
         // created must not linger as a tracked zero-balance account, or a
         // re-applied GENESIS_2 mint would be refused forever).
-        EXPECT_EQ(ledger.balance_of(sender), U128{})
-            << "the fork's credits were not reversed";
+        EXPECT_EQ(ledger.balance_of(sender), U128{}) << "the fork's credits were not reversed";
         EXPECT_EQ(ledger.balance_of(sink), U128{});
         EXPECT_FALSE(ledger.tracked_addresses_containing(sender))
             << "an address created by the fork stayed tracked";
@@ -1011,8 +1032,7 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
             << "the displaced fork frames were not preserved by the rollback";
         for (size_t i = 0; i < fork.size(); ++i) {
             EXPECT_EQ(displaced[i].height, i + 1);
-            EXPECT_EQ(0, std::memcmp(displaced[i].frame.data(), fork[i].data(),
-                                     BLOCK_SIZE_BYTES))
+            EXPECT_EQ(0, std::memcmp(displaced[i].frame.data(), fork[i].data(), BLOCK_SIZE_BYTES))
                 << "displaced frame " << i << " does not match the fork block";
         }
     } // destructor commits: everything durable, nothing re-appended
@@ -1029,7 +1049,7 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
 
         // Re-apply the SAME fork: legal again only because the rollback
         // restored the nonces (and the pre-state records match the frames).
-        for (const auto& f : fork) {
+        for (const auto &f : fork) {
             undo.apply_block(BlockView(f));
             ASSERT_TRUE(store->append_block(f));
             const auto res = ledger.apply_block(BlockView(f));
@@ -1039,7 +1059,7 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
         // ── Acceptance: rollback + re-apply == a fresh apply ───────────
         vx::state::LedgerState fresh;
         ASSERT_TRUE(fresh.apply_block(BlockView(gf)).ok);
-        for (const auto& f : fork) {
+        for (const auto &f : fork) {
             const auto res = fresh.apply_block(BlockView(f));
             ASSERT_TRUE(res.ok) << "fresh apply refused: " << res.error;
         }
@@ -1080,22 +1100,22 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
     vx::storage::BlockStore store(dir + "/nonce.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     PqAccount sender_acc = make_pq_account("VX_DEMO_SPENDER_SK_V1");
     sender_acc.addr = vx::blockchain::genesis2_mint_receiver_payload();
-    const Address& sender = sender_acc.addr;
+    const Address &sender = sender_acc.addr;
     const Address sink = addr_of("NFA_NONCE_SINK_00000000000000000000000000");
 
     // Height 1: fund the sender (the protocol-shaped GENESIS_2 mint).
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
-        Transaction mint = make_tx(addr_of("GENESIS_2"), sender,
-                                   vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
+        Transaction mint =
+            make_tx(addr_of("GENESIS_2"), sender, vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
         sign_transaction(mint);
         ASSERT_TRUE(b.add_transaction(mint));
         ASSERT_TRUE(push_block(store, ledger, b));
@@ -1149,17 +1169,16 @@ TEST(VortexDocumentedGapsTest, OversizedTxCountRejected) {
     vx::storage::BlockStore store(dir + "/txcount.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // A perfectly valid 1-tx block...
     BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction t = make_tx(addr_of("GENESIS_2"),
-                            addr_of("NFA_TXCOUNT_TARGET_00000000000000000000"),
-                            100000000u, 0);
+                            addr_of("NFA_TXCOUNT_TARGET_00000000000000000000"), 100000000u, 0);
     sign_transaction(t);
     ASSERT_TRUE(b.add_transaction(t));
     b.finalize();
@@ -1173,8 +1192,7 @@ TEST(VortexDocumentedGapsTest, OversizedTxCountRejected) {
     const uint32_t poisoned = 581;
     std::memcpy(f.data() + 0x1D4, &poisoned, sizeof(poisoned));
 
-    EXPECT_FALSE(store.append_block(f))
-        << "tx_count-581 frame accepted - poisoning regression!";
+    EXPECT_FALSE(store.append_block(f)) << "tx_count-581 frame accepted - poisoning regression!";
     EXPECT_EQ(store.chain_height(), 1u) << "poisoned frame must not land";
 
     std::filesystem::remove_all(dir);
@@ -1189,16 +1207,15 @@ TEST(VortexDocumentedGapsTest, TamperedMerkleRejected) {
     vx::storage::BlockStore store(dir + "/merkle.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction t = make_tx(addr_of("GENESIS_2"),
-                            addr_of("NFA_MERKLE_TARGET_000000000000000000000"),
-                            100000000u, 0);
+                            addr_of("NFA_MERKLE_TARGET_000000000000000000000"), 100000000u, 0);
     sign_transaction(t);
     ASSERT_TRUE(b.add_transaction(t));
     b.finalize();
@@ -1211,8 +1228,7 @@ TEST(VortexDocumentedGapsTest, TamperedMerkleRejected) {
     // the transaction set no longer commits to this header.
     f.data()[0x2C] = static_cast<uint8_t>(f.data()[0x2C] ^ 0xA5);
 
-    EXPECT_FALSE(store.append_block(f))
-        << "forged merkle root accepted - commitment regression!";
+    EXPECT_FALSE(store.append_block(f)) << "forged merkle root accepted - commitment regression!";
     EXPECT_EQ(store.chain_height(), 1u) << "forged frame must not land";
 
     std::filesystem::remove_all(dir);
@@ -1254,8 +1270,8 @@ TEST(VortexDocumentedGapsTest, HtlcVmFailureForcesLocked) {
     std::vector<uint8_t> tampered(contract.bytecode);
     ASSERT_GT(tampered.size(), 34u);
     tampered[33] = 0xFE; // unknown opcode, executed only on the CLAIM path
-    const auto bad = vx::vm::VortexVM::settle_htlc_swap(
-        tampered, std::span<const uint8_t>(preimage, 16), 99);
+    const auto bad =
+        vx::vm::VortexVM::settle_htlc_swap(tampered, std::span<const uint8_t>(preimage, 16), 99);
     EXPECT_FALSE(bad.vm_trace.success) << "corrupted bytecode executed cleanly?";
     EXPECT_EQ(bad.outcome, vx::vm::VortexVM::HtlcOutcome::LOCKED)
         << "a failed VM run must never settle as CLAIMED (round 5)";
@@ -1276,18 +1292,18 @@ TEST(VortexDocumentedGapsTest, VaultTokenDigestFullyChecked) {
     core.initialize(0xA11CE1234567890ULL);
 
     const std::string payload = "VAULT_REGRESSION_PAYLOAD_ROUND5";
-    const auto token = core.commit_secure_data(
-        reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+    const auto token =
+        core.commit_secure_data(reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
 
     // Forge: keep the first 4 bytes, corrupt the remaining 28.
     std::array<uint8_t, 32> forged = token;
-    for (size_t i = 4; i < 32; ++i) forged[i] = static_cast<uint8_t>(forged[i] ^ 0x5A);
+    for (size_t i = 4; i < 32; ++i)
+        forged[i] = static_cast<uint8_t>(forged[i] ^ 0x5A);
     EXPECT_NE(forged, token) << "precondition: the tail WAS mutated";
     uint8_t out[vx::core::MemoryCore::PAGE_SIZE];
     EXPECT_FALSE(core.consume_data(forged, out))
         << "a 4-byte-prefix token consumed the page - digest regression!";
-    EXPECT_TRUE(core.consume_data(token, out))
-        << "the genuine token must still consume";
+    EXPECT_TRUE(core.consume_data(token, out)) << "the genuine token must still consume";
     EXPECT_EQ(std::memcmp(out, payload.data(), payload.size()), 0);
 
     std::cout << "  [fixed] vault token with 28 mutated tail bytes is"
@@ -1304,15 +1320,15 @@ TEST(VortexDocumentedGapsTest, VaultPoolFullNotClobber) {
 
     const std::string a = "PAGE_ALIVE_TOKEN_A";
     const std::string b = "PAGE_ALIVE_TOKEN_B";
-    const auto tok_a = core.commit_secure_data(
-        reinterpret_cast<const uint8_t*>(a.data()), a.size());
-    const auto tok_b = core.commit_secure_data(
-        reinterpret_cast<const uint8_t*>(b.data()), b.size());
+    const auto tok_a =
+        core.commit_secure_data(reinterpret_cast<const uint8_t *>(a.data()), a.size());
+    const auto tok_b =
+        core.commit_secure_data(reinterpret_cast<const uint8_t *>(b.data()), b.size());
 
     bool threw = false;
     try {
-        core.commit_secure_data(reinterpret_cast<const uint8_t*>(a.data()), a.size());
-    } catch (const std::exception& e) {
+        core.commit_secure_data(reinterpret_cast<const uint8_t *>(a.data()), a.size());
+    } catch (const std::exception &e) {
         threw = std::string(e.what()).find("pool full") != std::string::npos;
     }
     EXPECT_TRUE(threw) << "the third commit must refuse a full pool";
@@ -1321,11 +1337,9 @@ TEST(VortexDocumentedGapsTest, VaultPoolFullNotClobber) {
     // silently zeroized.
     uint8_t out[vx::core::MemoryCore::PAGE_SIZE];
     ASSERT_TRUE(core.consume_data(tok_a, out));
-    EXPECT_EQ(std::memcmp(out, a.data(), a.size()), 0)
-        << "token A payload survived untouched";
+    EXPECT_EQ(std::memcmp(out, a.data(), a.size()), 0) << "token A payload survived untouched";
     ASSERT_TRUE(core.consume_data(tok_b, out));
-    EXPECT_EQ(std::memcmp(out, b.data(), b.size()), 0)
-        << "token B payload survived untouched";
+    EXPECT_EQ(std::memcmp(out, b.data(), b.size()), 0) << "token B payload survived untouched";
 
     std::cout << "  [fixed] full vault pool refuses instead of zeroing a"
               << " live LOCKED page; both tokens survive.\n";
@@ -1341,14 +1355,13 @@ TEST(VortexDocumentedGapsTest, TailMetadataCommitted) {
 
     BlockBuilder b = next_block(store, std::time(nullptr));
     Transaction t = make_tx(addr_of("GENESIS_2"),
-                            addr_of("NFA_TAIL_TARGET_00000000000000000000000"),
-                            100000000u, 0);
+                            addr_of("NFA_TAIL_TARGET_00000000000000000000000"), 100000000u, 0);
     sign_transaction(t);
     ASSERT_TRUE(b.add_transaction(t));
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
-    auto* raw = reinterpret_cast<const RawBlock*>(f.data());
+    auto *raw = reinterpret_cast<const RawBlock *>(f.data());
 
     uint8_t h1[32];
     hash_block(*raw, h1);
@@ -1357,7 +1370,7 @@ TEST(VortexDocumentedGapsTest, TailMetadataCommitted) {
     // the old header-only digest did not move; the full commitment must.
     BlockFrame g = f;
     g.data()[65472] = static_cast<uint8_t>(g.data()[65472] ^ 0x01);
-    auto* raw2 = reinterpret_cast<const RawBlock*>(g.data());
+    auto *raw2 = reinterpret_cast<const RawBlock *>(g.data());
     uint8_t h2[32];
     hash_block(*raw2, h2);
 
@@ -1382,10 +1395,10 @@ TEST(VortexDocumentedGapsTest, PogwGateAcceptsSealedWorkAndBindsTheNonce) {
     vx::storage::BlockStore store(dir + "/work.vxb", "genesis.bin", 12);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     BlockBuilder b = next_block(store, std::time(nullptr));
@@ -1396,7 +1409,7 @@ TEST(VortexDocumentedGapsTest, PogwGateAcceptsSealedWorkAndBindsTheNonce) {
 
     // A sealed frame's nonce is load-bearing: change it and the work is gone.
     BlockFrame forged = f;
-    auto* forged_raw = reinterpret_cast<RawBlock*>(forged.data());
+    auto *forged_raw = reinterpret_cast<RawBlock *>(forged.data());
     forged_raw->tail.pogw_nonce ^= 1;
     EXPECT_FALSE(store.append_block(forged));
     EXPECT_EQ(store.last_error(), "insufficient PoGW work for the current difficulty");
@@ -1417,10 +1430,10 @@ TEST(VortexDocumentedGapsTest, RecoveryRejectsCorruptedLedgerFrame) {
     {
         vx::storage::BlockStore store(path, "genesis.bin", 8);
         vx::state::LedgerState ledger;
-        const auto* g = store.get_block(0);
+        const auto *g = store.get_block(0);
         ASSERT_NE(g, nullptr);
         BlockFrame gf;
-        std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+        std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
         ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
         BlockBuilder b = next_block(store, std::time(nullptr));
         ASSERT_TRUE(push_block(store, ledger, b));
@@ -1435,8 +1448,7 @@ TEST(VortexDocumentedGapsTest, RecoveryRejectsCorruptedLedgerFrame) {
     ASSERT_EQ(::pwrite(fd, &byte, 1, off), 1);
     ::close(fd);
 
-    EXPECT_THROW({ vx::storage::BlockStore reopen(path, "genesis.bin", 8); },
-                 std::runtime_error);
+    EXPECT_THROW({ vx::storage::BlockStore reopen(path, "genesis.bin", 8); }, std::runtime_error);
 
     std::filesystem::remove_all(dir);
 }
@@ -1450,10 +1462,10 @@ TEST(VortexDocumentedGapsTest, UnboundSenderRejected) {
     vx::storage::BlockStore store(dir + "/unbound.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // The attacker controls a real PQ key - just not one bound to the
@@ -1495,10 +1507,10 @@ TEST(VortexDocumentedGapsTest, WitnessRootMismatchRejected) {
     vx::storage::BlockStore store(dir + "/mismatch.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     const Address demo_spender = payload_of(vx::blockchain::demo_spender_address_nfa());
@@ -1537,10 +1549,10 @@ TEST(VortexDocumentedGapsTest, SelfCertifyingAddressAutoBinds) {
     vx::storage::BlockStore store(dir + "/selfcert.vxb", "genesis.bin", 8);
     vx::state::LedgerState ledger;
 
-    const auto* g = store.get_block(0);
+    const auto *g = store.get_block(0);
     ASSERT_NE(g, nullptr);
     BlockFrame gf;
-    std::memcpy(gf.data(), reinterpret_cast<const uint8_t*>(g), BLOCK_SIZE_BYTES);
+    std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
     ASSERT_TRUE(ledger.apply_block(BlockView(gf)).ok);
 
     // A fresh PQ account nobody has ever seen: the address IS the key
@@ -1553,14 +1565,13 @@ TEST(VortexDocumentedGapsTest, SelfCertifyingAddressAutoBinds) {
     // Height 1: the protocol mint funds the demo spender (pinned shape).
     {
         BlockBuilder b = next_block(store, std::time(nullptr));
-        Transaction mint = make_tx(addr_of("GENESIS_2"), demo.addr,
-                                   vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
+        Transaction mint =
+            make_tx(addr_of("GENESIS_2"), demo.addr, vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
         sign_transaction(mint); // system sender: structural digest only
         ASSERT_TRUE(b.add_transaction(mint));
         ASSERT_TRUE(push_block(store, ledger, b));
     }
-    ASSERT_EQ(ledger.balance_of(demo.addr),
-              U128(vx::blockchain::GENESIS_2_MINT_ATOMICS));
+    ASSERT_EQ(ledger.balance_of(demo.addr), U128(vx::blockchain::GENESIS_2_MINT_ATOMICS));
 
     // Height 2: the demo spender funds the fresh account with a plain PQ
     // transfer (mints pay only the pinned receiver - a keyless digest can
@@ -1634,9 +1645,7 @@ TEST(VortexDocumentedGapsTest, WitnessDurableLogSurvivesRestart) {
     const std::string pqw = dir + "/witnesses.pqw";
 
     const PqAccount acc = make_pq_account("VX_TEST_DURABLE_SK_V1");
-    Transaction tx = make_tx(acc.addr,
-                             addr_of("NFA_DURABLE_SINK_000000000000000000000"),
-                             1000, 0);
+    Transaction tx = make_tx(acc.addr, addr_of("NFA_DURABLE_SINK_000000000000000000000"), 1000, 0);
 
     vx::crypto::pq::PqSignatureWitness w;
     {
@@ -1650,8 +1659,7 @@ TEST(VortexDocumentedGapsTest, WitnessDurableLogSurvivesRestart) {
     {
         std::ifstream in(pqw, std::ios::binary);
         ASSERT_TRUE(in.good()) << "durable witness log was not created";
-        std::string rec((std::istreambuf_iterator<char>(in)),
-                        std::istreambuf_iterator<char>());
+        std::string rec((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         const size_t expect = 8 + 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness);
         ASSERT_EQ(rec.size(), expect) << "exactly one 2458-byte record";
         EXPECT_EQ(std::memcmp(rec.data(), "VXPQWT1", 8), 0) << "record tag";
@@ -1661,8 +1669,8 @@ TEST(VortexDocumentedGapsTest, WitnessDurableLogSurvivesRestart) {
     // the registry and the witness is still there, byte-identical.
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(pqw);
     vx::crypto::pq::PqSignatureWitness w2;
-    ASSERT_TRUE(vx::crypto::pq::PqWitnessRegistry::instance().lookup(
-        vx::crypto::pq::tx_msg_digest(tx), w2))
+    ASSERT_TRUE(
+        vx::crypto::pq::PqWitnessRegistry::instance().lookup(vx::crypto::pq::tx_msg_digest(tx), w2))
         << "witness lost across the restart";
     EXPECT_EQ(w2.wots_sig, w.wots_sig);
     EXPECT_EQ(w2.pq_pubkey_root, w.pq_pubkey_root);
@@ -1672,4 +1680,211 @@ TEST(VortexDocumentedGapsTest, WitnessDurableLogSurvivesRestart) {
               << " VXPQWT1 record and a restart replays it (BACKLOG 0.8).\n";
 
     std::filesystem::remove_all(dir);
+}
+
+// ── BACKLOG 1.5 wiring (v0.0.18): rollover certificate consensus chain ──────
+//
+// A certified one-window key rotation lets a bound PQ account keep its
+// ADDRESS (which commits the window-0 anchor root) while spending under a
+// later window's root. Consensus accepts the rotated root ONLY through a
+// sequential chain of cryptographically verified ROLLOVER_CERT records
+// walked from the anchor - no certificate, no acceptance; a gap caps the
+// walk; the certificate leaf (15) never spends.
+
+namespace {
+
+// Full setup shared by the rollover end-to-end tests: genesis, the
+// GENESIS_2 mint to the demo spender, the demo spender funding a fresh
+// SELF-CERTIFYING PQA account (whose address commits its window-0 root),
+// and that account's first window-0 spend (which binds the anchor).
+struct RolloverFixture {
+    std::unique_ptr<vx::storage::BlockStore> store;
+    std::unique_ptr<vx::state::LedgerState> ledger;
+    PqAccount acc{};
+    Address sink{};
+    std::string dir;
+
+    // NOTE: the PqWitnessRegistry is a process-lifetime singleton - every
+    // fixture builds its OWN account tag so certificates registered by one
+    // test can never satisfy another test's expectations.
+    bool build(const char *account_tag) {
+        dir = temp_dir("vx_gap_rollover");
+        store = std::make_unique<vx::storage::BlockStore>(dir + "/rollover.vxb", "genesis.bin");
+        ledger = std::make_unique<vx::state::LedgerState>();
+
+        const auto *g = store->get_block(0);
+        if (!g)
+            return false;
+        BlockFrame gf;
+        std::memcpy(gf.data(), reinterpret_cast<const uint8_t *>(g), BLOCK_SIZE_BYTES);
+        if (!ledger->apply_block(BlockView(gf)).ok)
+            return false;
+
+        PqAccount demo = make_pq_account("VX_DEMO_SPENDER_SK_V1");
+        demo.addr = vx::blockchain::genesis2_mint_receiver_payload();
+        sink = addr_of("NFA_ROLLOVER_SINK_0000000000000000000000000000");
+        acc = make_pq_account(account_tag);
+
+        // Height 1: the bound-shape GENESIS_2 mint (100,000 VX to the demo
+        // spender).
+        {
+            BlockBuilder b = next_block(*store, std::time(nullptr));
+            Transaction mint =
+                make_tx(addr_of("GENESIS_2"), demo.addr, vx::blockchain::GENESIS_2_MINT_ATOMICS, 0);
+            sign_transaction(mint);
+            if (!b.add_transaction(mint))
+                return false;
+            if (!push_block(*store, *ledger, b))
+                return false;
+        }
+        // Height 2: the demo spender funds the PQA account.
+        {
+            BlockBuilder b = next_block(*store, std::time(nullptr));
+            Transaction fund = make_tx(demo.addr, acc.addr, 1000000000ull, 0);
+            if (!pq_sign(fund, demo))
+                return false;
+            if (!b.add_transaction(fund))
+                return false;
+            if (!push_block(*store, *ledger, b))
+                return false;
+        }
+        // Height 3: the PQA account's first spend - self-certifying
+        // binding stores the window-0 anchor root.
+        {
+            BlockBuilder b = next_block(*store, std::time(nullptr));
+            Transaction first = make_tx(acc.addr, sink, 1000000ull, 0);
+            if (!pq_sign(first, acc))
+                return false;
+            if (!b.add_transaction(first))
+                return false;
+            if (!push_block(*store, *ledger, b))
+                return false;
+        }
+        return true;
+    }
+
+    // A transaction signed INSIDE window `win` at leaf `leaf`, anchored by
+    // hand (the wallet path pq_sign_transaction is window-0-only until the
+    // post-rollover leaf accounting ships; consensus is window-agnostic).
+    Transaction window_tx(uint32_t nonce, uint32_t win, uint32_t leaf) {
+        Transaction tx = make_tx(acc.addr, sink, 2000000ull, nonce);
+        const auto pub_seed = vx::crypto::pq::pub_seed_from_sk(acc.sk);
+        const auto w = vx::crypto::pq::pq_sign_message(leaf, win, acc.sk, pub_seed,
+                                                       vx::crypto::pq::tx_msg_digest(tx));
+        assert(w.witness_digest != vx::crypto::pq::PqSignatureWitness{}.witness_digest);
+        // cocoon anchor = trunc12(Sponge("VX_SEGPQ_ANCHOR_V1" || msg || root
+        // || witness_digest)) - the same preimage pq_sign_transaction lays
+        // down, laid down by hand here (18 + 32*3 = 114 bytes).
+        const auto msg = vx::crypto::pq::tx_msg_digest(tx);
+        uint8_t a[18 + 32 + 32 + 32];
+        std::memcpy(a, "VX_SEGPQ_ANCHOR_V1", 18);
+        std::memcpy(a + 18, msg.data(), 32);
+        std::memcpy(a + 50, w.pq_pubkey_root.data(), 32);
+        std::memcpy(a + 82, w.witness_digest.data(), 32);
+        std::array<uint8_t, 32> full_tag{};
+        VortexSponge256::compute(a, sizeof(a), full_tag.data());
+        std::memcpy(tx.cocoon_proof, full_tag.data(), 12);
+        assert(vx::crypto::pq::PqWitnessRegistry::instance().register_witness(tx, w));
+        return tx;
+    }
+
+    // Registers the honest certificate for (win -> win+1) under acc.addr.
+    bool register_cert(uint32_t win) {
+        const auto pub_seed = vx::crypto::pq::pub_seed_from_sk(acc.sk);
+        vx::crypto::pq::PqRolloverCert cert;
+        std::memcpy(cert.sender.data(), acc.addr.data(), 42);
+        cert.from_window = win;
+        cert.to_window = win + 1;
+        cert.old_root = vx::crypto::pq::xmss_root_tree(acc.sk, pub_seed, win);
+        cert.new_root = vx::crypto::pq::xmss_root_tree(acc.sk, pub_seed, win + 1);
+        cert.witness = vx::crypto::pq::pq_sign_rollover(acc.sk, win, win + 1, nullptr);
+        return vx::crypto::pq::PqWitnessRegistry::instance().register_rollover_cert(cert);
+    }
+};
+
+} // namespace
+
+// ACCEPTED: the full certified rotation - anchor bound at height 3, one
+// certificate, a window-1 spend attributed through the walked chain.
+TEST(VortexDocumentedGapsTest, RolloverChainAccepted) {
+    RolloverFixture fx;
+    ASSERT_TRUE(fx.build("VX_ROLLOVER_E2E_SK_V1"));
+
+    // Before the certificate exists the rotated root is unattributable.
+    std::array<uint8_t, 32> walked{};
+    uint32_t win = 0;
+    const auto r0 =
+        vx::crypto::pq::xmss_root_tree(fx.acc.sk, vx::crypto::pq::pub_seed_from_sk(fx.acc.sk), 0);
+    EXPECT_FALSE(vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(
+        fx.acc.addr.data(), r0, walked, win));
+
+    ASSERT_TRUE(fx.register_cert(0)); // the 0 -> 1 certificate
+
+    EXPECT_TRUE(vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(fx.acc.addr.data(),
+                                                                                 r0, walked, win));
+    EXPECT_EQ(win, 1u);
+
+    {
+        BlockBuilder b = next_block(*fx.store, std::time(nullptr));
+        Transaction spend = fx.window_tx(1, 1, 3); // window 1, leaf 3
+        ASSERT_TRUE(b.add_transaction(spend));
+        const U128 before = fx.ledger->balance_of(fx.acc.addr);
+        ASSERT_TRUE(push_block(*fx.store, *fx.ledger, b));
+        EXPECT_EQ(fx.ledger->balance_of(fx.acc.addr), before - U128(2000100ull))
+            << "the window-1 spend must actually move value (amount + fee)";
+    }
+    std::cout << "  [closed] certified rollover: window-1 spend accepted"
+              << " through the walked certificate chain (BACKLOG 1.5).\n";
+    std::filesystem::remove_all(fx.dir);
+}
+
+// REJECTED: the same window-1 spend WITHOUT the certificate - fail-closed.
+TEST(VortexDocumentedGapsTest, RolloverWithoutCertRejected) {
+    RolloverFixture fx;
+    ASSERT_TRUE(fx.build("VX_ROLLOVER_NO_CERT_SK_V1"));
+
+    {
+        BlockBuilder b = next_block(*fx.store, std::time(nullptr));
+        Transaction spend = fx.window_tx(1, 1, 3); // cryptographically valid
+        ASSERT_TRUE(b.add_transaction(spend));
+        b.finalize();
+        BlockFrame f;
+        std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+        ASSERT_TRUE(seal_pogw_nonce(f, fx.store->required_pogw_bits()));
+        ASSERT_TRUE(fx.store->append_block(f));
+        const auto res = fx.ledger->apply_block(BlockView(f));
+        EXPECT_FALSE(res.ok) << "an uncertified rotated root was accepted";
+        EXPECT_NE(res.error.find("no certified rollover chain"), std::string::npos)
+            << "expected the chain-walk refusal";
+    }
+    std::cout << "  [closed] uncertified rollover: window-1 spend refused"
+              << " without a certificate chain.\n";
+    std::filesystem::remove_all(fx.dir);
+}
+
+// REJECTED: a spend on the RESERVED certificate leaf (15) - even inside an
+// honestly certified window. Leaf 15 certifies; it never spends.
+TEST(VortexDocumentedGapsTest, RolloverCertLeafSpenderRejected) {
+    RolloverFixture fx;
+    ASSERT_TRUE(fx.build("VX_ROLLOVER_LEAF15_SK_V1"));
+    ASSERT_TRUE(fx.register_cert(0));
+
+    // The witness verifies as a pure chain (wots_xmss) but the tx USE-time
+    // verification refuses the reserved leaf - registration through the
+    // client path must already fail.
+    {
+        Transaction spend = make_tx(fx.acc.addr, fx.sink, 2000000ull, 2);
+        const auto pub_seed = vx::crypto::pq::pub_seed_from_sk(fx.acc.sk);
+        const auto w =
+            vx::crypto::pq::pq_sign_message(vx::crypto::pq::PQ_ROLLOVER_CERT_LEAF, 1, fx.acc.sk,
+                                            pub_seed, vx::crypto::pq::tx_msg_digest(spend));
+        ASSERT_TRUE(w.witness_digest == vx::crypto::pq::witness_commitment(w));
+        EXPECT_FALSE(vx::crypto::pq::PqWitnessRegistry::instance().register_witness(spend, w))
+            << "a certificate-leaf witness entered the tx registry";
+        EXPECT_FALSE(verify_transaction_proof(spend))
+            << "Tier 1 accepted a certificate-leaf witness";
+    }
+    std::cout << "  [closed] certificate-leaf spender refused at USE time"
+              << " (leaf 15 never spends).\n";
+    std::filesystem::remove_all(fx.dir);
 }

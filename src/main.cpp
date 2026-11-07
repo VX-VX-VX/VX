@@ -285,6 +285,8 @@ int main(int argc, char* argv[]) {
     // BACKLOG 0.8: durable PQ witness sidecar — every witnessed transaction
     // is fsync'd beside the ledger and replayed on restart.
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(ledger_path + ".pqw");
+    // Rollover certs (v0.0.18): replay the durable cert sidecar too.
+    vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_cert_log(ledger_path + ".pqr");
     uint64_t current_height = store.chain_height();
     std::cout << "      ✓ Chain height: " << current_height << " blocks (tip = #" << (current_height - 1) << ")\n\n";
 

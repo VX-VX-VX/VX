@@ -19,13 +19,13 @@
 namespace vx::state {
 
 using blockchain::Address;
-using blockchain::Transaction;
 using blockchain::BlockView;
+using blockchain::Transaction;
 using core::U128;
 
 /// FNV-1a over the 42-byte NFA payload.
 struct AddressHash {
-    size_t operator()(const Address& a) const noexcept {
+    size_t operator()(const Address &a) const noexcept {
         uint64_t h = 1469598103934665603ull;
         for (uint8_t b : a) {
             h ^= b;
@@ -55,7 +55,7 @@ public:
     LedgerState() {
         // PQ seed bindings (BACKLOG 0.7): the protocol-level binding table
         // is part of consensus state, computed identically on every node.
-        for (const auto& b : blockchain::pq_seed_bindings()) {
+        for (const auto &b : blockchain::pq_seed_bindings()) {
             pq_roots_[b.addr] = b.root;
         }
     }
@@ -64,29 +64,31 @@ public:
     /// from it. Idempotent for the same root; a DIFFERENT root for an
     /// already-bound address is refused (root rotation is BACKLOG 0.8
     /// follow-up and must itself be witness-authorized when it ships).
-    bool bind_pq_sender(const Address& a, const std::array<uint8_t, 32>& root) {
+    bool bind_pq_sender(const Address &a, const std::array<uint8_t, 32> &root) {
         auto it = pq_roots_.find(a);
-        if (it != pq_roots_.end()) return it->second == root;
+        if (it != pq_roots_.end())
+            return it->second == root;
         pq_roots_[a] = root;
         return true;
     }
 
     /// The bound root for an address, if any.
-    bool pq_root_of(const Address& a, std::array<uint8_t, 32>& out) const {
+    bool pq_root_of(const Address &a, std::array<uint8_t, 32> &out) const {
         auto it = pq_roots_.find(a);
-        if (it == pq_roots_.end()) return false;
+        if (it == pq_roots_.end())
+            return false;
         out = it->second;
         return true;
     }
 
     /// Applies all transactions of a block. Rejects blocks whose height does
     /// not match the expected next height (state must track the chain tip).
-    ApplyResult apply_block(const BlockView& block) {
+    ApplyResult apply_block(const BlockView &block) {
         ApplyResult res;
 
         if (block.header().block_height != next_height_) {
-            res.error = "height gap: expected " + std::to_string(next_height_) +
-                        ", got " + std::to_string(block.header().block_height);
+            res.error = "height gap: expected " + std::to_string(next_height_) + ", got " +
+                        std::to_string(block.header().block_height);
             return res;
         }
 
@@ -96,8 +98,7 @@ public:
         // frame walks BlockView::tx(i) past the frame's transaction array
         // and past the frame itself.
         if (n > blockchain::MAX_TX_PER_BLOCK) {
-            res.error = "tx_count " + std::to_string(n) +
-                        " exceeds block capacity " +
+            res.error = "tx_count " + std::to_string(n) + " exceeds block capacity " +
                         std::to_string(blockchain::MAX_TX_PER_BLOCK);
             return res;
         }
@@ -109,10 +110,11 @@ public:
         // - e.g. tx_count patched after the merkle root was computed - must
         // be caught BEFORE any mutation: the body commitment is recomputed
         // from the frame bytes alone and compared with the header field.
-        if (!blockchain::verify_block_merkle(*reinterpret_cast<const blockchain::RawBlock*>(
-                block.bytes().data()))) {
+        if (!blockchain::verify_block_merkle(
+                *reinterpret_cast<const blockchain::RawBlock *>(block.bytes().data()))) {
             res.error = "ERR_APPLY_INTEGRITY: merkle_root does not commit the block body"
-                        " (header tx_count " + std::to_string(n) + ")";
+                        " (header tx_count " +
+                        std::to_string(n) + ")";
             return res;
         }
 
@@ -126,7 +128,7 @@ public:
         // astronomically large phantom balance (external review P0, fixed).
         std::unordered_map<Address, U128, AddressHash> intra_debits_;
 
- // verify every sender has sufficient funds + nonce.
+        // verify every sender has sufficient funds + nonce.
         // Track expected nonce per sender within this block (for intra-block sequential nonce)
         std::unordered_map<Address, uint32_t, AddressHash> expected_nonces_;
         // Self-certifying bindings produced by this block's pre-check loop;
@@ -147,7 +149,7 @@ public:
         U128 miner_mint_sum{0};
 
         for (uint32_t i = 0; i < n; ++i) {
-            const Transaction& tx = block.tx(i);
+            const Transaction &tx = block.tx(i);
 
             Address sender = blockchain::tx_address(tx.sender_nfa);
             uint64_t amount = blockchain::tx_amount(tx);
@@ -158,9 +160,9 @@ public:
             bool is_genesis_v1 = blockchain::is_genesis_v1_tx(tx);
 
             // Hardened Minting Rules.
-            const char* s = reinterpret_cast<const char*>(sender.data());
+            const char *s = reinterpret_cast<const char *>(sender.data());
             bool is_genesis = (std::strncmp(s, "GENESIS", 7) == 0);
-            bool is_miner   = (std::strncmp(s, "MINER_", 6) == 0);
+            bool is_miner = (std::strncmp(s, "MINER_", 6) == 0);
 
             // ── Authorization (BACKLOG 0.7, closed 2026-11-03): system
             // senders keep the structural integrity digest; every USER
@@ -177,10 +179,9 @@ public:
                     // fork cannot be replayed on a competing fork at the
                     // same height (its tag commits the OTHER fork's tip).
                     uint8_t expect_tag[12];
-                    blockchain::coinbase_binding(expect_tag,
-                                                 blockchain::tx_address(tx.receiver_nfa),
-                                                 block.header().block_height,
-                                                 block.header().prev_block_hash);
+                    blockchain::coinbase_binding(
+                        expect_tag, blockchain::tx_address(tx.receiver_nfa),
+                        block.header().block_height, block.header().prev_block_hash);
                     if (std::memcmp(tx.cocoon_proof, expect_tag, 12) != 0) {
                         res.error = "tx " + std::to_string(i) +
                                     ": coinbase is not bound to this chain position";
@@ -200,9 +201,32 @@ public:
                 std::array<uint8_t, 32> bound{};
                 if (pq_root_of(sender, bound)) {
                     if (!vx::core::ct_equal(bound.data(), w.pq_pubkey_root.data(), 32)) {
-                        res.error = "tx " + std::to_string(i) +
-                                    ": PQ witness root does not match the sender's bound key";
-                        return res;
+                        // BACKLOG 1.5 rollover: the witness root may be a
+                        // LATER window's root, certified by a sequential
+                        // chain of ROLLOVER_CERT records walked from the
+                        // anchor the address commits. Accept only when the
+                        // walked endpoint equals the witness root and the
+                        // witness signs INSIDE the walked window (leaf-15
+                        // exclusivity is already enforced at USE time by
+                        // pq_verify_transaction).
+                        std::array<uint8_t, 32> walked{};
+                        uint32_t walked_window = 0;
+                        const bool walked_ok =
+                            vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(
+                                sender.data(), bound, walked, walked_window) &&
+                            vx::core::ct_equal(walked.data(), w.pq_pubkey_root.data(), 32);
+                        if (!walked_ok) {
+                            res.error = "tx " + std::to_string(i) +
+                                        ": PQ witness root does not match the sender's bound"
+                                        " key (no certified rollover chain to it)";
+                            return res;
+                        }
+                        if (w.subtree_index != walked_window) {
+                            res.error = "tx " + std::to_string(i) +
+                                        ": PQ witness window does not match the certified"
+                                        " rollover chain";
+                            return res;
+                        }
                     }
                 } else if (blockchain::is_pq_address(sender)) {
                     // Self-certifying binding: the address commits its own
@@ -253,20 +277,22 @@ public:
                     // only one that happens to copy the protocol shape.
                     if (next_height_ == 1) {
                         if (genesis_mint_seen) {
-                            res.error = "tx " + std::to_string(i) +
-                                        ": second GENESIS mint in one block";
+                            res.error =
+                                "tx " + std::to_string(i) + ": second GENESIS mint in one block";
                             return res;
                         }
                         genesis_mint_seen = true;
                     }
-                    if (next_height_ > 0 && !(next_height_ == 1 &&
-                        std::strncmp(s, "GENESIS_2", 9) == 0 &&
-                        amount == blockchain::GENESIS_2_MINT_ATOMICS &&
-                        std::memcmp(tx.receiver_nfa,
-                                    blockchain::genesis2_mint_receiver_payload().data(),
-                                    42) == 0 &&
-                        !tracked_addresses_containing(blockchain::tx_address(tx.receiver_nfa)))) {
-                        res.error = "tx " + std::to_string(i) + ": GENESIS mint unauthorized at height " + std::to_string(next_height_);
+                    if (next_height_ > 0 &&
+                        !(next_height_ == 1 && std::strncmp(s, "GENESIS_2", 9) == 0 &&
+                          amount == blockchain::GENESIS_2_MINT_ATOMICS &&
+                          std::memcmp(tx.receiver_nfa,
+                                      blockchain::genesis2_mint_receiver_payload().data(),
+                                      42) == 0 &&
+                          !tracked_addresses_containing(blockchain::tx_address(tx.receiver_nfa)))) {
+                        res.error = "tx " + std::to_string(i) +
+                                    ": GENESIS mint unauthorized at height " +
+                                    std::to_string(next_height_);
                         return res;
                     }
                 }
@@ -295,14 +321,16 @@ public:
 
                 if (!(legacy_window && is_genesis_v1) && nonce != expected_nonce) {
                     res.error = "tx " + std::to_string(i) + ": nonce mismatch (expected " +
-                                std::to_string(expected_nonce) + ", got " + std::to_string(nonce) + ")";
+                                std::to_string(expected_nonce) + ", got " + std::to_string(nonce) +
+                                ")";
                     return res;
                 }
 
                 U128 total_cost = U128(amount) + U128(fee);
                 U128 balance = balance_of(sender);
                 auto pit = pending_.find(sender);
-                if (pit != pending_.end()) balance = balance + pit->second;
+                if (pit != pending_.end())
+                    balance = balance + pit->second;
                 // Subtract this sender's earlier spends IN THE SAME BLOCK
                 // (checked): each tx must be validated against the balance
                 // the commit loop will actually see.
@@ -324,7 +352,8 @@ public:
                 const U128 this_debit = U128(amount) + U128(fee);
                 U128 acc = U128{};
                 auto ait = intra_debits_.find(sender);
-                if (ait != intra_debits_.end()) acc = ait->second;
+                if (ait != intra_debits_.end())
+                    acc = ait->second;
                 if (acc > U128(0xFFFFFFFFFFFFFFFFULL) ||
                     this_debit > U128(0xFFFFFFFFFFFFFFFFULL) - acc) {
                     res.error = "tx " + std::to_string(i) + ": debit accumulator overflow";
@@ -336,8 +365,10 @@ public:
             // Emission accounting: mints are separated by sender class so
             // the gate below the loop can price the subsidy entitlement
             // (MINER_) separately from protocol allocations (GENESIS).
-            if (is_genesis) genesis_mint_sum = genesis_mint_sum + U128(amount);
-            if (is_miner) miner_mint_sum = miner_mint_sum + U128(amount);
+            if (is_genesis)
+                genesis_mint_sum = genesis_mint_sum + U128(amount);
+            if (is_miner)
+                miner_mint_sum = miner_mint_sum + U128(amount);
 
             debits[i] = U128(amount);
             Address receiver = blockchain::tx_address(tx.receiver_nfa);
@@ -370,11 +401,9 @@ public:
         //    determines the last partial rewards, and after it no further
         //    issuance can enter state.
         uint8_t frame_hash[32];
-        blockchain::VortexSponge256::compute(block.bytes().data(),
-                                             blockchain::BLOCK_SIZE_BYTES,
+        blockchain::VortexSponge256::compute(block.bytes().data(), blockchain::BLOCK_SIZE_BYTES,
                                              frame_hash);
-        const U128 schedule_reward =
-            U128(blockchain::block_reward_atoms(frame_hash));
+        const U128 schedule_reward = U128(blockchain::block_reward_atoms(frame_hash));
 
         U128 total_fees{0};
         for (uint32_t i = 0; i < n; ++i) {
@@ -388,20 +417,17 @@ public:
             const U128 entitlement = schedule_reward + miner_reward;
             if (miner_mint_sum > entitlement) {
                 res.error = "coinbase exceeds emission entitlement (reward " +
-                            std::to_string((schedule_reward /
-                                            U128(blockchain::ATOMS_PER_VX)).lo) +
+                            std::to_string((schedule_reward / U128(blockchain::ATOMS_PER_VX)).lo) +
                             " VX from this block's hash + fee share); height " +
                             std::to_string(block.header().block_height);
                 return res;
             }
-            const U128 recredited =
-                (miner_mint_sum < miner_reward) ? miner_mint_sum : miner_reward;
+            const U128 recredited = (miner_mint_sum < miner_reward) ? miner_mint_sum : miner_reward;
             block_issuance = (genesis_mint_sum + miner_mint_sum) - recredited;
             const U128 supply_cap = U128(blockchain::max_supply_atoms());
             if (issued_supply_ > supply_cap || block_issuance > supply_cap - issued_supply_) {
                 res.error = "supply cap exceeded: at most " +
-                            std::to_string(blockchain::MAX_SUPPLY_VX) +
-                            " VX can ever be issued";
+                            std::to_string(blockchain::MAX_SUPPLY_VX) + " VX can ever be issued";
                 return res;
             }
         }
@@ -438,22 +464,30 @@ public:
         // replaces, so a failed commit (or a failed post-apply integrity
         // check) restores the exact pre-block state. "No partial
         // application" is enforced here, not assumed from the pre-check.
-        struct BalanceUndo { Address addr; U128 prev; bool existed; };
-        struct NonceUndo { Address addr; uint32_t prev; bool existed; };
+        struct BalanceUndo {
+            Address addr;
+            U128 prev;
+            bool existed;
+        };
+        struct NonceUndo {
+            Address addr;
+            uint32_t prev;
+            bool existed;
+        };
         std::vector<BalanceUndo> balance_undo;
         std::vector<NonceUndo> nonce_undo;
         balance_undo.reserve(2 * n);
         const U128 burned_before = burned_supply_;
         const U128 issued_before = issued_supply_;
-        auto record_balance = [&](const Address& a) {
+        auto record_balance = [&](const Address &a) {
             const auto it = balances_.find(a);
-            balance_undo.push_back(BalanceUndo{a, it == balances_.end() ? U128{} : it->second,
-                                               it != balances_.end()});
+            balance_undo.push_back(
+                BalanceUndo{a, it == balances_.end() ? U128{} : it->second, it != balances_.end()});
         };
-        auto record_nonce = [&](const Address& a) {
+        auto record_nonce = [&](const Address &a) {
             const auto it = nonces_.find(a);
-            nonce_undo.push_back(NonceUndo{a, it == nonces_.end() ? 0u : it->second,
-                                           it != nonces_.end()});
+            nonce_undo.push_back(
+                NonceUndo{a, it == nonces_.end() ? 0u : it->second, it != nonces_.end()});
         };
         auto rollback_commit = [&]() {
             for (auto it = balance_undo.rbegin(); it != balance_undo.rend(); ++it) {
@@ -464,7 +498,8 @@ public:
                     // the untracked pre-block state (same rule as the reorg
                     // undo path - see forget_empty_address).
                     const auto e = balances_.find(it->addr);
-                    if (e != balances_.end() && e->second == U128{}) balances_.erase(e);
+                    if (e != balances_.end() && e->second == U128{})
+                        balances_.erase(e);
                 }
             }
             for (auto it = nonce_undo.rbegin(); it != nonce_undo.rend(); ++it) {
@@ -478,17 +513,17 @@ public:
             issued_supply_ = issued_before;
         };
 
- // commit with TDI fee burn (50% burned, 50% to miner)
+        // commit with TDI fee burn (50% burned, 50% to miner)
 
         uint32_t applied = 0;
         for (uint32_t i = 0; i < n; ++i) {
-            const Transaction& tx = block.tx(i);
+            const Transaction &tx = block.tx(i);
             Address sender = blockchain::tx_address(tx.sender_nfa);
             Address receiver = blockchain::tx_address(tx.receiver_nfa);
 
-            const char* s = reinterpret_cast<const char*>(sender.data());
-            bool is_coinbase = (std::strncmp(s, "GENESIS", 7) == 0) ||
-                               (std::strncmp(s, "MINER_", 6) == 0);
+            const char *s = reinterpret_cast<const char *>(sender.data());
+            bool is_coinbase =
+                (std::strncmp(s, "GENESIS", 7) == 0) || (std::strncmp(s, "MINER_", 6) == 0);
 
             if (!is_coinbase) {
                 // Hard underflow guard (defense in depth): the pre-check
@@ -527,8 +562,7 @@ public:
         // with a hard error instead of silently keeping partial state.
         if (applied != block.header().tx_count) {
             res.error = "ERR_APPLY_INTEGRITY: applied " + std::to_string(applied) +
-                        " transactions, header declares " +
-                        std::to_string(block.header().tx_count);
+                        " transactions, header declares " + std::to_string(block.header().tx_count);
             rollback_commit();
             return res;
         }
@@ -544,9 +578,8 @@ public:
         // supply value for large states, never an anomaly signal here.
         if (!exact_total_supply(post_supply) || !(post_supply == expected_post)) {
             res.error = "ERR_APPLY_INTEGRITY: supply law violated (post " +
-                        post_supply.to_string() + " != pre " + pre_supply.to_string() +
-                        " - fees " + total_fees.to_string() + " + mints " +
-                        coinbase_mints.to_string() + ")";
+                        post_supply.to_string() + " != pre " + pre_supply.to_string() + " - fees " +
+                        total_fees.to_string() + " + mints " + coinbase_mints.to_string() + ")";
             rollback_commit();
             return res;
         }
@@ -571,7 +604,7 @@ public:
         // A block rejected anywhere above leaves pq_roots_ untouched (the
         // old code bound the sender mid-loop, before later transactions
         // could still refuse the block).
-        for (const auto& [addr, root] : new_bindings_) {
+        for (const auto &[addr, root] : new_bindings_) {
             bind_pq_sender(addr, root);
         }
         new_bindings_.clear();
@@ -583,28 +616,34 @@ public:
         return res;
     }
 
-    U128 balance_of(const Address& a) const {
+    U128 balance_of(const Address &a) const {
         auto it = balances_.find(a);
         return it == balances_.end() ? U128{} : it->second;
     }
 
     /// Get next expected nonce for an address
-    uint32_t get_next_nonce(const Address& a) const {
+    uint32_t get_next_nonce(const Address &a) const {
         auto it = nonces_.find(a);
         return it == nonces_.end() ? 0 : it->second;
     }
 
     /// Set next expected nonce for an address
-    void set_next_nonce(const Address& a, uint32_t nonce) {
+    void set_next_nonce(const Address &a, uint32_t nonce) {
         nonces_[a] = nonce;
     }
 
-    uint64_t applied_height() const noexcept { return next_height_ - 1; }
-    uint64_t next_expected_height() const noexcept { return next_height_; }
-    size_t tracked_addresses() const noexcept { return balances_.size(); }
+    uint64_t applied_height() const noexcept {
+        return next_height_ - 1;
+    }
+    uint64_t next_expected_height() const noexcept {
+        return next_height_;
+    }
+    size_t tracked_addresses() const noexcept {
+        return balances_.size();
+    }
 
     /// Check if an address has ever been recorded in the state (even with 0 balance).
-    bool tracked_addresses_containing(const Address& a) const noexcept {
+    bool tracked_addresses_containing(const Address &a) const noexcept {
         return balances_.find(a) != balances_.end();
     }
 
@@ -614,27 +653,27 @@ public:
     /// re-applied height-1 GENESIS_2 mint would be refused forever because
     /// its receiver now counts as "already tracked". Returns true when an
     /// entry was erased.
-    bool forget_empty_address(const Address& a) {
+    bool forget_empty_address(const Address &a) {
         const auto it = balances_.find(a);
-        if (it == balances_.end() || !(it->second == U128{})) return false;
+        if (it == balances_.end() || !(it->second == U128{}))
+            return false;
         balances_.erase(it);
         return true;
     }
 
     /// Exposes the full active account map for RPC enumeration.
-    const std::unordered_map<Address, U128, AddressHash>& accounts() const noexcept {
+    const std::unordered_map<Address, U128, AddressHash> &accounts() const noexcept {
         return balances_;
     }
 
     /// Total atomics in circulation (sanity invariant against supply inflation).
     U128 total_supply() const noexcept {
         U128 sum{};
-        for (const auto& [addr, bal] : balances_) {
+        for (const auto &[addr, bal] : balances_) {
             // Checked accumulation: with per-sender intra-block debits
             // enforced in apply_block, balances cannot wrap - but this
             // sum must never silently mask a corrupted state either.
-            if (bal > U128(0xFFFFFFFFFFFFFFFFULL) ||
-                sum > U128(0xFFFFFFFFFFFFFFFFULL) - bal) {
+            if (bal > U128(0xFFFFFFFFFFFFFFFFULL) || sum > U128(0xFFFFFFFFFFFFFFFFULL) - bal) {
                 return U128(0xFFFFFFFFFFFFFFFFULL); // saturated: caller must treat as anomaly
             }
             sum = sum + bal;
@@ -648,15 +687,17 @@ public:
     /// (a 2^64-atom account is a valid state); the apply-integrity guard
     /// must never mistake that for corruption, so it sums here without the
     /// saturation and reports overflow through the return value instead.
-    bool exact_total_supply(U128& out) const noexcept {
+    bool exact_total_supply(U128 &out) const noexcept {
         U128 sum{};
-        for (const auto& [addr, bal] : balances_) {
+        for (const auto &[addr, bal] : balances_) {
             const uint64_t lo = sum.lo + bal.lo;
             const uint64_t carry = (lo < sum.lo) ? 1u : 0u;
             const uint64_t hi = sum.hi + bal.hi;
-            if (hi < sum.hi) return false; // 128-bit overflow
+            if (hi < sum.hi)
+                return false; // 128-bit overflow
             const uint64_t hi2 = hi + carry;
-            if (hi2 < hi) return false;    // 128-bit overflow via carry
+            if (hi2 < hi)
+                return false; // 128-bit overflow via carry
             sum = U128{lo, hi2};
         }
         out = sum;
@@ -664,11 +705,15 @@ public:
     }
 
     /// Total burned supply (TDI burn)
-    U128 total_burned() const noexcept { return burned_supply_; }
+    U128 total_burned() const noexcept {
+        return burned_supply_;
+    }
 
     /// Cumulative ISSUED supply (all coinbase credits minus fee-share
     /// re-credits) — the quantity the 7,000,000,000 VX cap bounds.
-    U128 issued_supply() const noexcept { return issued_supply_; }
+    U128 issued_supply() const noexcept {
+        return issued_supply_;
+    }
 
     /// Headroom left under the hard supply cap, in atoms. Producers clamp
     /// their coinbase to this so the last blocks of the emission window
@@ -693,12 +738,12 @@ public:
     }
 
     /// Renders an address with its NFA_V6_ prefix for display.
-    static std::string address_label(const Address& a) {
-        return "NFA_V6_" + std::string(reinterpret_cast<const char*>(a.data()), 42);
+    static std::string address_label(const Address &a) {
+        return "NFA_V6_" + std::string(reinterpret_cast<const char *>(a.data()), 42);
     }
 
     /// Rewind helper: adjust balance directly for reorg / undo
-    void adjust_balance(const Address& a, U128 delta, bool add) {
+    void adjust_balance(const Address &a, U128 delta, bool add) {
         if (add) {
             balances_[a] = balances_[a] + delta;
         } else {
@@ -718,9 +763,10 @@ public:
     /// and then spent within one block kept its spend as phantom balance
     /// after the reversal). Returns false when the ledger and the journal
     /// disagree (corruption): the caller must abort, not fabricate.
-    bool revert_balance_exact(const Address& a, const U128& amount) {
+    bool revert_balance_exact(const Address &a, const U128 &amount) {
         const auto it = balances_.find(a);
-        if (it == balances_.end() || it->second < amount) return false;
+        if (it == balances_.end() || it->second < amount)
+            return false;
         it->second = it->second - amount;
         return true;
     }
@@ -729,14 +775,17 @@ public:
     /// block's TDI burn (floor(total_fees / 2), recomputed from the undo
     /// record's fees — no format change) must leave the burned counter or
     /// a fork re-apply double-counts the burn. Returns false on mismatch.
-    bool revert_burned(const U128& amount) {
-        if (burned_supply_ < amount) return false;
+    bool revert_burned(const U128 &amount) {
+        if (burned_supply_ < amount)
+            return false;
         burned_supply_ = burned_supply_ - amount;
         return true;
     }
 
     /// Set height directly for reorg
-    void set_next_height(uint64_t h) noexcept { next_height_ = h; }
+    void set_next_height(uint64_t h) noexcept {
+        next_height_ = h;
+    }
 
 private:
     std::unordered_map<Address, U128, AddressHash> balances_;

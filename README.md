@@ -495,7 +495,7 @@ point is that it is *public*.
 
 ## Test suite
 
-36 ctest entries; all pass in **both** build editions:
+37 ctest entries; all pass in **both** build editions:
 
 | Target | Coverage |
 |---|---|
@@ -528,7 +528,9 @@ crash/recovery torture, the reorg carousel, ASERT retarget, RPC
 auth, C5 key import (fail-closed, constant-time), apply-path
 integrity, mempool admission, the VortexSponge1024 digest contract, and
 the VX2 generation-2 address format (own 135-bit BCH checksum, 6-symbol
-substitution guarantee - docs/ADDRESS_FORMATS_V2.md).
+substitution guarantee - docs/ADDRESS_FORMATS_V2.md), and the rollover
+certificate consensus wiring (`VortexPqRolloverWiringTest` - the
+sequential-chain acceptance policy, BACKLOG 1.5).
 
 ---
 
@@ -538,7 +540,7 @@ substitution guarantee - docs/ADDRESS_FORMATS_V2.md).
 include/vx/          public headers (blockchain, consensus, crypto, core,
                      math, net, rpc, state, storage, vm, wif)
 src/                 implementation, one directory per subsystem
-tests/               36 targets: 35 test suites (36 ctest entries,
+tests/               37 targets: 36 test suites (37 ctest entries,
                      GoogleTest + plain runners) + 1 manual benchmark
                      (bench_pq)
 web/                 React + TypeScript PWA console (+ Electron wrapper)

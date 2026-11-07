@@ -850,15 +850,105 @@ so a top-tree auth path cannot fit):
 
 Remaining (honest gaps, not hidden):
 
-- [ ] Consensus wiring: a rule for WHEN a rotated root is accepted
-  (certificate chain from the account's published window-0 root,
-  sequential-window policy, replay/rollback of certificates). Today
-  `PqWitnessRegistry` overwrites `sender_roots_` on every registration —
-  root rotation is silently accepted, which the certification chain must
-  replace.
+- [x] Consensus wiring (DELIVERED v0.0.18, owner-approved carrier B).
+  The implemented acceptance rule differs from the design-note sketch
+  below in ONE structural respect - it is STATELESS (no ledger state
+  change, no undo integration) and that difference is strictly safer:
+  a certificate does not MUTATE the account's bound root; instead
+  `LedgerState::apply_block` accepts a witness root that differs from
+  the bound anchor ONLY when `PqWitnessRegistry::advance_root_chain`
+  walks a sequential chain of FULLY VERIFIED certificates from the
+  anchor and its endpoint equals the witness root, with the witness's
+  `subtree_index` equal to the walked window. Reorg/rewind needs no
+  special handling because nothing was mutated: the walk re-derives
+  the same endpoint from the same anchor on any fork (deterministic
+  WOTS+ signing makes the valid certificate per (old_root, from, to)
+  transition UNIQUE, so the walk is deterministic).
 
-  DESIGN NOTE (2026-11-07, pre-implementation; consensus change ->
-  owner sign-off required before code):
+  Delivered pieces:
+  - `PqRolloverCert` record (sender, from_window, to_window, old_root,
+    new_root, leaf-15 witness) - the owner-decided carrier: wire type
+    `ROLLOVER_CERT = 0x0A` (VX60 format addition, old/new node
+    separation preserved: old nodes drop unknown types, fail-closed).
+  - `register_rollover_cert`: full verification BEFORE storage (leaf
+    15 of from_window, to == from + 1, both roots match the witness,
+    the commitment matches, `pq_verify_rollover` over the binding
+    digest of THIS tuple); dedup; per-sender (32) and per-map (50000)
+    caps; certificates alone never touch the `sender_roots_`
+    admission cache (pinned by test).
+  - `advance_root_chain`: deterministic walk from the anchor (window
+    0), capped at `PQ_MAX_CERT_CHAIN_DEPTH = 16`; a gap stops the walk
+    at the last unambiguous link; two DISTINCT candidates for one
+    transition stop it conservatively (a hash-function break, in
+    theory - never observed).
+  - `attach_durable_cert_log`: the `VXPQRT1` sidecar
+    (sender + windows + roots + witness), appended+fsync'd on every
+    accepted registration; replay RE-VERIFIES each record and stops at
+    the first failure (fail-closed: unlike the witness log - whose
+    entries are re-verified at USE time - a certificate entry is
+    consumed by the walk as a pre-verified fact, so a hand-corrupted
+    sidecar must not be able to plant a chain the walk would trust).
+    A torn TAIL (crash mid-append) is truncated back to the last
+    fully-read good record at replay, so honest records appended after
+    the tear are not stranded forever (review finding P2; the same fix
+    applied to the pre-existing witness sidecar).
+  - Leaf-15 exclusivity at USE time: `pq_verify_transaction` refuses
+    any witness with `leaf_index >= 15`, covering every path (client
+    registration, wire registration, consensus lookup) - the wallet
+    discipline (v0.0.15) is now also a consensus invariant.
+  - Tests: `VortexPqRolloverWiringTest` (chain walk determinism,
+    sequential policy, root substitution both ways, chain gap, depth
+    cap, admission-cache neutrality, durable sidecar replay,
+    leaf-15 mechanism) and three end-to-end ledger pins in
+    `VortexDocumentedGapsTest` (accepted rotation, uncertified
+    refusal, certificate-leaf spender refusal).
+
+  Still open under this item:
+
+- [ ] **P0 GATE (security review 2026-11-07, must close BEFORE any wallet
+  emits certificates)**: cert DELIVERY has no guarantee. Today a
+  certificate is fire-and-forget relay (`broadcast_rollover_cert`) and
+  nodes never backfill: a node that misses a relayed cert (connect
+  later, packet loss, restart with a pruned sidecar) fails
+  `apply_block` at the rotated block while its peers accept it -
+  permanent divergence, the failure the replay path cannot recover
+  from. The acceptance walk is only as consistent as the cert store
+  behind it. Required: a cert fetch/backfill protocol (cert INV +
+  GET_CERTS over VX60, replay-on-demand from the durable sidecar) and
+  a rule for which node relays which certs. While NO wallet emits
+  certificates the feature is inert and the hazard is unreachable -
+  which is exactly why this gate is pinned HERE, before the wallet
+  policy item can flip it on.
+- [ ] Wallet policy: when to roll over (window exhaustion), certificate
+  publication/relay (`broadcast_rollover_cert` exists at the wire
+  layer; the RPC/wallet trigger does not), and the post-rollover leaf
+  accounting - `pq_sign_transaction` still refuses windows above 0
+  because the durable leaf log records one byte per key root (leaf
+  index only), which cannot address window-1 leaves of the same key.
+  Widening that record format is a store-format change and goes
+  through the migration protocol; until then a rolled-over account
+  spends via explicit window/leaf signing (the e2e test path).
+- [ ] P3 (review 2026-11-07), format-bump candidates - NOT exploitable
+  today (the walk's anchor linkage and `derive_pq_address`
+  determinism make a transferred certificate inert; store pollution
+  only), pinned for the next wire-format revision: (a) the rollover
+  binding digest does not commit the SENDER address - a certificate
+  object is transferable between senders; commit sender in the digest
+  at the next format bump. (b) `from_window`/`to_window` cross the
+  wire as native-endian u32 (consistent with the frozen PQ_WITNESS
+  whole-struct memcpy; cross-endian peers fail closed on
+  `to != from + 1`, so the failure mode is liveness, not safety) -
+  pin a byte order before any big-endian host exists. (c) the
+  sidecar `fsync` runs under the registry mutex (pre-existing
+  witness-sidecar pattern); batching or a writer thread belongs to
+  the same future pass.
+
+  HISTORICAL DESIGN NOTE (2026-11-07, pre-implementation) - kept for
+  the record. Superseded: the state-mutation model and the undo-vector
+  mechanics below (replaced by the stateless walk described above).
+  Carried into the implementation: the leaf-15 policy, the sequential
+  one-window rule, the commitment-bound certificate, carrier B, and the
+  fail-closed refusal posture:
 
   - Today's posture: `LedgerState::bind_pq_sender` REFUSES a different
     root for an already-bound address, so a bound account is frozen at

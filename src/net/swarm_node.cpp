@@ -37,24 +37,49 @@ namespace vx::net {
 
 static constexpr uint64_t MAGIC = 0x58564336;
 
+// BACKLOG 1.5: the ROLLOVER_CERT wire payload - sender(42) + from_window(4)
+// + to_window(4) + old_root(32) + new_root(32) + witness(2376) = 2490 bytes.
+constexpr size_t kRolloverCertPayloadSize =
+    42 + 4 + 4 + 32 + 32 + sizeof(vx::crypto::pq::PqSignatureWitness);
+
+// Parse + REGISTER a received rollover certificate. The registry verifies
+// the FULL certificate object (leaf 15, sequential windows, both roots,
+// the commitment, the WOTS+/XMSS chain over the binding digest) before
+// storing - a hostile relay cannot plant anything unverified.
+void handle_rollover_cert_payload(const std::vector<uint8_t> &payload) {
+    if (payload.size() != kRolloverCertPayloadSize)
+        return;
+    vx::crypto::pq::PqRolloverCert cert;
+    std::memcpy(cert.sender.data(), payload.data(), 42);
+    std::memcpy(&cert.from_window, payload.data() + 42, 4);
+    std::memcpy(&cert.to_window, payload.data() + 46, 4);
+    std::memcpy(cert.old_root.data(), payload.data() + 50, 32);
+    std::memcpy(cert.new_root.data(), payload.data() + 82, 32);
+    std::memcpy(&cert.witness, payload.data() + 114, sizeof(cert.witness));
+    vx::crypto::pq::PqWitnessRegistry::instance().register_rollover_cert(cert);
+}
+
 // ── VX60 CRC32C (tiered: x86_64 SSE4.2 / aarch64 CRC32 / scalar) ────────────
 
-uint32_t compute_wire_crc32c(const uint8_t* data, size_t len) noexcept {
+uint32_t compute_wire_crc32c(const uint8_t *data, size_t len) noexcept {
     // Portable CRC32C from hw_intrinsics: hardware tiers when available,
     // bitwise Castagnoli fallback otherwise — identical value on all tiers.
     return vx::core::hw::crc32c(data, len);
 }
 
-bool wire_header_plausible(const WireHeader& h) noexcept {
-    if (h.magic != VX60_MAGIC) return false;
-    if (h.reserved != 0) return false;
-    if (h.payload_len > 65536) return false;
+bool wire_header_plausible(const WireHeader &h) noexcept {
+    if (h.magic != VX60_MAGIC)
+        return false;
+    if (h.reserved != 0)
+        return false;
+    if (h.payload_len > 65536)
+        return false;
     const uint8_t t = h.msg_type;
-    return t >= 0x01 && t <= 0x09; // 0x09 = PQ_WITNESS (BACKLOG 0.8)
+    return t >= 0x01 && t <= 0x0A; // 0x0A = ROLLOVER_CERT (BACKLOG 1.5)
 }
 
-WireHeader SwarmNode::make_header(WireMsgType type, uint32_t payload_len,
-                                  uint64_t nonce, uint8_t flags) noexcept {
+WireHeader SwarmNode::make_header(WireMsgType type, uint32_t payload_len, uint64_t nonce,
+                                  uint8_t flags) noexcept {
     WireHeader h{};
     h.magic = VX60_MAGIC;
     h.msg_type = static_cast<uint8_t>(type);
@@ -72,7 +97,7 @@ uint64_t PeerInfo::xor_distance() const {
     return node_id ^ SwarmNode::OUR_NODE_ID;
 }
 
-bool PeerInfo::operator<(const PeerInfo& other) const {
+bool PeerInfo::operator<(const PeerInfo &other) const {
     return xor_distance() < other.xor_distance();
 }
 
@@ -87,7 +112,8 @@ SwarmNode::~SwarmNode() {
 }
 
 void SwarmNode::start() {
-    if (running_.load()) return;
+    if (running_.load())
+        return;
     running_.store(true);
     emergency_stop_requested_.store(false);
 
@@ -112,10 +138,12 @@ void SwarmNode::emergency_stop() {
         std::lock_guard<std::mutex> lock(readers_mu_);
         readers_done.swap(peer_readers_);
     }
-    for (auto& t : readers_done)
-        if (t.joinable()) t.join();
+    for (auto &t : readers_done)
+        if (t.joinable())
+            t.join();
 
-    if (!was_running) return;
+    if (!was_running)
+        return;
 
     if (listen_fd_ >= 0) {
         ::shutdown(listen_fd_, SHUT_RDWR);
@@ -133,12 +161,16 @@ void SwarmNode::emergency_stop() {
         std::lock_guard<std::mutex> lock(handlers_mu_);
         handlers_done.swap(conn_handlers_);
     }
-    for (auto& t : handlers_done)
-        if (t.joinable()) t.join();
+    for (auto &t : handlers_done)
+        if (t.joinable())
+            t.join();
 
-    if (listener_thread_.joinable()) listener_thread_.join();
-    if (gossip_thread_.joinable()) gossip_thread_.join();
-    if (health_thread_.joinable()) health_thread_.join();
+    if (listener_thread_.joinable())
+        listener_thread_.join();
+    if (gossip_thread_.joinable())
+        gossip_thread_.join();
+    if (health_thread_.joinable())
+        health_thread_.join();
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
     peer_table_.clear();
@@ -146,27 +178,29 @@ void SwarmNode::emergency_stop() {
 
 void SwarmNode::close_all_peers() {
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    for (auto& [addr, fd] : peer_fds_) {
+    for (auto &[addr, fd] : peer_fds_) {
         // shutdown only: the owning reader/serve thread observes the
         // shutdown, exits and closes the fd itself. Closing here too would
         // double-close before the owner's close, and a recycled fd number
         // in between would make the owner kill an unrelated connection.
-        if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+        if (fd >= 0)
+            ::shutdown(fd, SHUT_RDWR);
     }
     peer_fds_.clear();
 }
 
 // ── TCP peer connections ────────────────────────────────────────────────────
 
-bool SwarmNode::connect_peer_tcp(const std::string& host, uint16_t port) {
+bool SwarmNode::connect_peer_tcp(const std::string &host, uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    if (fd < 0)
+        return false;
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1 ||
-        ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
         ::close(fd);
         std::cerr << "[Swarm] TCP connect " << host << ":" << port << " failed\n";
         return false;
@@ -183,8 +217,7 @@ bool SwarmNode::connect_peer_tcp(const std::string& host, uint16_t port) {
 
     // Handshake: announce ourselves so the remote listener promotes this
     // connection into its peer table (and can broadcast back over it).
-    WireHeader ping = make_header(WireMsgType::PING, 0,
-                                  session_nonce_.fetch_add(1));
+    WireHeader ping = make_header(WireMsgType::PING, 0, session_nonce_.fetch_add(1));
     ping.crc32c = compute_wire_crc32c(nullptr, 0);
     ssize_t n = ::send(fd, &ping, sizeof(ping), MSG_NOSIGNAL);
     if (n != static_cast<ssize_t>(sizeof(ping))) {
@@ -207,12 +240,14 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
     for (;;) {
         WireHeader hdr{};
         std::vector<uint8_t> payload;
-        if (!recv_packet(fd, hdr, payload)) break;
+        if (!recv_packet(fd, hdr, payload))
+            break;
         const auto type = static_cast<WireMsgType>(hdr.msg_type);
-        if (type == WireMsgType::PONG) continue; // keepalive reply
+        if (type == WireMsgType::PONG)
+            continue; // keepalive reply
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
             handle_incoming_frame(label,
-                std::span<const uint8_t, 65536>(payload.data(), payload.size()));
+                                  std::span<const uint8_t, 65536>(payload.data(), payload.size()));
             continue;
         }
         if (type == WireMsgType::PQ_WITNESS &&
@@ -223,6 +258,10 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             std::memcpy(digest.data(), payload.data(), 32);
             vx::crypto::pq::PqWitnessRegistry::instance().register_witness_bytes(
                 digest, payload.data() + 32, w);
+            continue;
+        }
+        if (type == WireMsgType::ROLLOVER_CERT) {
+            handle_rollover_cert_payload(payload);
             continue;
         }
         break; // unexpected message type: drop the connection
@@ -252,30 +291,33 @@ void SwarmNode::add_loopback_peer() {
     peer_table_.insert(loopback);
 }
 
-bool SwarmNode::connect_to_peer(const PeerInfo& peer) {
+bool SwarmNode::connect_to_peer(const PeerInfo &peer) {
     (void)peer;
     // Real TCP connections go through connect_peer_tcp(); virtual mesh peers
     // (10.0.0.x simulation range) remain bookkeeping-only.
     return true;
 }
 
-void SwarmNode::disconnect_from_peer(const PeerInfo& peer) {
+void SwarmNode::disconnect_from_peer(const PeerInfo &peer) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto it = peer_fds_.find(peer.address);
     if (it != peer_fds_.end()) {
-        if (it->second >= 0) ::close(it->second);
+        if (it->second >= 0)
+            ::close(it->second);
         peer_fds_.erase(it);
     }
 }
 
 // ── Wire send / recv ────────────────────────────────────────────────────────
 
-uint64_t SwarmNode::send_packet(int fd, const WireHeader& hdr, const uint8_t* payload) {
-    if (fd < 0) return 0;
+uint64_t SwarmNode::send_packet(int fd, const WireHeader &hdr, const uint8_t *payload) {
+    if (fd < 0)
+        return 0;
 
     // Header goes out with crc32c already filled by the caller.
     ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-    if (n != static_cast<ssize_t>(sizeof(hdr))) return 0;
+    if (n != static_cast<ssize_t>(sizeof(hdr)))
+        return 0;
 
     uint64_t total = sizeof(hdr);
     if (hdr.payload_len > 0 && payload) {
@@ -283,7 +325,8 @@ uint64_t SwarmNode::send_packet(int fd, const WireHeader& hdr, const uint8_t* pa
         while (off < hdr.payload_len) {
             n = ::send(fd, payload + off, hdr.payload_len - off, MSG_NOSIGNAL);
             if (n <= 0) {
-                if (n < 0 && (errno == EINTR)) continue;
+                if (n < 0 && (errno == EINTR))
+                    continue;
                 return 0;
             }
             off += static_cast<size_t>(n);
@@ -294,16 +337,18 @@ uint64_t SwarmNode::send_packet(int fd, const WireHeader& hdr, const uint8_t* pa
     return total;
 }
 
-bool SwarmNode::recv_packet(int fd, WireHeader& hdr, std::vector<uint8_t>& payload) {
-    if (fd < 0) return false;
+bool SwarmNode::recv_packet(int fd, WireHeader &hdr, std::vector<uint8_t> &payload) {
+    if (fd < 0)
+        return false;
 
     // Read exactly 24 bytes of header
     size_t got = 0;
-    auto* hdr_bytes = reinterpret_cast<uint8_t*>(&hdr);
+    auto *hdr_bytes = reinterpret_cast<uint8_t *>(&hdr);
     while (got < sizeof(hdr)) {
         ssize_t n = ::recv(fd, hdr_bytes + got, sizeof(hdr) - got, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR)
+                continue;
             return false;
         }
         got += static_cast<size_t>(n);
@@ -320,7 +365,8 @@ bool SwarmNode::recv_packet(int fd, WireHeader& hdr, std::vector<uint8_t>& paylo
     while (off < hdr.payload_len) {
         ssize_t n = ::recv(fd, payload.data() + off, hdr.payload_len - off, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR)
+                continue;
             return false;
         }
         off += static_cast<size_t>(n);
@@ -337,16 +383,18 @@ bool SwarmNode::recv_packet(int fd, WireHeader& hdr, std::vector<uint8_t>& paylo
 // ── Zero-copy block streaming (sendfile) ────────────────────────────────────
 
 bool SwarmNode::send_block_zero_copy(int socket_fd, int ledger_fd, uint64_t block_height,
-                                     const uint8_t* block_data) {
-    if (socket_fd < 0) return false;
+                                     const uint8_t *block_data) {
+    if (socket_fd < 0)
+        return false;
 
-    WireHeader hdr = make_header(WireMsgType::RAW_BLOCK_64K, 65536,
-                                 session_nonce_.fetch_add(1), WIRE_FLAG_ZERO_COPY);
+    WireHeader hdr = make_header(WireMsgType::RAW_BLOCK_64K, 65536, session_nonce_.fetch_add(1),
+                                 WIRE_FLAG_ZERO_COPY);
     hdr.crc32c = 0; // payload is streamed zero-copy; CRC covers header itself
 
     // 1. 24-byte header
     ssize_t n = ::send(socket_fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-    if (n != static_cast<ssize_t>(sizeof(hdr))) return false;
+    if (n != static_cast<ssize_t>(sizeof(hdr)))
+        return false;
 
     uint64_t sent = sizeof(hdr);
     bool zero_copy = false;
@@ -359,7 +407,8 @@ bool SwarmNode::send_block_zero_copy(int socket_fd, int ledger_fd, uint64_t bloc
         while (remaining > 0) {
             ssize_t s = ::sendfile(socket_fd, ledger_fd, &offset, remaining);
             if (s <= 0) {
-                if (s < 0 && errno == EINTR) continue;
+                if (s < 0 && errno == EINTR)
+                    continue;
                 zero_copy = false;
                 break;
             }
@@ -374,7 +423,8 @@ bool SwarmNode::send_block_zero_copy(int socket_fd, int ledger_fd, uint64_t bloc
         while (off < 65536) {
             ssize_t s = ::send(socket_fd, block_data + off, 65536 - off, MSG_NOSIGNAL);
             if (s <= 0) {
-                if (s < 0 && errno == EINTR) continue;
+                if (s < 0 && errno == EINTR)
+                    continue;
                 return false;
             }
             sent += static_cast<uint64_t>(s);
@@ -385,25 +435,29 @@ bool SwarmNode::send_block_zero_copy(int socket_fd, int ledger_fd, uint64_t bloc
     }
 
     zero_copy_bytes_sent_.fetch_add(sent);
-    if (sent >= 24 + 65536) zero_copy_blocks_streamed_.fetch_add(1);
+    if (sent >= 24 + 65536)
+        zero_copy_blocks_streamed_.fetch_add(1);
     vx60_bytes_transferred_.fetch_add(sent);
     return true;
 }
 
 // ── Frame broadcast / handling ──────────────────────────────────────────────
 
-bool SwarmNode::send_frame_to_peer(int fd, const std::span<const uint8_t, 65536>& frame) {
-    if (fd < 0) return false;
-    WireHeader hdr = make_header(WireMsgType::RAW_BLOCK_64K, 65536,
-                                 session_nonce_.fetch_add(1), WIRE_FLAG_ZERO_COPY);
+bool SwarmNode::send_frame_to_peer(int fd, const std::span<const uint8_t, 65536> &frame) {
+    if (fd < 0)
+        return false;
+    WireHeader hdr = make_header(WireMsgType::RAW_BLOCK_64K, 65536, session_nonce_.fetch_add(1),
+                                 WIRE_FLAG_ZERO_COPY);
     hdr.crc32c = compute_wire_crc32c(frame.data(), frame.size());
     ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-    if (n != static_cast<ssize_t>(sizeof(hdr))) return false;
+    if (n != static_cast<ssize_t>(sizeof(hdr)))
+        return false;
     size_t off = 0;
     while (off < frame.size()) {
         n = ::send(fd, frame.data() + off, frame.size() - off, MSG_NOSIGNAL);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR)
+                continue;
             return false;
         }
         off += static_cast<size_t>(n);
@@ -412,7 +466,7 @@ bool SwarmNode::send_frame_to_peer(int fd, const std::span<const uint8_t, 65536>
     return true;
 }
 
-void SwarmNode::broadcast_frame(const std::span<const uint8_t, 65536>& frame) {
+void SwarmNode::broadcast_frame(const std::span<const uint8_t, 65536> &frame) {
     // Snapshot the peer fds under the lock, send OUTSIDE it: a blocking
     // ::send to a stalled peer (full TCP window) must never hold
     // peers_mutex_ - that would freeze health_loop, disconnect_from_peer
@@ -421,26 +475,27 @@ void SwarmNode::broadcast_frame(const std::span<const uint8_t, 65536>& frame) {
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         fds.reserve(peer_fds_.size());
-        for (const auto& [addr, fd] : peer_fds_) {
+        for (const auto &[addr, fd] : peer_fds_) {
             (void)addr;
             fds.push_back(fd);
         }
     }
-    for (int fd : fds) send_frame_to_peer(fd, frame);
+    for (int fd : fds)
+        send_frame_to_peer(fd, frame);
 }
 
 // BACKLOG 0.8: witnesses travel as their own wire message so a receiving
 // node can verify the block's user transactions on arrival (the 64 KiB
 // frame has no spare bytes — the witness rides beside the frame, never
 // inside it).
-void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536>& frame) {
-    auto* raw = reinterpret_cast<const blockchain::RawBlock*>(frame.data());
-    const uint32_t count = raw->header.tx_count > blockchain::MAX_TX_PER_BLOCK
-                               ? 0u : raw->header.tx_count;
+void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536> &frame) {
+    auto *raw = reinterpret_cast<const blockchain::RawBlock *>(frame.data());
+    const uint32_t count =
+        raw->header.tx_count > blockchain::MAX_TX_PER_BLOCK ? 0u : raw->header.tx_count;
     std::vector<std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)>> payloads;
     for (uint32_t i = 0; i < count; ++i) {
-        const blockchain::Transaction& tx = raw->transactions[i];
-        const char* s = reinterpret_cast<const char*>(tx.sender_nfa);
+        const blockchain::Transaction &tx = raw->transactions[i];
+        const char *s = reinterpret_cast<const char *>(tx.sender_nfa);
         if (std::strncmp(s, "GENESIS", 7) == 0 || std::strncmp(s, "MINER_", 6) == 0)
             continue; // system senders carry no witness
         const auto digest = vx::crypto::pq::tx_msg_digest(tx);
@@ -459,24 +514,26 @@ void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536>& f
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         fds.reserve(peer_fds_.size());
-        for (const auto& [addr, fd] : peer_fds_) {
+        for (const auto &[addr, fd] : peer_fds_) {
             (void)addr;
             fds.push_back(fd);
         }
     }
     for (int fd : fds) {
-        for (const auto& payload : payloads) {
-            WireHeader hdr = make_header(WireMsgType::PQ_WITNESS,
-                                         static_cast<uint32_t>(payload.size()),
-                                         session_nonce_.fetch_add(1));
+        for (const auto &payload : payloads) {
+            WireHeader hdr =
+                make_header(WireMsgType::PQ_WITNESS, static_cast<uint32_t>(payload.size()),
+                            session_nonce_.fetch_add(1));
             hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
             ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-            if (n != static_cast<ssize_t>(sizeof(hdr))) break;
+            if (n != static_cast<ssize_t>(sizeof(hdr)))
+                break;
             size_t off = 0;
             while (off < payload.size()) {
                 n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
                 if (n <= 0) {
-                    if (n < 0 && errno == EINTR) continue;
+                    if (n < 0 && errno == EINTR)
+                        continue;
                     break;
                 }
                 off += static_cast<size_t>(n);
@@ -485,21 +542,67 @@ void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536>& f
     }
 }
 
+// BACKLOG 1.5: relay a certified one-window key rotation. Payload layout
+// mirrors handle_rollover_cert_payload; the receiver re-verifies the FULL
+// certificate object before storing, so relay is fire-and-forget here.
+void SwarmNode::broadcast_rollover_cert(const vx::crypto::pq::PqRolloverCert &cert) {
+    std::array<uint8_t, kRolloverCertPayloadSize> payload{};
+    std::memcpy(payload.data(), cert.sender.data(), 42);
+    std::memcpy(payload.data() + 42, &cert.from_window, 4);
+    std::memcpy(payload.data() + 46, &cert.to_window, 4);
+    std::memcpy(payload.data() + 50, cert.old_root.data(), 32);
+    std::memcpy(payload.data() + 82, cert.new_root.data(), 32);
+    std::memcpy(payload.data() + 114, &cert.witness, sizeof(cert.witness));
+    // Snapshot + send outside the lock (same reasoning as broadcast_frame);
+    // a short header send desyncs the peer's stream, so it is fatal there.
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        fds.reserve(peer_fds_.size());
+        for (const auto &[addr, fd] : peer_fds_) {
+            (void)addr;
+            fds.push_back(fd);
+        }
+    }
+    for (int fd : fds) {
+        WireHeader hdr =
+            make_header(WireMsgType::ROLLOVER_CERT, static_cast<uint32_t>(payload.size()),
+                        session_nonce_.fetch_add(1));
+        hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
+        ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
+        if (n != static_cast<ssize_t>(sizeof(hdr)))
+            continue;
+        size_t off = 0;
+        while (off < payload.size()) {
+            n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR)
+                    continue;
+                break;
+            }
+            off += static_cast<size_t>(n);
+        }
+    }
+}
+
 void SwarmNode::set_frame_hook(FrameHook hook) {
     frame_hook_ = std::move(hook);
 }
 
-void SwarmNode::handle_incoming_frame(const std::string& from_peer, const std::span<const uint8_t, 65536>& frame) {
+void SwarmNode::handle_incoming_frame(const std::string &from_peer,
+                                      const std::span<const uint8_t, 65536> &frame) {
     if (!verify_frame(frame)) {
         ban_peer(from_peer, 100);
         return;
     }
-    if (frame_hook_) frame_hook_(frame.data(), frame.size());
+    if (frame_hook_)
+        frame_hook_(frame.data(), frame.size());
     // Further block-relay policy (apply / re-broadcast) lives in the hook.
 }
 
-bool SwarmNode::verify_frame(const std::span<const uint8_t, 65536>& frame) {
-    if (frame.size() < 4) return false;
+bool SwarmNode::verify_frame(const std::span<const uint8_t, 65536> &frame) {
+    if (frame.size() < 4)
+        return false;
     uint32_t magic;
     std::memcpy(&magic, frame.data(), 4);
     return magic == blockchain::BLOCK_MAGIC;
@@ -507,13 +610,14 @@ bool SwarmNode::verify_frame(const std::span<const uint8_t, 65536>& frame) {
 
 // ── Peer reputation ─────────────────────────────────────────────────────────
 
-void SwarmNode::ban_peer(const std::string& address, int score_increment) {
+void SwarmNode::ban_peer(const std::string &address, int score_increment) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     for (auto it = peer_table_.begin(); it != peer_table_.end(); ++it) {
         if (it->address == address) {
             PeerInfo peer = *it;
             peer.dos_score += score_increment;
-            if (peer.dos_score >= 100) peer.is_banned = true;
+            if (peer.dos_score >= 100)
+                peer.is_banned = true;
             peer_table_.erase(it);
             peer_table_.insert(peer);
             return;
@@ -522,7 +626,7 @@ void SwarmNode::ban_peer(const std::string& address, int score_increment) {
 }
 
 void SwarmNode::simulate_fork() {
- // replaces this with the full live split-brain cycle via
+    // replaces this with the full live split-brain cycle via
     // simulate_live_split_brain_reorg(). Kept as a legacy no-op marker.
     std::cout << "[Swarm] legacy simulate_fork() — use simulate_live_split_brain_reorg()\n";
 }
@@ -543,7 +647,7 @@ void SwarmNode::inject_rogue_peer() {
     peer_table_.insert(rogue);
 }
 
-void SwarmNode::resolve_fork(const PeerInfo& challenger) {
+void SwarmNode::resolve_fork(const PeerInfo &challenger) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     std::cout << "[Swarm] Fork resolved: keeping heaviest work" << std::endl;
 }
@@ -552,15 +656,15 @@ void SwarmNode::resolve_fork(const PeerInfo& challenger) {
 
 bool SwarmNode::bind_p2p_listener(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return false;
+    if (fd < 0)
+        return false;
     int opt = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 ||
-        ::listen(fd, 8) < 0) {
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0 || ::listen(fd, 8) < 0) {
         ::close(fd);
         return false;
     }
@@ -573,7 +677,8 @@ bool SwarmNode::bind_p2p_listener(uint16_t port) {
 
 void SwarmNode::shutdown_accepted() {
     std::lock_guard<std::mutex> lock(accepted_mu_);
-    for (int fd : accepted_fds_) ::shutdown(fd, SHUT_RDWR);
+    for (int fd : accepted_fds_)
+        ::shutdown(fd, SHUT_RDWR);
 }
 
 void SwarmNode::listener_loop() {
@@ -584,8 +689,10 @@ void SwarmNode::listener_loop() {
         }
         int c = ::accept(listen_fd_, nullptr, nullptr);
         if (c < 0) {
-            if (errno == EINTR) continue;
-            if (emergency_stop_requested_.load()) break;
+            if (errno == EINTR)
+                continue;
+            if (emergency_stop_requested_.load())
+                break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
@@ -620,11 +727,12 @@ void SwarmNode::serve_connection(int c) {
     std::string peer_label = "loopback";
     bool registered = false;
     auto promote = [&]() {
-        if (registered) return;
+        if (registered)
+            return;
         sockaddr_in sa{};
         socklen_t sl = sizeof(sa);
         uint16_t rport = 0;
-        if (::getpeername(c, reinterpret_cast<sockaddr*>(&sa), &sl) == 0) {
+        if (::getpeername(c, reinterpret_cast<sockaddr *>(&sa), &sl) == 0) {
             char ip[INET_ADDRSTRLEN] = {0};
             ::inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof(ip));
             rport = ntohs(sa.sin_port);
@@ -643,12 +751,12 @@ void SwarmNode::serve_connection(int c) {
     for (;;) {
         WireHeader hdr{};
         std::vector<uint8_t> payload;
-        if (!recv_packet(c, hdr, payload)) break;
+        if (!recv_packet(c, hdr, payload))
+            break;
         const auto type = static_cast<WireMsgType>(hdr.msg_type);
         if (type == WireMsgType::PING) {
             promote();
-            WireHeader pong = make_header(WireMsgType::PONG, 0,
-                                          session_nonce_.fetch_add(1));
+            WireHeader pong = make_header(WireMsgType::PONG, 0, session_nonce_.fetch_add(1));
             pong.crc32c = compute_wire_crc32c(nullptr, 0);
             ::send(c, &pong, sizeof(pong), MSG_NOSIGNAL);
             continue;
@@ -656,7 +764,7 @@ void SwarmNode::serve_connection(int c) {
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
             promote();
             handle_incoming_frame(peer_label,
-                std::span<const uint8_t, 65536>(payload.data(), payload.size()));
+                                  std::span<const uint8_t, 65536>(payload.data(), payload.size()));
             continue;
         }
         if (type == WireMsgType::PQ_WITNESS &&
@@ -670,13 +778,21 @@ void SwarmNode::serve_connection(int c) {
                 digest, payload.data() + 32, w);
             continue;
         }
+        if (type == WireMsgType::ROLLOVER_CERT) {
+            promote();
+            handle_rollover_cert_payload(payload);
+            continue;
+        }
         break;
     }
     if (registered) {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         peer_fds_.erase(peer_label);
         for (auto it = peer_table_.begin(); it != peer_table_.end(); ++it) {
-            if (it->address == peer_label) { peer_table_.erase(it); break; }
+            if (it->address == peer_label) {
+                peer_table_.erase(it);
+                break;
+            }
         }
     }
     {
@@ -732,7 +848,8 @@ void SwarmNode::health_loop() {
         for (int fd : banned_fds) {
             // shutdown only: the owning reader/serve thread wakes, tears down
             // its state and closes the fd exactly once (see comment above).
-            if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
+            if (fd >= 0)
+                ::shutdown(fd, SHUT_RDWR);
         }
         for (int i = 0; i < 50 && !emergency_stop_requested_.load(); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -748,9 +865,9 @@ std::vector<PeerInfo> SwarmNode::get_peer_table() const {
 
 namespace {
 
+using blockchain::BlockBuilder;
 using blockchain::BlockFrame;
 using blockchain::BlockView;
-using blockchain::BlockBuilder;
 using blockchain::Transaction;
 using state::LedgerState;
 using storage::BlockStore;
@@ -762,7 +879,8 @@ constexpr uint64_t SB_BLOCK_BYTES = 65536;
 uint64_t work_of_heights(uint64_t blocks_mined) {
     // Monotone synthetic cumulative work: each block adds (height+1)*1e6.
     uint64_t w = 0;
-    for (uint64_t i = 1; i <= blocks_mined; ++i) w += i * 1'000'000ULL;
+    for (uint64_t i = 1; i <= blocks_mined; ++i)
+        w += i * 1'000'000ULL;
     return w;
 }
 
@@ -776,30 +894,34 @@ struct SimNode {
     std::unique_ptr<vx::state::UndoEngine> undo;
     uint64_t cumulative_pogw = 0;
 
-    SimNode(const std::string& dir, const std::string& genesis_path) : data_dir(dir) {
+    SimNode(const std::string &dir, const std::string &genesis_path) : data_dir(dir) {
         std::filesystem::create_directories(dir);
         const std::string ledger_path = dir + "/ledger.vxb";
         std::filesystem::remove(ledger_path); // fresh partition state each run
-        store = std::make_unique<BlockStore>(ledger_path, genesis_path, 1); // sim: difficulty-1 PoGW
+        store =
+            std::make_unique<BlockStore>(ledger_path, genesis_path, 1); // sim: difficulty-1 PoGW
         ledger = std::make_unique<LedgerState>();
         undo = std::make_unique<vx::state::UndoEngine>(dir, *store, *ledger);
         // Apply genesis to state (journal entry stays in memory for O(1) undo)
-        auto* g = store->get_block(0);
+        auto *g = store->get_block(0);
         if (g) {
             BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(
-                reinterpret_cast<const uint8_t*>(g), SB_BLOCK_BYTES)};
+                reinterpret_cast<const uint8_t *>(g), SB_BLOCK_BYTES)};
             ledger->apply_block(v);
             undo->apply_block(v);
         }
     }
 
-    uint64_t height() const { return store->chain_height() - 1; }
+    uint64_t height() const {
+        return store->chain_height() - 1;
+    }
 
     std::string tip_hex() const {
         uint8_t h[32];
         store->tip_hash(h);
         std::ostringstream oss;
-        for (uint8_t b : h) oss << std::hex << std::setw(2) << std::setfill('0') << int(b);
+        for (uint8_t b : h)
+            oss << std::hex << std::setw(2) << std::setfill('0') << int(b);
         return oss.str();
     }
 
@@ -812,11 +934,13 @@ struct SimNode {
 
             Transaction cb{};
             vx::blockchain::set_nfa_field(cb.sender_nfa, "MINER_");
-            for (size_t k = 6; k < 42; ++k) cb.sender_nfa[k] = '0';
+            for (size_t k = 6; k < 42; ++k)
+                cb.sender_nfa[k] = '0';
             vx::blockchain::set_nfa_field(cb.receiver_nfa, "MINER_REWARD_ADDR_SPLIT_BRAIN_SIM");
-            for (size_t k = 35; k < 42; ++k) cb.receiver_nfa[k] = '0';
+            for (size_t k = 35; k < 42; ++k)
+                cb.receiver_nfa[k] = '0';
             blockchain::tx_set_amount(cb, 1'000'000ULL * (h + 1)); // distinct per height
-            blockchain::set_coinbase_binding(cb, h, tip); // chain-position binding
+            blockchain::set_coinbase_binding(cb, h, tip);          // chain-position binding
 
             BlockBuilder b;
             b.set_height(h);
@@ -829,15 +953,17 @@ struct SimNode {
             BlockFrame frame;
             auto fv = b.bytes();
             std::memcpy(frame.data(), fv.data(), SB_BLOCK_BYTES);
-            auto* raw = reinterpret_cast<blockchain::RawBlock*>(frame.data());
+            auto *raw = reinterpret_cast<blockchain::RawBlock *>(frame.data());
             uint64_t nonce = 0;
             while (true) {
                 raw->tail.pogw_nonce = nonce++;
                 uint8_t hash[32];
                 blockchain::VortexSponge256::compute(frame.data(), SB_BLOCK_BYTES, hash);
-                if (hash[0] == 0) break;
+                if (hash[0] == 0)
+                    break;
             }
-            if (!store->append_block(frame)) break;
+            if (!store->append_block(frame))
+                break;
 
             BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(frame.data(), SB_BLOCK_BYTES)};
             undo->apply_block(v);
@@ -849,18 +975,20 @@ struct SimNode {
 };
 
 // Send one 65536-byte block over VX60 RAW_BLOCK_64K with a real 24B header.
-uint64_t vx60_send_block(int fd, uint64_t peer_nonce_base, const uint8_t* frame) {
-    WireHeader hdr = SwarmNode::make_header(WireMsgType::RAW_BLOCK_64K, SB_BLOCK_BYTES,
-                                            peer_nonce_base);
+uint64_t vx60_send_block(int fd, uint64_t peer_nonce_base, const uint8_t *frame) {
+    WireHeader hdr =
+        SwarmNode::make_header(WireMsgType::RAW_BLOCK_64K, SB_BLOCK_BYTES, peer_nonce_base);
     hdr.crc32c = compute_wire_crc32c(frame, SB_BLOCK_BYTES);
     ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-    if (n != static_cast<ssize_t>(sizeof(hdr))) return 0;
+    if (n != static_cast<ssize_t>(sizeof(hdr)))
+        return 0;
     size_t off = 0;
     uint64_t total = sizeof(hdr);
     while (off < SB_BLOCK_BYTES) {
         n = ::send(fd, frame + off, SB_BLOCK_BYTES - off, MSG_NOSIGNAL);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR)
+                continue;
             return 0;
         }
         off += static_cast<size_t>(n);
@@ -870,14 +998,15 @@ uint64_t vx60_send_block(int fd, uint64_t peer_nonce_base, const uint8_t* frame)
 }
 
 // Receive one VX60 packet; validates magic + CRC32C; drops on corruption.
-bool vx60_recv_packet(int fd, WireHeader& hdr, std::vector<uint8_t>& payload,
-                      uint64_t& dropped_counter) {
+bool vx60_recv_packet(int fd, WireHeader &hdr, std::vector<uint8_t> &payload,
+                      uint64_t &dropped_counter) {
     size_t got = 0;
-    auto* p = reinterpret_cast<uint8_t*>(&hdr);
+    auto *p = reinterpret_cast<uint8_t *>(&hdr);
     while (got < sizeof(hdr)) {
         ssize_t n = ::recv(fd, p + got, sizeof(hdr) - got, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR)
+                continue;
             return false;
         }
         got += static_cast<size_t>(n);
@@ -891,7 +1020,8 @@ bool vx60_recv_packet(int fd, WireHeader& hdr, std::vector<uint8_t>& payload,
     while (off < hdr.payload_len) {
         ssize_t n = ::recv(fd, payload.data() + off, hdr.payload_len - off, 0);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR)
+                continue;
             return false;
         }
         off += static_cast<size_t>(n);
@@ -919,16 +1049,20 @@ std::vector<uint8_t> handshake_payload(uint64_t height, uint64_t work, const uin
 // remove_all on every exit path — early returns, exceptions, success.
 class TempDirGuard {
 public:
-    explicit TempDirGuard(std::string path) : path_(std::move(path)) {}
+    explicit TempDirGuard(std::string path) : path_(std::move(path)) {
+    }
     ~TempDirGuard() {
         if (armed_) {
             std::error_code ec;
             std::filesystem::remove_all(path_, ec);
         }
     }
-    TempDirGuard(const TempDirGuard&) = delete;
-    TempDirGuard& operator=(const TempDirGuard&) = delete;
-    const std::string& path() const { return path_; }
+    TempDirGuard(const TempDirGuard &) = delete;
+    TempDirGuard &operator=(const TempDirGuard &) = delete;
+    const std::string &path() const {
+        return path_;
+    }
+
 private:
     std::string path_;
     bool armed_ = true;
@@ -945,9 +1079,10 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
         // remove/create window. Use a per-process directory, refuse a
         // planted symlink, and create the final component EXCLUSIVELY so a
         // racing plant loses.
-        const std::string base = (std::filesystem::temp_directory_path() /
-            ("vx_split_brain-" + std::to_string(static_cast<long>(::getpid()))))
-            .string();
+        const std::string base =
+            (std::filesystem::temp_directory_path() /
+             ("vx_split_brain-" + std::to_string(static_cast<long>(::getpid()))))
+                .string();
         std::error_code fs_ec;
         const auto st = std::filesystem::symlink_status(base, fs_ec);
         if (!fs_ec && st.type() == std::filesystem::file_type::symlink) {
@@ -960,7 +1095,8 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
         if (fs_ec || !created) {
             // A real error, or the path already existed again (raced plant):
             // refuse rather than write into an attacker-chosen directory.
-            report.error = "split-brain temp dir could not be created exclusively: " + fs_ec.message();
+            report.error =
+                "split-brain temp dir could not be created exclusively: " + fs_ec.message();
             return report;
         }
         // P2-4: owner-private sandbox regardless of umask — and round-2
@@ -978,8 +1114,8 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
         struct stat fd_sb{};
         struct stat path_sb{};
         const bool identity_ok = ::fstat(dirfd, &fd_sb) == 0 &&
-                                 ::stat(base.c_str(), &path_sb) == 0 &&
-                                 S_ISDIR(fd_sb.st_mode) && fd_sb.st_ino == path_sb.st_ino;
+                                 ::stat(base.c_str(), &path_sb) == 0 && S_ISDIR(fd_sb.st_mode) &&
+                                 fd_sb.st_ino == path_sb.st_ino;
         if (!identity_ok || ::fchmod(dirfd, 0700) != 0) {
             report.error = "split-brain temp dir identity check or chmod 0700 failed";
             ::close(dirfd);
@@ -992,7 +1128,7 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
         const std::string genesis_path = "genesis.bin";
         try {
             blockchain::ensure_genesis_file(genesis_path);
-        } catch (const std::exception& e) {
+        } catch (const std::exception &e) {
             report.error = std::string("cannot regenerate genesis.bin: ") + e.what();
             return report;
         }
@@ -1001,15 +1137,15 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
         SimNode node_a(base + "/node_a", genesis_path);
         SimNode node_b(base + "/node_b", genesis_path);
 
-  // ── Partition (no communication) ──────────────────────────
-        report.node_a_work = node_a.mine(2);  // Node A: 2 blocks (less work)
-        report.node_b_work = node_b.mine(4);  // Node B: 4 blocks (more work)
+        // ── Partition (no communication) ──────────────────────────
+        report.node_a_work = node_a.mine(2); // Node A: 2 blocks (less work)
+        report.node_b_work = node_b.mine(4); // Node B: 4 blocks (more work)
         report.node_a_height = node_a.height();
         report.node_b_height = node_b.height();
         report.node_a_tip_hex = node_a.tip_hex();
         report.node_b_tip_hex = node_b.tip_hex();
 
-  // ── Heal — real VX60 TCP loopback ─────────────────────────
+        // ── Heal — real VX60 TCP loopback ─────────────────────────
         int srv = ::socket(AF_INET, SOCK_STREAM, 0);
         int cfd = -1, bfd = -1;
         if (srv < 0) {
@@ -1022,25 +1158,23 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port = 0; // ephemeral
-        if (::bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0 ||
+        if (::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0 ||
             ::listen(srv, 1) < 0) {
             ::close(srv);
             report.error = "bind/listen failed";
             return report;
         }
         socklen_t alen = sizeof(addr);
-        ::getsockname(srv, reinterpret_cast<sockaddr*>(&addr), &alen);
+        ::getsockname(srv, reinterpret_cast<sockaddr *>(&addr), &alen);
         const uint16_t port = ntohs(addr.sin_port);
 
-        std::thread acceptor([&]() {
-            bfd = ::accept(srv, nullptr, nullptr);
-        });
+        std::thread acceptor([&]() { bfd = ::accept(srv, nullptr, nullptr); });
         cfd = ::socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in ca{};
         ca.sin_family = AF_INET;
         ca.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         ca.sin_port = htons(port);
-        if (::connect(cfd, reinterpret_cast<sockaddr*>(&ca), sizeof(ca)) < 0) {
+        if (::connect(cfd, reinterpret_cast<sockaddr *>(&ca), sizeof(ca)) < 0) {
             report.error = "connect failed";
             acceptor.join();
             ::close(srv);
@@ -1048,7 +1182,8 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
         }
         acceptor.join();
         if (bfd < 0) {
-            ::close(cfd); ::close(srv);
+            ::close(cfd);
+            ::close(srv);
             report.error = "accept failed";
             return report;
         }
@@ -1060,9 +1195,9 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             uint8_t tip[32];
             node_a.store->tip_hash(tip);
             auto p = handshake_payload(node_a.height(), node_a.cumulative_pogw, tip);
-            WireHeader h = SwarmNode::make_header(WireMsgType::HANDSHAKE,
-                                                  static_cast<uint32_t>(p.size()),
-                                                  session_nonce_.fetch_add(1));
+            WireHeader h =
+                SwarmNode::make_header(WireMsgType::HANDSHAKE, static_cast<uint32_t>(p.size()),
+                                       session_nonce_.fetch_add(1));
             h.crc32c = compute_wire_crc32c(p.data(), p.size());
             bytes_total += send_packet(bfd, h, p.data());
         }
@@ -1071,9 +1206,9 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             uint8_t tip[32];
             node_b.store->tip_hash(tip);
             auto p = handshake_payload(node_b.height(), node_b.cumulative_pogw, tip);
-            WireHeader h = SwarmNode::make_header(WireMsgType::HANDSHAKE,
-                                                  static_cast<uint32_t>(p.size()),
-                                                  session_nonce_.fetch_add(1));
+            WireHeader h =
+                SwarmNode::make_header(WireMsgType::HANDSHAKE, static_cast<uint32_t>(p.size()),
+                                       session_nonce_.fetch_add(1));
             h.crc32c = compute_wire_crc32c(p.data(), p.size());
             bytes_total += send_packet(cfd, h, p.data());
         }
@@ -1084,25 +1219,28 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             uint64_t dropped = 0;
             if (!vx60_recv_packet(cfd, rh, rp, dropped)) {
                 corrupted_packets_dropped_.fetch_add(dropped);
-                ::close(cfd); ::close(bfd); ::close(srv);
+                ::close(cfd);
+                ::close(bfd);
+                ::close(srv);
                 report.error = "handshake recv failed";
                 return report;
             }
             bytes_total += sizeof(rh) + rp.size();
         }
 
-  // ── O(1) Reorg on Node A ──────────────────────────────────
+        // ── O(1) Reorg on Node A ──────────────────────────────────
         // Node B streams its 4 blocks; Node A rolls back its 2 via undo.vxl.
         if (report.node_b_work > report.node_a_work) {
             // 3a. Stream B's fork blocks over VX60 first (Node B -> A).
             std::vector<BlockFrame> b_frames;
             for (uint64_t h = 1; h <= report.node_b_height; ++h) {
-                auto* raw = node_b.store->get_block(h);
-                if (!raw) continue;
+                auto *raw = node_b.store->get_block(h);
+                if (!raw)
+                    continue;
                 b_frames.emplace_back();
                 std::memcpy(b_frames.back().data(), raw, SB_BLOCK_BYTES);
-                bytes_total += vx60_send_block(bfd, session_nonce_.fetch_add(1),
-                                               b_frames.back().data());
+                bytes_total +=
+                    vx60_send_block(bfd, session_nonce_.fetch_add(1), b_frames.back().data());
             }
 
             // 3b. Node A: O(1) rollback to genesis through undo.vxl journal.
@@ -1115,15 +1253,16 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             // Truncate Node A's ledger back to genesis only.
             node_a.store.reset(); // close mmap/fd
             std::filesystem::resize_file(base + "/node_a/ledger.vxb", SB_BLOCK_BYTES);
-            node_a.store = std::make_unique<BlockStore>(base + "/node_a/ledger.vxb", genesis_path, 1);
+            node_a.store =
+                std::make_unique<BlockStore>(base + "/node_a/ledger.vxb", genesis_path, 1);
             // The journal survived the rollback; re-point it at the reopened
             // store (its old reference died with store.reset() above).
             node_a.undo->attach_store(*node_a.store);
 
             // 3c. Node A applies B's 4 blocks (received over VX60).
             for (uint64_t h = 1; h <= report.node_b_height; ++h) {
-                BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(
-                    b_frames[h - 1].data(), SB_BLOCK_BYTES)};
+                BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(b_frames[h - 1].data(),
+                                                                     SB_BLOCK_BYTES)};
                 node_a.undo->apply_block(v);
                 if (node_a.ledger->apply_block(v).ok) {
                     node_a.undo->commit_undo_point();
@@ -1140,7 +1279,9 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             vx60_bytes_transferred_.fetch_add(bytes_total);
         }
 
-        ::close(cfd); ::close(bfd); ::close(srv);
+        ::close(cfd);
+        ::close(bfd);
+        ::close(srv);
 
         // ── Final invariant: identical tips at height 4 ────────────────────
         report.final_height = node_a.height();
@@ -1155,7 +1296,7 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
             std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
         return report;
 
-    } catch (const std::exception& e) {
+    } catch (const std::exception &e) {
         report.error = e.what();
         return report;
     }
@@ -1163,35 +1304,37 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Dandelion++ ZK-Cocoon routing
-// ═══════════════════════════════════════════ encrypted_tx mask = Sponge(XOR-key stream from ephemeral_salt) ═══
+// ═══════════════════════════════════════════ encrypted_tx mask = Sponge(XOR-key stream from
+// ephemeral_salt) ═══
 
 namespace {
 
 // Deterministic XOR mask stream derived from an ephemeral salt (per-hop layer).
 // Each hop strips its layer and adds its own — the classic Dandelion++ privacy
 // onion over the VortexSponge256 XOF.
-void cocoon_mask_layer(uint8_t* bytes112, uint64_t salt) noexcept {
+void cocoon_mask_layer(uint8_t *bytes112, uint64_t salt) noexcept {
     blockchain::VortexSponge256 sponge;
-    sponge.absorb(reinterpret_cast<const uint8_t*>(&salt), sizeof(salt));
+    sponge.absorb(reinterpret_cast<const uint8_t *>(&salt), sizeof(salt));
     uint8_t stream[112];
     // Absorb enough entropy: 112 bytes through repeated sponge absorption.
     const uint8_t zero = 0;
     for (size_t off = 0; off < sizeof(stream); off += 32) {
         sponge.absorb(&zero, 1);
-        sponge.absorb(reinterpret_cast<const uint8_t*>(&salt), sizeof(salt));
+        sponge.absorb(reinterpret_cast<const uint8_t *>(&salt), sizeof(salt));
     }
     sponge.finalize(stream); // 32 bytes
     // Extend stream to 112 bytes with a counter-mode sponge expansion.
     for (size_t blk = 1; blk * 32 < sizeof(stream); ++blk) {
         blockchain::VortexSponge256 s2;
-        s2.absorb(reinterpret_cast<const uint8_t*>(&salt), sizeof(salt));
+        s2.absorb(reinterpret_cast<const uint8_t *>(&salt), sizeof(salt));
         const uint8_t ctr = static_cast<uint8_t>(blk);
         s2.absorb(&ctr, 1);
         uint8_t chunk[32];
         s2.finalize(chunk);
         std::memcpy(stream + blk * 32, chunk, std::min(sizeof(stream) - blk * 32, size_t(32)));
     }
-    for (size_t i = 0; i < 112; ++i) bytes112[i] ^= stream[i];
+    for (size_t i = 0; i < 112; ++i)
+        bytes112[i] ^= stream[i];
 }
 
 // Hardware entropy source for hop counts / salts (no std::rand).
@@ -1203,14 +1346,14 @@ uint64_t hw_entropy() noexcept {
         (void)r;
         ::close(fd);
     }
-    if (v == 0) v = 0x9E3779B97F4A7C15ULL; // deterministic fallback
+    if (v == 0)
+        v = 0x9E3779B97F4A7C15ULL; // deterministic fallback
     return v;
 }
 
 } // namespace
 
-TxCocoon SwarmNode::seal_cocoon(const blockchain::Transaction& tx,
-                                uint16_t tdi_score_fp) noexcept {
+TxCocoon SwarmNode::seal_cocoon(const blockchain::Transaction &tx, uint16_t tdi_score_fp) noexcept {
     TxCocoon c{};
     std::memcpy(c.encrypted_tx, &tx, 112);
     const uint64_t salt = hw_entropy();
@@ -1220,11 +1363,11 @@ TxCocoon SwarmNode::seal_cocoon(const blockchain::Transaction& tx,
     c.phase = COCOON_PHASE_STEM;
     c.tdi_score_fp = tdi_score_fp;
     cocoon_mask_layer(c.encrypted_tx, salt);
-    c.cocoon_crc32c = compute_wire_crc32c(reinterpret_cast<const uint8_t*>(c.encrypted_tx), 112);
+    c.cocoon_crc32c = compute_wire_crc32c(reinterpret_cast<const uint8_t *>(c.encrypted_tx), 112);
     return c;
 }
 
-blockchain::Transaction SwarmNode::open_cocoon(const TxCocoon& cocoon) noexcept {
+blockchain::Transaction SwarmNode::open_cocoon(const TxCocoon &cocoon) noexcept {
     blockchain::Transaction tx{};
     std::array<uint8_t, 112> bytes{};
     std::memcpy(bytes.data(), cocoon.encrypted_tx, 112);
@@ -1233,10 +1376,10 @@ blockchain::Transaction SwarmNode::open_cocoon(const TxCocoon& cocoon) noexcept 
     return tx;
 }
 
-bool SwarmNode::relay_cocoon_step(TxCocoon& cocoon, CocoonHopTrace& trace) {
+bool SwarmNode::relay_cocoon_step(TxCocoon &cocoon, CocoonHopTrace &trace) {
     // Integrity gate: corrupted cocoons burn without entering the graph.
-    const uint32_t crc = compute_wire_crc32c(
-        reinterpret_cast<const uint8_t*>(cocoon.encrypted_tx), 112);
+    const uint32_t crc =
+        compute_wire_crc32c(reinterpret_cast<const uint8_t *>(cocoon.encrypted_tx), 112);
     if (crc != cocoon.cocoon_crc32c) {
         trace.action = "burned";
         trace.forwarded = false;
@@ -1260,9 +1403,9 @@ bool SwarmNode::relay_cocoon_step(TxCocoon& cocoon, CocoonHopTrace& trace) {
         cocoon_mask_layer(cocoon.encrypted_tx, cocoon.ephemeral_salt); // peel
         const uint64_t fresh_salt = hw_entropy();
         cocoon.ephemeral_salt = fresh_salt;
-        cocoon_mask_layer(cocoon.encrypted_tx, fresh_salt);            // re-mask
-        cocoon.cocoon_crc32c = compute_wire_crc32c(
-            reinterpret_cast<const uint8_t*>(cocoon.encrypted_tx), 112);
+        cocoon_mask_layer(cocoon.encrypted_tx, fresh_salt); // re-mask
+        cocoon.cocoon_crc32c =
+            compute_wire_crc32c(reinterpret_cast<const uint8_t *>(cocoon.encrypted_tx), 112);
 
         cocoon.stem_hops_remaining--;
         if (cocoon.stem_hops_remaining == 0) {
@@ -1293,7 +1436,7 @@ bool SwarmNode::relay_cocoon_step(TxCocoon& cocoon, CocoonHopTrace& trace) {
     return false;
 }
 
-CocoonRelayReport SwarmNode::relay_cocoon_full_cycle(const blockchain::Transaction& tx,
+CocoonRelayReport SwarmNode::relay_cocoon_full_cycle(const blockchain::Transaction &tx,
                                                      uint16_t tdi_score_fp) {
     CocoonRelayReport report;
     TxCocoon cocoon = seal_cocoon(tx, tdi_score_fp);
@@ -1311,7 +1454,7 @@ CocoonRelayReport SwarmNode::relay_cocoon_full_cycle(const blockchain::Transacti
         // Cocoon hash trace (masked payload sponge digest per hop).
         blockchain::VortexSponge256 sponge;
         sponge.absorb(cocoon.encrypted_tx, 112);
-        sponge.absorb(reinterpret_cast<const uint8_t*>(&cocoon.ephemeral_salt), 8);
+        sponge.absorb(reinterpret_cast<const uint8_t *>(&cocoon.ephemeral_salt), 8);
         uint8_t ch[32];
         sponge.finalize(ch);
         std::ostringstream oss;
@@ -1347,8 +1490,7 @@ CocoonRelayReport SwarmNode::relay_cocoon_full_cycle(const blockchain::Transacti
 
     report.stats = dandelion_stats();
     report.ok = true;
-    report.vx60_bytes_transferred =
-        report.hops.size() * (24 + sizeof(TxCocoon));
+    report.vx60_bytes_transferred = report.hops.size() * (24 + sizeof(TxCocoon));
     return report;
 }
 
@@ -1358,7 +1500,8 @@ DandelionStats SwarmNode::dandelion_stats() const noexcept {
     s.fluff_broadcasts = fluff_broadcasts_.load(std::memory_order_relaxed);
     s.tdi_spam_annihilated = tdi_spam_annihilated_.load(std::memory_order_relaxed);
     const uint64_t cycles = stem_cycles_count_.load(std::memory_order_relaxed);
-    s.avg_stem_hops = cycles ? static_cast<double>(stem_hops_sum_.load(std::memory_order_relaxed)) / cycles : 0.0;
+    s.avg_stem_hops =
+        cycles ? static_cast<double>(stem_hops_sum_.load(std::memory_order_relaxed)) / cycles : 0.0;
     s.anonymity_set_size = anonymity_set_size_.load(std::memory_order_relaxed);
     return s;
 }
