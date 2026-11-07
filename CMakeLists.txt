@@ -267,6 +267,8 @@ add_executable(test_pq_signatures tests/test_pq_signatures.cpp)
 target_link_libraries(test_pq_signatures PRIVATE vx_core gtest gtest_main)
 add_executable(test_pq_rollover tests/test_pq_rollover.cpp)
 target_link_libraries(test_pq_rollover PRIVATE vx_core)
+add_executable(test_pq_rollover_wiring tests/test_pq_rollover_wiring.cpp)
+target_link_libraries(test_pq_rollover_wiring PRIVATE vx_core)
 
 # PQ benchmark (BACKLOG P2): reproducible root/sign/verify measurements.
 # A manual target, NOT a ctest entry - benchmarks do not gate CI.
@@ -308,6 +310,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_apply_integrity test_mempool_admission test_fold_window
             test_sponge512 test_sponge1024 test_address_v2
             test_attractor_degeneracy test_pq_rollover
+            test_pq_rollover_wiring
             test_crt_seam_theorems test_derivation_migration
             test_digest_uniformity)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
@@ -340,6 +343,7 @@ add_test(NAME VortexVaultHtlcTest COMMAND test_vault_htlc)
 add_test(NAME VortexChaosFuzzerTest COMMAND test_chaos_fuzzer)
 add_test(NAME VortexPqSignatureTest COMMAND test_pq_signatures)
 add_test(NAME VortexPqRolloverTest COMMAND test_pq_rollover)
+add_test(NAME VortexPqRolloverWiringTest COMMAND test_pq_rollover_wiring)
 add_test(NAME VortexRetargetTest COMMAND test_retarget)
 add_test(NAME VortexReorgCarouselTest COMMAND test_reorg_carousel)
 add_test(NAME VxBifurcationOracleTest COMMAND test_bifurcation)
@@ -361,7 +365,7 @@ if(VX_BUILD_FUZZERS)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         message(FATAL_ERROR "VX_BUILD_FUZZERS=ON requires Clang (libFuzzer)")
     endif()
-    foreach(fuzz_target IN ITEMS fuzz_block_frame fuzz_pq_witness fuzz_wire fuzz_rpc fuzz_undo_journal)
+    foreach(fuzz_target IN ITEMS fuzz_block_frame fuzz_pq_witness fuzz_wire fuzz_rpc fuzz_undo_journal fuzz_reorg)
         add_executable(${fuzz_target} fuzz/${fuzz_target}.cpp)
         target_compile_options(${fuzz_target} PRIVATE -fsanitize=fuzzer)
         target_link_libraries(${fuzz_target} PRIVATE vx_core -fsanitize=fuzzer)
