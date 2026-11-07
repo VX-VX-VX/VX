@@ -7,6 +7,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -398,16 +400,20 @@ private:
     /// 1024-bit mpz -> 128 bytes, most-significant byte first, zero-padded.
     static void toBytes1024(const mpz_class &v, uint8_t *out) {
         std::memset(out, 0, 128);
-        uint8_t tmp[128];
-        size_t count = 0;
-        mpz_export(tmp, &count, 1 /* MSB first */, 1, 1, 0, v.get_mpz_t());
-        // Values here are residues mod 1024-bit moduli; a larger export is
-        // a caller contract violation, not a runtime condition to absorb.
-        if (count > 128) {
+        // Security fix (2026-11-07, in-repo security review): the size
+        // check MUST precede mpz_export, which writes count bytes into
+        // the caller buffer BEFORE count is known - exporting a value
+        // wider than 1024 bits into tmp[128] would be a stack overflow.
+        // Values here are residues mod 1024-bit moduli; a larger export
+        // is a caller contract violation, not a runtime condition to
+        // absorb.
+        if (mpz_sgn(v.get_mpz_t()) < 0 || mpz_sizeinbase(v.get_mpz_t(), 256) > 128) {
             std::fputs("VortexAddressV2: trunk exceeds 1024 bits\n", stderr);
             std::abort();
         }
-        std::memcpy(out + (128 - count), tmp, count);
+        const size_t n = mpz_sizeinbase(v.get_mpz_t(), 256);
+        size_t count = 0;
+        mpz_export(out + (128 - n), &count, 1 /* MSB first */, 1, 1, 0, v.get_mpz_t());
     }
 };
 
