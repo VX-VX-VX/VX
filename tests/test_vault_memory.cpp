@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 #include "vx/core/memory_vault.hpp"
 #include "vx/core/rt_scheduler.hpp"
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
 
 TEST(VortexVaultMemoryTest, PageStateTransitionsAndBurning) {
     if (!vx::core::MemoryCore::mlock_supported()) {
@@ -127,4 +132,64 @@ TEST(VortexVaultMemoryTest, ConcurrentCommitConsumeStress) {
     // Coherent final accounting: every page consumed, none stranded LOCKED.
     const auto stats = core.get_stats();
     EXPECT_EQ(stats.locked_pages, 0);
+}
+
+// Vault lock split (2026-11-07): the panic wipe must (a) TERMINATE while
+// claimers are running (the emergency latch refuses new claims, the drain
+// waits out the in-flight ones) and (b) leave NO page LOCKED behind - a
+// surviving LOCKED page after an emergency burn would be a live secret the
+// operator believes destroyed. Also pins the honest post-wipe semantics:
+// further commits are refused with the "retired" diagnostic.
+TEST(VortexVaultMemoryTest, ConcurrentEmergencyBurnTerminatesAndCompletes) {
+    if (!vx::core::MemoryCore::mlock_supported()) {
+        GTEST_SKIP() << "mlock unavailable in this environment (CI container); "
+                        "locked-arena coverage requires RLIMIT_MEMLOCK >= arena size";
+    }
+    vx::core::MemoryCore core(vx::core::MemoryCore::DEFAULT_ARENA_SIZE);
+    core.initialize(0xE8E8C0DEC0DEULL);
+
+    std::atomic<int> commit_ok{0};
+    std::atomic<int> commit_refused{0};
+    std::atomic<bool> stop{false};
+
+    std::vector<std::thread> workers;
+    for (int t = 0; t < 4; ++t) {
+        workers.emplace_back([&, t]() {
+            uint8_t out[256];
+            for (int i = 0; i < 400 && !stop.load(); ++i) {
+                const std::string payload = "WIPE_RACE_T" + std::to_string(t) + "_I" +
+                                            std::to_string(i) + "_PANIC_PAYLOAD_ABCDEFGH";
+                try {
+                    auto h = core.commit_secure_data(
+                        reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
+                    ++commit_ok;
+                    std::memset(out, 0, sizeof(out));
+                    (void)core.consume_data(h, out); // may lose the race to the wipe
+                } catch (const std::exception &) {
+                    ++commit_refused; // latch closed (or transient pool pressure)
+                }
+            }
+        });
+    }
+
+    // Let the claimers build up live pages, then fire the panic wipe from
+    // this thread WHILE they run.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    core.emergency_burn_all(); // must return (termination under load)
+    stop.store(true);
+    for (auto &w : workers)
+        w.join();
+
+    // The core invariant of the drain: nothing survives LOCKED.
+    EXPECT_EQ(core.get_stats().locked_pages, 0);
+
+    // Post-wipe honesty: the vault is retired - a new commit is refused,
+    // not silently resurrected.
+    bool threw = false;
+    try {
+        core.commit_secure_data(reinterpret_cast<const uint8_t *>("x"), 1);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
 }

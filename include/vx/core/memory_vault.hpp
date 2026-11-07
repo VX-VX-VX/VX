@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <atomic>
 #include <array>
-#include <mutex>
 #include <string>
 #include <optional>
 #include <functional>
@@ -19,7 +18,13 @@ inline constexpr size_t VAULT_HASH_SIZE = 32;
 enum class PageState : uint8_t {
     VOID = 0,
     LOCKED = 1,
-    BURNED = 2
+    BURNED = 2,
+    // Transient owner-held state (vault lock split, 2026-11-07): a thread
+    // won the page's state CAS and is writing/reading/burning its contents.
+    // Every plain (non-atomic) access to a page's offset/capacity/hash/data
+    // happens either while holding CLAIMED or after acquiring CLAIMED from
+    // LOCKED - the state field is the only synchronization edge.
+    CLAIMED = 3
 };
 
 struct alignas(16) MemoryPage {
@@ -33,9 +38,18 @@ struct alignas(16) MemoryPage {
     // Full 32-byte capability digest (external review round 5: the old
     // uint32_t field made the "256-bit" token effectively 32 bits — the
     // remaining 224 token bytes were never checked on consume).
-    std::array<uint8_t, VAULT_HASH_SIZE> content_hash{};
-    uint8_t state : 2 = 0; // PageState::VOID
-    uint8_t reserved : 6 = 0;
+    // ATOMIC BYTES (vault lock split): the digest is compared lock-free
+    // while a page is LOCKED, and the emergency-burn sweep may zero it
+    // concurrently after claiming the page - so both sides go through
+    // atomic byte access. The digest is immutable while LOCKED (only the
+    // CLAIMED committer writes it before publishing), so torn reads are
+    // impossible in practice; atomics make the model race-free, the
+    // compare itself stays constant-time byte-wise.
+    std::array<std::atomic<uint8_t>, VAULT_HASH_SIZE> content_hash{};
+    // Page-state word (vault lock split: plain 2-bit bitfield -> atomic).
+    // Plain members (offset/capacity) are protected by this word's
+    // release/acquire edges, not by a global lock.
+    std::atomic<uint8_t> state{0}; // PageState::VOID
 };
 
 class MemoryCore {
@@ -121,8 +135,19 @@ private:
     // Generate unique SHA-32 hash using SSE4.2 CRC32
     std::array<uint8_t, HASH_SIZE> generate_unique_sha32(const uint8_t* data, size_t size);
 
-    // Hardware master key (user_key ^ hw_uuid)
-    uint64_t hw_master_key_ = 0;
+    // Hardware master key (user_key ^ hw_uuid). Atomic: emergency_burn_all
+    // zeroes it while concurrent commits may be deriving capability digests
+    // from it (vault lock split - the global vault_mutex_ is gone).
+    std::atomic<uint64_t> hw_master_key_{0};
+
+    // Emergency-wipe latch (vault lock split): set by emergency_burn_all
+    // BEFORE the sweep so no new page claims can start during the drain -
+    // without it a sustained claim stream could keep the drain loop waiting
+    // indefinitely (the mutex version got termination for free by queueing).
+    // The latch STAYS SET: post-wipe the vault is retired (the pre-split
+    // code could never reuse a burned page, so post-emergency commits were
+    // a guaranteed pool-full error anyway). initialize() clears it.
+    std::atomic<bool> emergency_wipe_{false};
 
     // Arena memory
     uint8_t* arena_ = nullptr;
@@ -144,23 +169,26 @@ private:
     std::atomic<size_t> next_page_{0};
     std::atomic<size_t> entropy_nonce_{0};
 
-    // Page-state invariant lock (v0.0.11 shared-state audit): commit,
-    // consume, burn, emergency-burn and ephemeral signing all do
-    // check-then-claim on pages_[].state with no other synchronization.
-    // The RPC server serves handlers on detached threads sharing one
-    // MemoryCore, so two concurrent commits could claim the same VOID
-    // page and overwrite each other's secrets. Mutable: get_stats() is
-    // const and must snapshot page states coherently.
-    mutable std::mutex vault_mutex_;
+    // Page-state protocol (vault lock split, owner pattern 2026-11-05 II.1;
+    // replaces the v0.0.11 global vault_mutex_): every page transition is a
+    // CAS on pages_[i].state and pages are physically disjoint arena
+    // regions, so the only globally-serialized step is the ~20 ns claim -
+    // heavy key expansion / signing / zeroization / cache flushing run
+    // lock-free on the claimed page and publish the final state with
+    // memory_order_release. Page i's work never contends with page j's.
+    // One behavioral note recorded honestly: a transient CLAIMED page makes
+    // the pool look one slot smaller to concurrent committers (the mutex
+    // version made them QUEUE instead); at 16384 slots vs the live RPC
+    // thread count this never approaches the pool-full error.
 
     // Huge page support
     bool try_huge_pages(size_t size);
     void fallback_alloc(size_t size);
 
-    // Internal burn variant called with vault_mutex_ already held (the
-    // ephemeral-sign path burns its own page inside the same critical
-    // section - locking the public burn_page there would self-deadlock).
-    bool burn_page_internal_(uint32_t page_id) noexcept;
+    // Burn variant called with the page's CLAIMED state already won (the
+    // ephemeral-sign path burns its own claimed page; the public burn_page
+    // claims first). Zeroize + noise + flush + BURNED release-store.
+    bool burn_page_claimed_(uint32_t page_id) noexcept;
 };
 
 } // namespace vx::core

@@ -1047,17 +1047,46 @@ posture, at ~120 µs extra per sign/verify (16x-longer chains).
 - [ ] Guard pages around locked regions; verify mlock failure semantics
   on hosts with low `rlimit_memlock` (document the fallback loudly).
 - Acceptance: TSan clean in CI; fallback path tested with a low rlimit.
-- [ ] Owner pattern (2026-11-05, II.1) — vault_mutex_ decomposition:
-  today one global mutex spans the whole ephemeral-sign cycle
-  (claim → SK → WOTS+ sign → burn ≈ 17k sponge calls + clflush), so
-  every concurrent RPC vault call queues behind one signer's
-  cryptography. Split it: an atomic page-state claim
-  (VOID→CLAIMED, compare_exchange) is the only globally-serialized
-  step (~20 ns); heavy key expansion / signing / zeroize / clflush run
-  lock-free on the claimed page; the final BURNED transition publishes
-  with memory_order_release. Pages are physically disjoint, so page i's
-  work never contends with page j. Regression guard: the v0.0.11
-  concurrency stress test must stay green through the split.
+- [x] Owner pattern (2026-11-05, II.1) — vault_mutex_ decomposition,
+  DELIVERED 2026-11-07: the global vault_mutex_ is gone. Every page
+  transition is a CAS on `pages_[i].state` (new CLAIMED state marks the
+  claim window); heavy key expansion / signing / zeroize / clflush run
+  lock-free on the claimed page and publish the final state with
+  memory_order_release; pages are physically disjoint, so page i's work
+  never contends with page j. The capability digest became atomic bytes:
+  consume compares lock-free on LOCKED pages while an emergency sweep may
+  zero a claimed page's digest concurrently (the digest is immutable while
+  LOCKED, so a zeroed digest can only produce a skip, never a false token
+  match). Emergency wipe latches first (no new claims during the drain;
+  the latch stays set - the vault is retired, matching the pre-split
+  post-emergency dead pool). Two intermediate designs were caught by the
+  project's own gates before they could ship: claim-then-compare hid live
+  tokens from concurrent scanners (the stress test failed with 201 lost
+  tokens); a plain digest read raced the emergency zeroing (caught by
+  reasoning, fixed with atomic bytes before any lane ran). Real BURNED-slot
+  reuse now ships with the split (round-5 policy said "reusable after
+  consumed or burned" but the scan only ever accepted VOID - the pool was
+  silently single-use per initialize). Regression guard green: the v0.0.11
+  stress test plus a new `ConcurrentEmergencyBurnTerminatesAndCompletes`
+  (4 claimers vs a mid-flight panic wipe; termination + zero LOCKED pages
+  + post-wipe "retired" refusal) - 8/8 TSan reruns clean, ASan/UBSan and
+  GCC lanes green. Honest notes: stats buckets no longer sum to the pool
+  size while pages are CLAIMED in flight (each page still counted exactly
+  once); a transient CLAIMED page makes the pool look one slot smaller to
+  concurrent committers (the mutex version made them queue instead).
+  Adversarial review of the split itself (2026-11-07, before commit) found
+  two more defects, both fixed the same day: (1) HIGH - the wipe's drain
+  could exit while a commit that had read the latch as false published
+  LOCKED behind the sweep (live secret + redeemable token in a retired
+  vault); closed by a post-claim latch re-check in commit/ephemeral-sign
+  (release the slot, refuse) plus a fixpoint drain that ends only after a
+  pass with zero burns, zero CLAIMED observations and a clean final scan;
+  (2) MEDIUM - ABA on BURNED-slot reuse in consume: the digest matched
+  while LOCKED, then a wipe + re-commit repurposed the page before the
+  CAS won, so the old token would have copied out a DIFFERENT committer's
+  secret; closed by re-running the constant-time compare under CLAIM and
+  restoring LOCKED on mismatch. Exception safety: ephemeral-sign burns its
+  claimed page on any throw (a CLAIMED-forever page would hang the drain).
 
 ### 1.6 RPC shared-state audit (delivered 2026-11-05, v0.0.11) — residual: TSan
 
