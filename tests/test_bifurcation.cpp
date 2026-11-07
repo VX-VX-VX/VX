@@ -175,6 +175,11 @@ struct PushResult {
 PushResult push_block(vx::storage::BlockStore& store,
                       vx::state::LedgerState& ledger, BlockBuilder& b) {
     PushResult out;
+    // BACKLOG 2.11: bind the canonical witness set before sealing.
+    b.bind_canonical_witnesses(
+        [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return ledger.pq_root_of(a, out);
+        });
     b.finalize();
     BlockFrame frame;
     std::memcpy(frame.data(), b.bytes().data(), BLOCK_SIZE_BYTES);

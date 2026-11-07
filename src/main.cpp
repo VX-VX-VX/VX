@@ -157,9 +157,14 @@ void run_demo_script(vx::storage::BlockStore& store,
         std::array<uint8_t, 32> demo_sk{};
         vx::blockchain::VortexSponge256::compute(
             reinterpret_cast<const uint8_t*>("VX_DEMO_SPENDER_SK_V1"), 21, demo_sk.data());
-        if (!vx::crypto::pq::pq_sign_transaction(tx2, demo_sk)) {
+        vx::crypto::pq::PqSignatureWitness demo_witness{};
+        if (!vx::crypto::pq::pq_sign_transaction(tx2, demo_sk, nullptr, nullptr, &demo_witness)) {
             throw std::runtime_error("demo: PQ signing failed (no free leaf)");
         }
+        // BACKLOG 2.11: the demo block's header commits its witness set -
+        // tx2 is the only user transaction here.
+        builder.add_witness_binding(builder.tx_count(), tx2.sender_nfa,
+                                    demo_witness.pq_pubkey_root.data());
     }
     builder.add_transaction(tx2);
 

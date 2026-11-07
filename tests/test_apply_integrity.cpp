@@ -88,7 +88,14 @@ BlockBuilder next_block(vx::storage::BlockStore& store, uint64_t ts) {
 }
 
 // Builds + seals a frame from a builder without touching store/ledger.
-BlockFrame sealed_frame(vx::storage::BlockStore& store, BlockBuilder& b) {
+// BACKLOG 2.11: the frame's witness commitment is bound from the ledger's
+// canonical bindings before sealing, exactly like a production producer.
+BlockFrame sealed_frame(vx::storage::BlockStore &store, vx::state::LedgerState &ledger,
+                        BlockBuilder &b) {
+    b.bind_canonical_witnesses(
+        [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return ledger.pq_root_of(a, out);
+        });
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -130,7 +137,7 @@ struct IntegrityChain {
                                    GENESIS_2_MINT_ATOMICS, 0);
         sign_transaction(mint); // system sender: structural digest only
         if (!b.add_transaction(mint)) { ADD_FAILURE(); return; }
-        const BlockFrame f = sealed_frame(*store, b);
+        const BlockFrame f = sealed_frame(*store, *ledger, b);
         if (!store->append_block(f)) { ADD_FAILURE(); return; }
         if (!ledger->apply_block(BlockView(f)).ok) { ADD_FAILURE(); return; }
         if (!(ledger->balance_of(spender) == U128(GENESIS_2_MINT_ATOMICS))) { ADD_FAILURE(); return; }
@@ -186,7 +193,7 @@ TEST(VortexApplyIntegrityTest, TxCountDownwardLieRejected) {
     ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(t1, c.demo.sk));
     ASSERT_TRUE(b.add_transaction(t0));
     ASSERT_TRUE(b.add_transaction(t1));
-    BlockFrame f = sealed_frame(*c.store, b);
+    BlockFrame f = sealed_frame(*c.store, *c.ledger, b);
 
     // ...then the header lies that only the first transaction exists
     // (patched after the merkle root was computed; the count stays within
@@ -233,7 +240,7 @@ TEST(VortexApplyIntegrityTest, TxCountUpwardLieRejected) {
     Transaction t0 = make_tx(c.spender, c.sink_a, 1000000000u, 0);
     ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(t0, c.demo.sk));
     ASSERT_TRUE(b.add_transaction(t0));
-    BlockFrame f = sealed_frame(*c.store, b);
+    BlockFrame f = sealed_frame(*c.store, *c.ledger, b);
 
     patch_tx_count(f, 2);
     const auto res = c.ledger->apply_block(BlockView(f));
@@ -265,7 +272,7 @@ TEST(VortexApplyIntegrityTest, HonestMultiTxBlockMatchesSupplyLaw) {
     ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(t1, c.demo.sk));
     ASSERT_TRUE(b.add_transaction(t0));
     ASSERT_TRUE(b.add_transaction(t1));
-    const BlockFrame f = sealed_frame(*c.store, b);
+    const BlockFrame f = sealed_frame(*c.store, *c.ledger, b);
     const auto res = c.ledger->apply_block(BlockView(f));
     ASSERT_TRUE(res.ok) << res.error;
     EXPECT_EQ(res.transfers, 2u);

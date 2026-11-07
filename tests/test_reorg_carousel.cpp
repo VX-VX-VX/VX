@@ -365,6 +365,11 @@ void build_mined_block(Carousel& c, ReorgNode& n, const Address& cb_recv,
     for (const auto& t : txs) {
         if (!b.add_transaction(t)) ADD_FAILURE() << "block builder full";
     }
+    // BACKLOG 2.11: bind the canonical witness set before sealing.
+    b.bind_canonical_witnesses(
+        [&n](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return n.ledger.pq_root_of(a, out);
+        });
     b.finalize();
     out.fill(0);
     std::memcpy(out.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -594,8 +599,11 @@ void build_shared_prefix(Carousel& c) {
         apply_frame(c.a, f, "prefix funding");
     }
     // Heights 14..100: pure floor coinbase blocks (miner churn on the
-    // shared prefix, no state beyond the emission credit).
-    while (c.a.chain.size() - 1 < kPrefixBlocks) {
+    // shared prefix, no state beyond the emission credit). The fatal-failure
+    // guard stops the loop if apply_frame ever refuses: an assert inside the
+    // helper returns only from the helper, and an unguarded while would
+    // rebuild+reseal frames forever against a stuck ledger tip.
+    while (c.a.chain.size() - 1 < kPrefixBlocks && !::testing::Test::HasFatalFailure()) {
         BlockFrame f;
         build_mined_block(c, c.a, tagged_addr("NFA_CAR_MINER_H", c.next_serial()),
                           {}, f);

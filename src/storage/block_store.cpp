@@ -331,7 +331,7 @@ BlockStore::BlockStore(const std::string &path, const std::string &genesis_path,
         if (!gv.valid_magic() || gv.header().block_height != 0) {
             ::close(fd_);
             fd_ = -1;
-            throw std::runtime_error("BlockStore: genesis.bin is not a valid height-0 VXC6 frame");
+            throw std::runtime_error("BlockStore: genesis.bin is not a valid height-0 VXC7 frame");
         }
         ssize_t wrote = ::pwrite(fd_, genesis.data(), BLOCK_SIZE_BYTES, 0);
         if (wrote != static_cast<ssize_t>(BLOCK_SIZE_BYTES)) {

@@ -1,6 +1,6 @@
 // genesis.cpp — deterministic in-process genesis builder.
 // Block #0 is never shipped: every node reconstructs the same 64 KiB frame
-// from the published canonical seed. 472 B header + 1 signed coinbase tx.
+// from the published canonical seed. 504 B header (VXC7) + 1 signed coinbase tx.
 
 #include "vx/blockchain/genesis.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"

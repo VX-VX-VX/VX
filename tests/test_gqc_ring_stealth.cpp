@@ -392,14 +392,15 @@ TEST(VortexGqcRingStealthTest, StealthEnvelopeOneOfSixteen) {
                           env.stealth_addr.data(), 42), 0);
     EXPECT_EQ(std::memcmp(env.stealth_addr.data(), "NFA_ST_", 7), 0);
 
-    // Stamp the envelope into a transaction and hide it among 579 noise txs.
+    // Stamp the envelope into a transaction and hide it among 578 noise txs
+    // (a full VXC7 block: 1 stealth + 578 noise = MAX_TX_PER_BLOCK).
     Transaction stealth{};
     vx::blockchain::set_nfa_field(stealth.sender_nfa, "STEALTH_TEST_SENDER_0000000000000000000000");
     vx::blockchain::tx_set_amount(stealth, 999'999);
     vx::blockchain::tx_set_fee(stealth, 750);
     stamp_stealth_envelope(env, stealth);
 
-    std::vector<Transaction> block(580);
+    std::vector<Transaction> block(579);
     std::mt19937 rng(0xFEED);
     for (auto& tx : block) {
         std::memset(&tx, 0, sizeof(tx));

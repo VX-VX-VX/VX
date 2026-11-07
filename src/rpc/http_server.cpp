@@ -739,7 +739,7 @@ HttpResponse HttpServer::handle_status(const HttpRequest&) {
         << "\"tip_block_index\":" << tip << ","
         << "\"ledger_bytes\":" << (height * 65536ULL) << ","
         << "\"frame_size\":65536,"
-        << "\"max_tx_per_block\":580,"
+        << "\"max_tx_per_block\":579,"
         << "\"total_supply_atomics\":\"" << supply_str << "\","
         << "\"total_supply_vx\":\"" << format_vx(supply.lo) << "\","
         << "\"max_supply_vx\":" << blockchain::MAX_SUPPLY_VX << ","
@@ -750,7 +750,8 @@ HttpResponse HttpServer::handle_status(const HttpRequest&) {
         << "\"reward_tier_count\":" << blockchain::REWARD_TIER_COUNT << ","
         << "\"tracked_accounts_count\":" << ledger_.tracked_addresses() << ","
         << "\"tip_hash_hex\":\"" << hash_hex << "\","
-        << "\"crypto_engine\":\"3-Trunk Galois Attractor (3072-bit CRT) + VortexSponge256 (12-Round ARX)\","
+        << "\"crypto_engine\":\"3-Trunk Galois Attractor (3072-bit CRT) + VortexSponge256 "
+           "(12-Round ARX)\","
         << "\"storage_engine\":\"POSIX mmap/mremap O(1) Zero-Copy\""
         << "}";
     return HttpResponse::json(200, oss.str());
@@ -787,13 +788,16 @@ HttpResponse HttpServer::handle_blocks(const HttpRequest&) {
             << "\"z_hex\":\"" << hex_bytes(hdr.attractor_coords + 256, 128) << "\"},";
 
         uint32_t tx_used = hdr.tx_count * 112;
-        uint32_t tx_free = (580 - hdr.tx_count) * 112;
-        double util = (tx_used + 472 + 104) * 100.0 / 65536.0;
-        oss << "\"memory_layout\":{\"header_bytes\":472,\"tx_used_bytes\":" << tx_used
-            << ",\"tx_free_bytes\":" << tx_free << ",\"tail_reserved_bytes\":104,\"utilization_pct\":" << std::fixed << std::setprecision(2) << util << "},";
+        uint32_t tx_free = (579 - hdr.tx_count) * 112;
+        double util = (tx_used + 504 + 80 + 104) * 100.0 / 65536.0;
+        oss << "\"memory_layout\":{\"header_bytes\":504,\"tx_used_bytes\":" << tx_used
+            << ",\"tx_free_bytes\":" << tx_free
+            << ",\"tail_reserved_bytes\":104,\"utilization_pct\":" << std::fixed
+            << std::setprecision(2) << util << "},";
 
-        // Raw header hex (472 bytes)
-        oss << "\"raw_header_hex\":\"" << hex_bytes(reinterpret_cast<const uint8_t*>(&hdr), 472) << "\",";
+        // Raw header hex (504 bytes)
+        oss << "\"raw_header_hex\":\"" << hex_bytes(reinterpret_cast<const uint8_t *>(&hdr), 504)
+            << "\",";
         oss << "\"transactions\":[";
         // Structural cap: never walk past the frame's fixed transaction array
         // (a malformed/hand-crafted frame may carry an inflated header count).
@@ -1454,7 +1458,7 @@ HttpResponse HttpServer::handle_security_audit(const HttpRequest& req) {
 
     // ── SAC avalanche probe on VortexSponge256 ─────────────────────────────
     if (atk == "sac_avalanche_probe") {
-        std::array<uint8_t, 472> hdr{}; // block-header-sized probe surface
+        std::array<uint8_t, 504> hdr{}; // block-header-sized probe surface
         for (size_t i = 0; i < hdr.size(); ++i)
             hdr[i] = static_cast<uint8_t>(0xA5 + i * 13);
         uint8_t d1[bc::VortexSponge256::DIGEST_SIZE];
@@ -2490,8 +2494,8 @@ HttpResponse HttpServer::handle_zk_ivk_scan(const HttpRequest& req) {
     (void)req;
     std::lock_guard<std::mutex> lock(state_mutex_);
 
-    // Build a block-like array of 580 transactions: 579 random-looking
-    // transfers + 1 stealth-stamped transaction for the demo recipient.
+    // Build a block-like array of MAX_TX_PER_BLOCK transactions: 578
+    // random-looking transfers + 1 stealth-stamped tx for the demo recipient.
     std::vector<blockchain::Transaction> txs(vx::blockchain::MAX_TX_PER_BLOCK);
     for (size_t i = 0; i < txs.size(); ++i) {
         blockchain::Transaction& tx = txs[i];

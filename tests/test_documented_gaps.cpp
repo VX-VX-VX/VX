@@ -32,7 +32,7 @@
 //  10. VaultPoolFullNotClobber — the ring page cursor used to silently
 //      zero a still-LOCKED page when the pool wrapped.
 //  11. TailMetadataCommitted — the block hash used to cover only the
-//      472-byte header, leaving vm/PoGW tail metadata outside the
+//      504-byte header, leaving vm/PoGW tail metadata outside the
 //      commitment.
 //
 // BACKLOG 1.5 wiring (v0.0.18) — certified PQ key rollover:
@@ -133,6 +133,11 @@ Transaction make_tx(const Address &sender, const Address &receiver, uint64_t amo
 // (PoGW nonce search at the store's required difficulty) before the gate
 // sees it — the same work rule every production producer follows.
 bool push_block(vx::storage::BlockStore &store, vx::state::LedgerState &ledger, BlockBuilder &b) {
+    // BACKLOG 2.11: bind the canonical witness set before sealing.
+    b.bind_canonical_witnesses(
+        [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return ledger.pq_root_of(a, out);
+        });
     b.finalize();
     BlockFrame frame;
     std::memcpy(frame.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -231,8 +236,14 @@ TEST(VortexDocumentedGapsTest, KeylessTheftRejected) {
     BlockBuilder b = next_block(store, std::time(nullptr));
     ASSERT_TRUE(b.add_transaction(theft));
     b.finalize();
+    // The theft tx carries NO witness (it is keyless), so the honest
+    // builder could not bind one; a hostile producer however can put ANY
+    // 32 non-empty bytes in the commitment. The structural gate accepts
+    // exactly that shape - the LEDGER is the authority and refuses the
+    // unbound sender at Tier 1 before the witness tree is ever consulted.
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    reinterpret_cast<RawBlock *>(f.data())->header.witness_merkle_root[0] = 0xA5;
     ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
     EXPECT_TRUE(store.append_block(f))
         << "the store gate judges structure and work only; the authorization"
@@ -308,6 +319,11 @@ TEST(VortexDocumentedGapsTest, DoubleSpendInBlockRejected) {
         EXPECT_TRUE(verify_transaction_proof(s2));
         ASSERT_TRUE(b.add_transaction(s1));
         ASSERT_TRUE(b.add_transaction(s2));
+        // The spends carry real witnesses - bind them like a producer.
+        b.bind_canonical_witnesses(
+            [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+                return ledger.pq_root_of(a, out);
+            });
 
         // The block is structurally valid (the store gate passes it after
         // sealing); the STATE layer must reject it outright - no partial
@@ -1000,6 +1016,11 @@ TEST(VortexDocumentedGapsTest, ReorgUndoRestoresNoncesAndFrames) {
             ASSERT_TRUE(pq_sign(s2, sender_acc));
             ASSERT_TRUE(b.add_transaction(s1));
             ASSERT_TRUE(b.add_transaction(s2));
+            // BACKLOG 2.11: the fork's spend block must commit its witness set.
+            b.bind_canonical_witnesses(
+                [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+                    return ledger.pq_root_of(a, out);
+                });
             b.finalize();
             BlockFrame f;
             std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -1144,8 +1165,11 @@ TEST(VortexDocumentedGapsTest, NonceZeroReplayRejected) {
         b.finalize();
         BlockFrame f;
         std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
-        // Structurally valid block: the store gate (sealed) passes it; the
-        // STATE layer must refuse the genesis-v1-shaped replay.
+        // Structurally valid block: the store gate (sealed) passes a
+        // syntactically non-empty placeholder commitment (the shape a
+        // hostile producer can always produce); the STATE layer must
+        // refuse the genesis-v1-shaped replay.
+        reinterpret_cast<RawBlock *>(f.data())->header.witness_merkle_root[0] = 0x5A;
         ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
         EXPECT_TRUE(store.append_block(f));
         const auto res = ledger.apply_block(BlockView(f));
@@ -1346,7 +1370,7 @@ TEST(VortexDocumentedGapsTest, VaultPoolFullNotClobber) {
 }
 
 // ── Regression (round 5, fixed): the block id committed only the
-// 472-byte header; the tail (vm_state_root, vm_gas_used, pogw_nonce,
+// 504-byte header; the tail (vm_state_root, vm_gas_used, pogw_nonce,
 // vm_bytecode) sat OUTSIDE the commitment, so two frames differing only
 // in their PoGW nonce shared one tip hash. hash_block now commits both.
 TEST(VortexDocumentedGapsTest, TailMetadataCommitted) {
@@ -1481,8 +1505,12 @@ TEST(VortexDocumentedGapsTest, UnboundSenderRejected) {
     BlockBuilder b = next_block(store, std::time(nullptr));
     ASSERT_TRUE(b.add_transaction(tx));
     b.finalize();
+    // Structurally valid but state-illegal: the frame carries a
+    // syntactically non-empty placeholder commitment (a hostile producer
+    // can put any 32 bytes there) - the LEDGER is the authority below.
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    reinterpret_cast<RawBlock *>(f.data())->header.witness_merkle_root[0] = 0x5A;
     ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
     EXPECT_TRUE(store.append_block(f));
     const auto res = ledger.apply_block(BlockView(f));
@@ -1523,8 +1551,12 @@ TEST(VortexDocumentedGapsTest, WitnessRootMismatchRejected) {
     BlockBuilder b = next_block(store, std::time(nullptr));
     ASSERT_TRUE(b.add_transaction(tx));
     b.finalize();
+    // Structurally valid but state-illegal: the frame carries a
+    // syntactically non-empty placeholder commitment (a hostile producer
+    // can put any 32 bytes there) - the LEDGER is the authority below.
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+    reinterpret_cast<RawBlock *>(f.data())->header.witness_merkle_root[0] = 0x5A;
     ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
     EXPECT_TRUE(store.append_block(f));
     const auto res = ledger.apply_block(BlockView(f));
@@ -1850,6 +1882,12 @@ TEST(VortexDocumentedGapsTest, RolloverWithoutCertRejected) {
         b.finalize();
         BlockFrame f;
         std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
+        // The uncertified window-1 root is NOT canonical (no certified
+        // chain walks to it), so an honest producer cannot bind it - the
+        // frame instead carries a syntactically non-empty placeholder,
+        // exactly the shape a hostile producer can always produce. The
+        // LEDGER must refuse it below.
+        reinterpret_cast<RawBlock *>(f.data())->header.witness_merkle_root[0] = 0x5A;
         ASSERT_TRUE(seal_pogw_nonce(f, fx.store->required_pogw_bits()));
         ASSERT_TRUE(fx.store->append_block(f));
         const auto res = fx.ledger->apply_block(BlockView(f));

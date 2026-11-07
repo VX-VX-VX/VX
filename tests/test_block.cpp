@@ -11,11 +11,11 @@ using namespace vx::blockchain;
 
 void test_struct_sizes() {
     std::cout << "[TEST 1] Compile-time struct size verification...\n";
-    std::cout << "  sizeof(BlockHeader) = " << sizeof(BlockHeader) << " (expected 472)\n";
+    std::cout << "  sizeof(BlockHeader) = " << sizeof(BlockHeader) << " (expected 504)\n";
     std::cout << "  sizeof(Transaction) = " << sizeof(Transaction) << " (expected 112)\n";
     std::cout << "  sizeof(RawBlock)    = " << sizeof(RawBlock) << " (expected 65536)\n";
 
-    assert(sizeof(BlockHeader) == 472);
+    assert(sizeof(BlockHeader) == 504);
     assert(sizeof(Transaction) == 112);
     assert(sizeof(RawBlock) == 65536);
 
@@ -27,6 +27,7 @@ void test_struct_sizes() {
     assert(offsetof(BlockHeader, timestamp) == 0x04C);
     assert(offsetof(BlockHeader, attractor_coords) == 0x054);
     assert(offsetof(BlockHeader, tx_count) == 0x1D4);
+    assert(offsetof(BlockHeader, witness_merkle_root) == 0x1D8);
 
     std::cout << "  ✓ All sizes and offsets match the 64 KB spec exactly!\n\n";
 }
@@ -41,18 +42,18 @@ void test_magic_and_defaults() {
 
     BlockView view(bytes);
     assert(view.valid_magic());
-    assert(view.header().magic == 0x58564336);
+    assert(view.header().magic == 0x58564337);
     assert(view.tx_count() == 0);
 
-    // Note: spec fixes magic as the numeric constant 0x58564336.
-    // Its on-disk byte order (LE) is 36 43 56 58.
+    // Note: spec fixes magic as the numeric constant 0x58564337 (VXC7).
+    // Its on-disk byte order (LE) is 37 43 56 58.
     const uint8_t* m = reinterpret_cast<const uint8_t*>(&view.header().magic);
     std::cout << "  Magic bytes (LE on disk): ";
     for (int i = 0; i < 4; ++i) std::cout << std::hex << std::setw(2) << std::setfill('0')
                                           << static_cast<int>(m[i]) << ' ';
     std::cout << std::dec << "\n";
 
-    std::cout << "  ✓ Magic verified as 0x58564336!\n\n";
+    std::cout << "  ✓ Magic verified as 0x58564337!\n\n";
 }
 
 void test_transaction_addition() {
@@ -101,7 +102,7 @@ void test_transaction_addition() {
 }
 
 void test_max_capacity() {
-    std::cout << "[TEST 4] Maximum block capacity (580 transactions)...\n";
+    std::cout << "[TEST 4] Maximum block capacity (579 transactions)...\n";
     BlockBuilder builder;
 
     Transaction tx{};
@@ -116,10 +117,10 @@ void test_max_capacity() {
     builder.finalize();
     auto bytes = builder.bytes();
     BlockView view(bytes);
-    assert(view.tx_count() == 580);
+    assert(view.tx_count() == 579);
     assert(bytes.size() == 65536);
 
-    std::cout << "  ✓ Exactly 580 transactions fit in 64 KB frame, 581st rejected!\n\n";
+    std::cout << "  ✓ Exactly 579 transactions fit in 64 KB frame, 580th rejected!\n\n";
 }
 
 void test_zero_copy_view() {

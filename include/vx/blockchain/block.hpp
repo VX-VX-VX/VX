@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <span>
 #include <string>
+#include <vector>
+#include <functional>
 
 namespace vx::crypto::pq { struct PqSignatureWitness; } // forward decl (pq_signature.hpp)
 
@@ -36,13 +38,23 @@ inline void set_nfa_field(std::array<uint8_t, N>& dst, const char (&src)[M]) {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-inline constexpr uint32_t BLOCK_MAGIC        = 0x58564336; // "VXC6" little-endian
+inline constexpr uint32_t BLOCK_MAGIC = 0x58564337; // "VXC7" little-endian
+// Format v1 ("VXC6", 472 B header, 580 tx, no witness commitment) is refused
+// everywhere (BACKLOG 2.11 versioned bump); the constant stays for the
+// fail-closed diagnostic that names WHICH version a peer offered.
+inline constexpr uint32_t BLOCK_MAGIC_V1 = 0x58564336;     // "VXC6" little-endian
 inline constexpr size_t   BLOCK_SIZE_BYTES   = 65536;      // exactly 64 KB
-inline constexpr size_t   HEADER_SIZE_BYTES  = 472;
+// VXC7: the header grew by the 32-byte witness_merkle_root (BACKLOG 2.11) -
+// 472 + 32 = 504 - so one transaction slot gave way: 579 x 112 = 64848, and
+// the freed 80 bytes sit between the transaction array and the tail as an
+// explicit zeroed body_padding, keeping every tail offset identical to VXC6
+// (504 + 64848 + 80 + 104 = 65536).
+inline constexpr size_t HEADER_SIZE_BYTES = 504;
 inline constexpr size_t   TX_SIZE_BYTES      = 112;
-inline constexpr size_t   MAX_TX_PER_BLOCK   = 580;
-// NOTE: spec said 88 B padding, but 472 + 580*112 + 88 = 65520 ≠ 65536.
-// Exactly 580 transactions of 112 B in a fixed 64 KB frame requires 104 B padding.
+inline constexpr size_t MAX_TX_PER_BLOCK = 579;
+inline constexpr size_t BODY_PADDING_BYTES = 80;
+// NOTE: spec said 88 B padding, but 472 + 580*112 + 88 = 65520 != 65536.
+// The tail (VM state root, gas, PoGW nonce, bytecode) fills the last 104 B.
 inline constexpr size_t   PADDING_SIZE_BYTES = 104;
 // NOTE (external review round 5): the tail has NO free bytes — vm_state_root
 // (65432..65463), vm_gas_used (65464..65471), pogw_nonce (65472..65479) and
@@ -51,7 +63,9 @@ inline constexpr size_t   PADDING_SIZE_BYTES = 104;
 // metadata); it lives in a versioned sidecar record beside the ledger file
 // (see storage::BlockStore::stamp_gqc).
 
-static_assert(HEADER_SIZE_BYTES + MAX_TX_PER_BLOCK * TX_SIZE_BYTES + PADDING_SIZE_BYTES == BLOCK_SIZE_BYTES,
+static_assert(HEADER_SIZE_BYTES + MAX_TX_PER_BLOCK * TX_SIZE_BYTES + BODY_PADDING_BYTES +
+                      PADDING_SIZE_BYTES ==
+                  BLOCK_SIZE_BYTES,
               "Block layout must be exactly 64 KB");
 
 // True byte-level packing: alignas(1) alone does NOT remove inter-member padding
@@ -63,21 +77,31 @@ static_assert(HEADER_SIZE_BYTES + MAX_TX_PER_BLOCK * TX_SIZE_BYTES + PADDING_SIZ
 #define VX_PACKED
 #endif
 
-// ── BlockHeader (472 bytes, no alignment padding) ────────────────────────────
+// ── BlockHeader (504 bytes, no alignment padding) ────────────────────────────
+// VXC7 (BACKLOG 2.11, versioned bump from VXC6): adds the 32-byte
+// witness_merkle_root - the proposer's commitment to the exact detached
+// WOTS+/XMSS witness set its block's user transactions require. Witnesses
+// themselves are 2376 B each and cannot fit in the frame; the commitment
+// makes a withholding peer attributable instead of merely annoying, and
+// apply_block refuses any frame whose header lies about its witness set.
 
 struct alignas(1) VX_PACKED BlockHeader {
-    uint32_t magic;                          // 0x000  4B   "VXC6"
+    uint32_t magic;                          // 0x000  4B   "VXC7"
     uint64_t block_height;                   // 0x004  8B
     uint8_t  prev_block_hash[32];            // 0x00C 32B
     uint8_t  merkle_root[32];                // 0x02C 32B
     uint64_t timestamp;                      // 0x04C  8B
     uint8_t  attractor_coords[384];          // 0x054 384B  X(128) || Y(128) || Z(128)
     uint32_t tx_count;                       // 0x1D4  4B
+    uint8_t witness_merkle_root[32];         // 0x1D8 32B  commitment to the out-of-band witness set
 
     bool is_valid_magic() const noexcept { return magic == BLOCK_MAGIC; }
+    bool is_v1_magic() const noexcept {
+        return magic == BLOCK_MAGIC_V1;
+    }
 };
 
-static_assert(sizeof(BlockHeader) == HEADER_SIZE_BYTES, "BlockHeader must be 472 bytes");
+static_assert(sizeof(BlockHeader) == HEADER_SIZE_BYTES, "BlockHeader must be 504 bytes");
 
 // ── Transaction (112 bytes, no alignment padding) ───────────────────────────
 // Upgraded V2 layout with replay protection (nonce), fee market (TDI burn),
@@ -157,24 +181,82 @@ static_assert(sizeof(VortexFrameTail) == PADDING_SIZE_BYTES, "VortexFrameTail mu
 struct alignas(1) RawBlock {
     BlockHeader header;
     Transaction transactions[MAX_TX_PER_BLOCK];
+    uint8_t body_padding[BODY_PADDING_BYTES]; // zeroed; keeps VXC6 tail offsets
     VortexFrameTail tail;
 };
 
 static_assert(sizeof(RawBlock) == BLOCK_SIZE_BYTES, "RawBlock must be exactly 65536 bytes");
 
 // Tail field offsets are consensus layout facts (external review round 5):
-// every consumer of the tail must be able to prove where each field sits.
+// VXC7 keeps every tail offset identical to VXC6 - the 32-byte header growth
+// trades one transaction slot, and the freed 80 bytes sit before the tail.
+// Every consumer of the tail must be able to prove where each field sits.
 static_assert(offsetof(RawBlock, tail) == 65432, "tail must start at 65432");
 static_assert(offsetof(RawBlock, tail.vm_state_root) == 65432, "vm_state_root at 65432");
 static_assert(offsetof(RawBlock, tail.vm_gas_used) == 65464, "vm_gas_used at 65464");
 static_assert(offsetof(RawBlock, tail.pogw_nonce) == 65472, "pogw_nonce at 65472");
 static_assert(offsetof(RawBlock, tail.vm_bytecode) == 65480, "vm_bytecode at 65480");
+static_assert(offsetof(RawBlock, header.witness_merkle_root) == 0x1D8,
+              "witness_merkle_root at 0x1D8");
 
 // Merkle commitment: recompute from the block body alone and compare
 // against the header field. External review P1: the field existed but
 // was verified nowhere on intake.
 void compute_block_merkle(const RawBlock& raw, uint8_t out[32]) noexcept;
 bool verify_block_merkle(const RawBlock& raw) noexcept;
+
+// ── Witness merkle commitment (BACKLOG 2.11) ─────────────────────────────────
+// The header's witness_merkle_root commits the detached witness set the
+// block's USER transactions require (system senders - GENESIS/MINER_ - carry
+// none). A leaf binds the transaction position, the sender and the CANONICAL
+// key identity - the XMSS root - rather than the raw witness bytes: two
+// witnesses of the same tree (different one-time leaves) must verify as the
+// same set, or a block could admit under two different roots depending on
+// which candidate a node's registry happened to hold.
+//   leaf  = Sponge256("VXWMRL1" || tx_index u32 LE || sender[42] || xmss_root[32])
+//   node  = Sponge256("VXWMRN1" || left[32] || right[32])   (odd -> last duplicated)
+//   empty = Sponge256("VXWMRE1")
+// The producer collects bindings while building; the verifier recomputes the
+// same tree from the witnesses the registry holds - so a header that lies
+// about its witness set can never apply, and a peer that withholds witnesses
+// can be identified by which subtree never arrives.
+struct WitnessBinding {
+    uint32_t tx_index;
+    std::array<uint8_t, 42> sender;
+    std::array<uint8_t, 32> pq_root;
+};
+
+void compute_witness_merkle_root(const WitnessBinding *bindings, size_t n,
+                                 uint8_t out[32]) noexcept;
+const uint8_t *witness_merkle_empty_root() noexcept;
+
+/// Why a block's witness commitment could not be confirmed.
+enum class WitnessRootStatus {
+    MATCH,           // recomputed tree equals the header field
+    MISSING_WITNESS, // a user tx has no verifying witness in the registry yet
+    MISMATCH,        // witnesses exist but commit to something else - attributable proposer
+};
+
+/// Recomputes the witness tree from the registry (one verifying candidate
+/// per user tx whose XMSS root matches the CANONICAL binding - see
+/// consensus_witness_root) and compares it with the header field.
+/// `bound_root_of` is the ledger's binding oracle (LedgerState::pq_root_of);
+/// genesis-table bindings and self-certifying PQA addresses are resolved
+/// internally. Never throws.
+// Address is declared further below; the alias uses the raw payload type.
+using BoundRootOf = std::function<bool(const std::array<uint8_t, 42> &, std::array<uint8_t, 32> &)>;
+WitnessRootStatus verify_witness_merkle(const RawBlock &raw, BoundRootOf bound_root_of) noexcept;
+
+/// The consensus-acceptable XMSS root for one user transaction's sender:
+/// the ledger-bound root, else the genesis seed-table root, else - for a
+/// self-certifying PQA address - the root of a registry candidate that
+/// verifies against THIS transaction AND re-derives the sender address.
+/// Returns false when no canonical root can be pinned down (the tx cannot
+/// apply anywhere anyway). Producer (miner/builder) and verifier both call
+/// this, so the committed tree and the recomputed tree agree by
+/// construction - independent of witness arrival order.
+bool consensus_witness_root(const Transaction &tx, BoundRootOf bound_root_of,
+                            std::array<uint8_t, 32> &out_root) noexcept;
 
 // ── Common aliases ───────────────────────────────────────────────────────────
 
@@ -198,6 +280,13 @@ using Address    = std::array<uint8_t, 42>;               // NFA payload without
  */
 bool is_pq_address(const Address& a) noexcept;
 void derive_pq_address(const uint8_t root[32], uint8_t out_addr[42]) noexcept;
+
+/// The protocol's own senders - GENESIS mints and MINER_ coinbases - carry
+/// no PQ witness and are excluded from the witness merkle set (BACKLOG 2.11).
+/// One definition shared by apply_block, the intake gate and the witness
+/// relays, so the classification can never drift between producer and
+/// verifier.
+bool is_system_sender(const Address &a) noexcept;
 
 /**
  * @brief Strict PQ authorization check for one transaction (the only
@@ -354,9 +443,40 @@ public:
         return true;
     }
 
+    uint32_t tx_count() const noexcept {
+        return block_.header.tx_count;
+    }
+
+    const Transaction &tx(uint32_t index) const noexcept {
+        return block_.transactions[index];
+    }
+
+    // BACKLOG 2.11: record one witness binding for the transaction at
+    // tx_index. The leaf commits only public facts (index, sender, the
+    // witness's XMSS root), so the builder needs no PQ types.
+    // Call once per user transaction, before finalize().
+    bool add_witness_binding(uint32_t tx_index, const uint8_t sender[42],
+                             const uint8_t pq_root[32]) noexcept {
+        WitnessBinding b;
+        b.tx_index = tx_index;
+        std::memcpy(b.sender.data(), sender, 42);
+        std::memcpy(b.pq_root.data(), pq_root, 32);
+        bindings_.push_back(b);
+        return true;
+    }
+
+    // BACKLOG 2.11 producer convenience: bind the CANONICAL witness root of
+    // every user transaction in this block (ledger-bound / genesis-table /
+    // self-certifying PQA - see consensus_witness_root). Transactions whose
+    // canonical root cannot be pinned (no consensus-consistent witness in
+    // the registry) are left unbound; applying such a block is refused, so
+    // a producer must not seal one. Returns the number of bindings added.
+    size_t bind_canonical_witnesses(BoundRootOf bound_root_of);
+
     void finalize() noexcept {
         // Zero tail is already zeroed by constructor / memset
         compute_merkle_root();
+        compute_witness_root();
     }
 
     void set_nonce(uint64_t nonce) noexcept { block_.tail.pogw_nonce = nonce; }
@@ -372,7 +492,9 @@ public:
 
 private:
     void compute_merkle_root() noexcept;
+    void compute_witness_root() noexcept;
     RawBlock block_;
+    std::vector<WitnessBinding> bindings_;
 };
 
 } // namespace vx::blockchain

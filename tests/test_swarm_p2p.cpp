@@ -125,9 +125,9 @@ TEST(VortexSwarmP2PTest, FullBlockRoundTripOverTcp) {
     socklen_t alen = sizeof(addr);
     ::getsockname(srv, reinterpret_cast<sockaddr*>(&addr), &alen);
 
-    // A realistic 65536-byte block frame (VXC6 magic + deterministic body)
+    // A realistic 65536-byte block frame (VXC7 magic + deterministic body)
     std::vector<uint8_t> frame(65536, 0);
-    const uint32_t magic = 0x58564336;
+    const uint32_t magic = 0x58564337;
     std::memcpy(frame.data(), &magic, 4);
     for (size_t i = 4; i < frame.size(); ++i) frame[i] = static_cast<uint8_t>(i * 13 + 5);
 
@@ -221,7 +221,7 @@ TEST(VortexSwarmP2PTest, ListenerRelaysVerifiedFrameToHook) {
     // Sender node: connects and broadcasts a deterministic 64 KiB frame.
     vx::net::SwarmNode sender;
     std::vector<uint8_t> frame(65536, 0);
-    const uint32_t magic = 0x58564336; // VXC6 block magic
+    const uint32_t magic = 0x58564337; // VXC7 block magic
     std::memcpy(frame.data(), &magic, 4);
     for (size_t i = 4; i < frame.size(); ++i) frame[i] = static_cast<uint8_t>(i * 31 + 7);
     ASSERT_TRUE(sender.connect_peer_tcp("127.0.0.1", port));

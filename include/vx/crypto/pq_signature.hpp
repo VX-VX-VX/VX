@@ -448,6 +448,17 @@ public:
     // predict - it just will not verify against the honest transaction).
     bool lookup_verifying(const blockchain::Transaction &tx, PqSignatureWitness &out) const;
 
+    // BACKLOG 2.11: consensus witness selection. Scans EVERY candidate for
+    // the tx's digest and answers whether one exists that (a) verifies
+    // against THIS transaction and (b) carries exactly the requested XMSS
+    // root - the canonical key identity consensus binding rules pin down.
+    // Unlike lookup_verifying (first verifying candidate, arrival-order
+    // dependent), the answer is the same on every node regardless of the
+    // order witnesses arrived in: the root is not a registry artifact.
+    bool lookup_verifying_with_root(const blockchain::Transaction &tx,
+                                    const std::array<uint8_t, 32> &root,
+                                    PqSignatureWitness *out = nullptr) const;
+
     // Last signed transaction + witness (RPC demo state).
     void set_last(const blockchain::Transaction &tx, const PqSignatureWitness &w);
     bool get_last(blockchain::Transaction &tx, PqSignatureWitness &w) const;

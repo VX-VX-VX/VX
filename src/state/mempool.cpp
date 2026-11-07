@@ -305,7 +305,9 @@ MempoolStats Mempool::stats() const noexcept {
     size_t cnt = count_.load(std::memory_order_relaxed);
     s.count = cnt;
     s.byte_occupancy = cnt * 112;
-    s.utilization_pct = (static_cast<double>(cnt) / 580.0) * 100.0; // 580 tx = full 64KB frame
+    s.utilization_pct =
+        (static_cast<double>(cnt) / static_cast<double>(blockchain::MAX_TX_PER_BLOCK)) *
+        100.0; // full 64KB frame
 
     U128 total_fees{0};
     U128 total_amounts{0};

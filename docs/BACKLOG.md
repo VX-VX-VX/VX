@@ -670,7 +670,7 @@ power there; width is the insurance against our own assumptions.
   must stay consensus-visible.
 - [x] Retarget parameter lock (found by the 2026-11-04 ASERT review,
   F2): delivered 2026-11-05 as a fingerprint pin instead of a genesis
-  domain commitment — the genesis frame hash is immutable (485f5afac16d…),
+  domain commitment — the then-current genesis frame hash (485f5afac16d…; superseded 2026-11-07 by the VXC7 frame bump, 2.11: the genesis now commits to 047f3cf7ac9f259b…),
   so folding the params in would change it. `POGW_RETARGET_FINGERPRINT`
   (FNV-1a over anchor_bits||half_life_blocks) is pinned by static_assert
   in retarget.hpp and by `RetargetParameterLock` in test_retarget.cpp:
@@ -1414,11 +1414,48 @@ the block itself, so witnesses necessarily travel out-of-band today.
   rejected until that sender registers locally. Needs a designed
   first-seen binding path (e.g., block-carried witness registration
   bound to the accepted block) rather than an accidental stall.
-- [ ] Add a witness_merkle_root to the block header (a wire/tag change
-  — needs a versioned format bump, never a silent swap) so a node can
-  demand the exact witness set the proposer committed to; a peer that
-  withholds witnesses (Omission/Orphan Witness attack) becomes
-  attributable instead of merely annoying.
+- [x] STAGE 1 DELIVERED 2026-11-07 (VXC7 frame format): the header grew
+  472 -> 504 B (witness_merkle_root[32] at offset 0x1D8),
+  BLOCK_MAGIC 0x58564336 -> 0x58564337; VXC6 frames are REFUSED at
+  intake by name ("VXC6 frame refused: pre-2.11 format without a
+  witness commitment") — a versioned format bump, never a silent swap;
+  MAX_TX_PER_BLOCK 580 -> 579 (the 32-byte commitment comes out of the
+  tx budget's slack, body_padding 80 B keeps every other tail offset
+  unchanged). The producer commits the CANONICAL witness set (one
+  WitnessBinding per user transaction: 0-based tx index, sender,
+  canonical root) into the header BEFORE PoGW sealing, so the
+  commitment is inside the work-sealed frame. Canonical selection
+  (consensus_witness_root, arrival-order independent): 1) ledger-bound
+  root via the verifier's binding oracle -> direct registry hit ->
+  certified rollover-chain walk (advance_root_chain) -> second lookup;
+  2) genesis seed table; 3) self-certifying PQA (first verifying
+  candidate whose root re-derives the sender address; ~2^-234 collision
+  bound). Ledger enforcement: apply_block recomputes the tree from the
+  witnesses ITS OWN verification accepted and refuses a lying header
+  with ERR_WITNESS_ROOT before any state mutation. Structural intake
+  gate, both directions: zero user txs <=> the header must commit the
+  fixed domain-separated empty constant Sponge256("VXWMRE1") (nonzero —
+  the all-zero commitment is not confusable with "no field"); user txs
+  present <=> the header must NOT commit the empty constant (every user
+  tx resolves to exactly one canonical witness before a block may
+  apply). Leaf = Sponge256("VXWMRL1" || tx_index u32 LE || sender[42]
+  || canonical_root[32]); node = Sponge256("VXWMRN1" || left || right);
+  odd count duplicates the last leaf. HONEST MIGRATION NOTE: existing
+  VXC6 testnet ledgers fail closed at intake — a fresh chain start is
+  required; no migration path is offered (the format is pre-beta).
+  Tests: VortexWitnessMerkleTest, 8 sections (empty-constant
+  determinism, system-only auto-commit + structural refusal, index/
+  sender binding, VXC6 named refusal, the inverse structural rule,
+  lying-header refused before mutation with byte-identical ledger,
+  wrong-key binding refused with a valid witness present, canonical
+  selection ignores a foreign pre-registered candidate). All touched
+  suites patched and green on the assert lane (38 ctest entries + the
+  new suite).
+- [ ] STAGE 2 (open): the delivery protocol the header commitment now
+  makes possible — a node demands the exact witness set the proposer
+  committed to; MISSING_WITNESS vs MISMATCH distinction is already in
+  place for parking: park-pending frames in apply_remote_frame, retry
+  on witness arrival, attribution/ban for withholding proposers.
 - [ ] Define the witness-retention window: how long a node must serve
   witnesses for blocks it proposes, and the ban/score for a peer that
   repeatedly proposes blocks whose witnesses never arrive.

@@ -26,15 +26,15 @@
 //      apply_block (balances_[a] = ... keeps the entry at 0). Untracking
 //      happens only in the reorg undo forget-loop (forget_empty_address).
 //   [FINDING] 5. A U128 credit-sum overflow is unreachable by construction
-//      (MAX_TX_PER_BLOCK=580 x UINT64_MAX ~= 2^73.6 << 2^128); the reachable
+//      (MAX_TX_PER_BLOCK=579 x UINT64_MAX ~= 2^73.6 << 2^128); the reachable
 //      overflow is the u64-bounded per-sender intra-block DEBIT accumulator,
 //      which the checked add refuses pre-commit ("debit accumulator
 //      overflow") with zero mutation.
 //   [FINDING] 6. One PQ key signs at most 15 transactions EVER: the WOTS+
 //      leaf is the tx nonce's low 4 bits, leaf 15 is RESERVED for rollover
 //      certificates (kernel invariant, v0.0.15/v0.0.16), and
-//      pq_sign_transaction refuses nonce >= 15. "580 txs from one sender"
-//      is unproducible; the 580-tx maximum is exercised with 39 keys
+//      pq_sign_transaction refuses nonce >= 15. "579 txs from one sender"
+//      is unproducible; the 579-tx maximum is exercised with 39 keys
 //      instead. The ledger itself has no such limit.
 //   [FINDING] 7. The public invariant helper total_supply() SATURATES at
 //      2^64-1 (its treat-as-anomaly sentinel) once balances cross 2^64 in
@@ -161,6 +161,11 @@ PqAccount demo_spender() {
 vx::state::ApplyResult push_block(vx::storage::BlockStore& store,
                                   vx::state::LedgerState& ledger,
                                   BlockBuilder& b) {
+    // BACKLOG 2.11: bind the canonical witness set before sealing.
+    b.bind_canonical_witnesses(
+        [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return ledger.pq_root_of(a, out);
+        });
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -203,6 +208,11 @@ vx::state::ApplyResult apply_user_block(vx::state::LedgerState& ledger,
     std::array<uint8_t, 384> coords{};
     b.set_attractor_coords(coords.data());
     for (const auto& tx : txs) b.add_transaction(tx);
+    // BACKLOG 2.11: bind the canonical witness set before applying.
+    b.bind_canonical_witnesses(
+        [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return ledger.pq_root_of(a, out);
+        });
     b.finalize();
     BlockFrame f;
     std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -633,7 +643,7 @@ TEST(VxBoundaryTortureTest, AmountUint64Max) {
 }
 
 // [FINDING 5] Two max-ish credits in one block: the U128 CREDIT sum cannot
-// overflow (580 x UINT64_MAX ~= 2^73.6 << 2^128), but the per-sender
+// overflow (579 x UINT64_MAX ~= 2^73.6 << 2^128), but the per-sender
 // intra-block DEBIT accumulator is u64-bounded and its checked add must
 // refuse pre-commit. (a) two full-u64 debits overflow the accumulator at
 // tx 1; (b) one full-u64 debit plus a fee overflows at tx 0. Both leave
@@ -796,6 +806,11 @@ TEST(VxBoundaryTortureTest, FeeUint32MaxBurnAndOddShare) {
         b.set_attractor_coords(coords.data());
         b.add_transaction(cb);  // index 0
         b.add_transaction(t);   // index 1
+        // BACKLOG 2.11: the spend's witness must be committed.
+        b.bind_canonical_witnesses(
+            [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+                return ledger.pq_root_of(a, out);
+            });
         b.finalize();
         BlockFrame f;
         std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -1061,6 +1076,11 @@ TEST(VxBoundaryTortureTest, MintReapplyAfterRollback) {
             Transaction t = mk_tx(spender.addr, sink, 2'000'000ull, 100, 0);
             ASSERT_TRUE(pq_sign(t, spender));
             b.add_transaction(t);
+            // BACKLOG 2.11: the honest spend frame commits its witness set.
+            b.bind_canonical_witnesses(
+                [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+                    return ledger.pq_root_of(a, out);
+                });
             b.finalize();
             BlockFrame f;
             std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -1102,15 +1122,15 @@ TEST(VxBoundaryTortureTest, MintReapplyAfterRollback) {
 
 // -- 6. BLOCK EDGES ----------------------------------------------------------
 
-// [FINDING 6] A full block of 580 txs from ONE sender is IMPOSSIBLE to
+// [FINDING 6] A full block of 579 txs from ONE sender is IMPOSSIBLE to
 // produce honestly: pq_sign_transaction derives the WOTS+ leaf from the tx
 // nonce and REFUSES nonce >= 16 (XMSS subtree rollover is unimplemented --
 // the published root covers subtree 0, leaves 0..15 only). One PQ key can
 // therefore sign at most 16 transactions EVER (and after 16 lifetime txs a
 // key is dead: the ledger nonce keeps counting past what any witness can
-// cover). The structural 580-tx maximum is exercised below with 37
-// distinct fresh keys (36 x 16 + 4 = 580), staged with the test-only
-// adjust_balance helper (the demo spender itself cannot fund 37 accounts --
+// cover). The structural 579-tx maximum is exercised below with 39
+// distinct fresh keys (38 x 15 + 9 = 579), staged with the test-only
+// adjust_balance helper (the demo spender itself cannot fund 39 accounts --
 // its 16 leaves are exhausted). The 581st tx cannot even enter the frame.
 TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
     const std::string dir = temp_dir("vx_bt_maxtx");
@@ -1133,7 +1153,7 @@ TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
         ledger.adjust_balance(senders.back().addr, U128(200'000'000ull), true);
     }
 
-    // The full 580-tx block: 38 senders x 15 txs + 1 sender x 10 txs.
+    // The full 579-tx block: 38 senders x 15 txs + 1 sender x 9 txs.
     // (15 txs per key: leaves 0..14; leaf 15 is the reserved cert leaf.)
     BlockBuilder b = next_block(store, ts + 1);
     uint32_t added = 0;
@@ -1148,7 +1168,7 @@ TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
         }
     }
     ASSERT_EQ(added, MAX_TX_PER_BLOCK);
-    // The 581st cannot enter the frame.
+    // The 580th cannot enter the frame.
     {
         Transaction t581 = mk_tx(senders[38].addr, sink, AMOUNT, FEE, 10);
         ASSERT_TRUE(pq_sign(t581, senders[38]));
@@ -1157,7 +1177,7 @@ TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
     const auto res = push_block(store, ledger, b);
     EXPECT_TRUE(res.ok) << res.error;
 
-    EXPECT_EQ(res.transfers, 580u);
+    EXPECT_EQ(res.transfers, 579u);
     EXPECT_EQ(ledger.balance_of(sink), U128(MAX_TX_PER_BLOCK * AMOUNT));
     EXPECT_EQ(ledger.total_burned(), U128(MAX_TX_PER_BLOCK * FEE / 2)); // 29,000
     EXPECT_EQ(ledger.issued_supply(),
@@ -1169,8 +1189,7 @@ TEST(VxBoundaryTortureTest, MaxTxsPerBlockFull) {
         EXPECT_EQ(ledger.balance_of(senders[s].addr),
                   U128(200'000'000ull - 15ull * (AMOUNT + FEE))) << s;
     }
-    EXPECT_EQ(ledger.balance_of(senders[38].addr),
-              U128(200'000'000ull - 10ull * (AMOUNT + FEE)));
+    EXPECT_EQ(ledger.balance_of(senders[38].addr), U128(200'000'000ull - 9ull * (AMOUNT + FEE)));
 
     std::filesystem::remove_all(dir);
 }
@@ -1248,13 +1267,12 @@ TEST(VxBoundaryTortureTest, TxCountHeaderLie) {
     // Seal first: the rejection below must name tx_count, not missing work.
     ASSERT_TRUE(seal_pogw_nonce(f, store.required_pogw_bits()));
 
-    for (const uint32_t lie : {uint32_t{581}, uint32_t{0xFFFFFFFFu}}) {
+    for (const uint32_t lie : {uint32_t{580}, uint32_t{0xFFFFFFFFu}}) {
         BlockFrame poisoned = f;
         std::memcpy(poisoned.data() + 0x1D4, &lie, sizeof(lie));
         const auto res = ledger.apply_block(BlockView(poisoned));
         EXPECT_FALSE(res.ok);
-        EXPECT_EQ(res.error, "tx_count " + std::to_string(lie) +
-                                 " exceeds block capacity 580")
+        EXPECT_EQ(res.error, "tx_count " + std::to_string(lie) + " exceeds block capacity 579")
             << res.error;
         EXPECT_FALSE(store.append_block(poisoned));
         EXPECT_EQ(store.last_error(), "tx_count exceeds MAX_TX_PER_BLOCK");

@@ -14,7 +14,7 @@ namespace vx::blockchain {
 // same 64 KiB frame bit-for-bit — "always regenerate, never copy" by design.
 
 /// Builds the deterministic 64 KiB genesis frame (#0) in memory.
-/// 1000-round Tri-Barrel attractor run (secure CRT moduli) → 472 B header
+/// 1000-round Tri-Barrel attractor run (secure CRT moduli) → 504 B header (VXC7)
 /// with the real attractor coordinates + 1 signed coinbase transaction.
 BlockFrame build_genesis_frame();
 

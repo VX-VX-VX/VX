@@ -58,7 +58,7 @@ uint32_t crc32c_hw(const uint8_t* data, size_t len) noexcept;
 // Scalar CRC32C fallback
 uint32_t crc32c_scalar(const uint8_t* data, size_t len) noexcept;
 
-// Verify all 580 transaction proofs in a frame using OpenMP
+// Verify all 579 transaction proofs in a frame using OpenMP
 // Returns number of invalid proofs found
 int verify_frame_parallel(
     const vx::blockchain::Transaction* txs,

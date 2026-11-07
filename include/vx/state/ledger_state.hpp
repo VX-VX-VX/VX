@@ -120,6 +120,11 @@ public:
 
         std::vector<U128> debits(n);
         std::vector<U128> fees(n);
+        // BACKLOG 2.11: witness bindings collected while each user
+        // transaction is verified; the header's witness_merkle_root is
+        // judged against the recomputed tree AFTER the loop, before any
+        // mutation (same fail-closed discipline as the emission gate).
+        std::vector<blockchain::WitnessBinding> witness_bindings_;
         // Intra-block pending credits for intra-block spendability.
         std::unordered_map<Address, U128, AddressHash> pending_;
         // Intra-block DEBITS per sender (amount + fee, cumulative). Without
@@ -193,32 +198,46 @@ public:
                 }
             } else {
                 vx::crypto::pq::PqSignatureWitness w;
-                std::string pq_err;
-                if (!blockchain::verify_pq_witness(tx, nullptr, &w, &pq_err)) {
-                    res.error = "tx " + std::to_string(i) + ": " + pq_err;
-                    return res;
-                }
+                std::array<uint8_t, 32> canonical_root{};
                 std::array<uint8_t, 32> bound{};
                 if (pq_root_of(sender, bound)) {
-                    if (!vx::core::ct_equal(bound.data(), w.pq_pubkey_root.data(), 32)) {
-                        // BACKLOG 1.5 rollover: the witness root may be a
-                        // LATER window's root, certified by a sequential
-                        // chain of ROLLOVER_CERT records walked from the
-                        // anchor the address commits. Accept only when the
-                        // walked endpoint equals the witness root and the
-                        // witness signs INSIDE the walked window (leaf-15
-                        // exclusivity is already enforced at USE time by
-                        // pq_verify_transaction).
+                    // BACKLOG 2.11: the ledger binding pins the CANONICAL
+                    // root, so the accepted witness is selected by root -
+                    // a candidate that verifies while carrying a DIFFERENT
+                    // root (an attacker's self-consistent pre-registration,
+                    // math-audit F7) can no longer displace the honest one
+                    // by arriving first. The direct match is tried first;
+                    // the certified rollover chain (BACKLOG 1.5) may then
+                    // authorize a LATER window's root as the walked
+                    // endpoint.
+                    const bool direct =
+                        vx::crypto::pq::PqWitnessRegistry::instance().lookup_verifying_with_root(
+                            tx, bound, &w);
+                    bool accepted = direct;
+                    if (direct) {
+                        canonical_root = bound;
+                    } else {
                         std::array<uint8_t, 32> walked{};
                         uint32_t walked_window = 0;
                         const bool walked_ok =
                             vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(
                                 sender.data(), bound, walked, walked_window) &&
-                            vx::core::ct_equal(walked.data(), w.pq_pubkey_root.data(), 32);
+                            vx::crypto::pq::PqWitnessRegistry::instance()
+                                .lookup_verifying_with_root(tx, walked, &w);
                         if (!walked_ok) {
-                            res.error = "tx " + std::to_string(i) +
-                                        ": PQ witness root does not match the sender's bound"
-                                        " key (no certified rollover chain to it)";
+                            // Distinguish the two refusal shapes: no witness
+                            // at all for this digest vs a witness that
+                            // verifies but carries a foreign root.
+                            vx::crypto::pq::PqSignatureWitness any_w;
+                            if (!vx::crypto::pq::PqWitnessRegistry::instance().lookup_verifying(
+                                    tx, any_w)) {
+                                res.error = "tx " + std::to_string(i) +
+                                            ": no PQ witness registered for this transaction";
+                            } else {
+                                res.error = "tx " + std::to_string(i) +
+                                            ": PQ witness root does not match the sender's"
+                                            " bound key (no certified rollover chain to it)";
+                            }
                             return res;
                         }
                         if (w.subtree_index != walked_window) {
@@ -227,10 +246,17 @@ public:
                                         " rollover chain";
                             return res;
                         }
+                        canonical_root = walked;
                     }
+                    (void)accepted;
                 } else if (blockchain::is_pq_address(sender)) {
                     // Self-certifying binding: the address commits its own
                     // key root, so the first witnessed spend binds it.
+                    std::string pq_err;
+                    if (!blockchain::verify_pq_witness(tx, nullptr, &w, &pq_err)) {
+                        res.error = "tx " + std::to_string(i) + ": " + pq_err;
+                        return res;
+                    }
                     Address chk{};
                     blockchain::derive_pq_address(w.pq_pubkey_root.data(), chk.data());
                     if (chk != sender) {
@@ -238,6 +264,7 @@ public:
                                     ": PQ witness root does not derive the sender address";
                         return res;
                     }
+                    canonical_root = w.pq_pubkey_root;
                     // Round-7 hardening: bindings collected, applied only
                     // after the WHOLE block validates - a rejected block
                     // must not mutate consensus state.
@@ -247,6 +274,15 @@ public:
                                 ": sender address is not PQ-bound; keyless transfers are"
                                 " rejected (BACKLOG 0.7)";
                     return res;
+                }
+                {
+                    // BACKLOG 2.11: remember this tx's verified canonical key
+                    // identity for the witness-tree recomputation below.
+                    blockchain::WitnessBinding wb;
+                    wb.tx_index = i;
+                    wb.sender = sender;
+                    wb.pq_root = canonical_root;
+                    witness_bindings_.push_back(wb);
                 }
             }
 
@@ -377,6 +413,28 @@ public:
             // Update expected nonce for next transaction from same sender
             if (!is_genesis && !is_miner && !is_genesis_v1) {
                 expected_nonces_[sender] = expected_nonces_[sender] + 1;
+            }
+        }
+
+        // ── Witness commitment gate (BACKLOG 2.11) ──────────────────────────
+        // Runs AFTER the whole block validates and BEFORE any state mutation.
+        // Every user transaction's witness has just been verified against the
+        // registry; the tree recomputed from those verified keys must equal
+        // the header's witness_merkle_root. A producer that omits a witness
+        // binding, or a frame whose header lies about its witness set, is
+        // refused here - the commitment is consensus-enforced in exactly one
+        // place, with no extra crypto passes (the witnesses were verified
+        // anyway).
+        {
+            uint8_t expect_root[32];
+            blockchain::compute_witness_merkle_root(witness_bindings_.data(),
+                                                    witness_bindings_.size(), expect_root);
+            if (std::memcmp(expect_root, block.header().witness_merkle_root, 32) != 0) {
+                res.error = "ERR_WITNESS_ROOT: witness_merkle_root does not commit this"
+                            " block's verified witness set (height " +
+                            std::to_string(block.header().block_height) + ", user txs " +
+                            std::to_string(witness_bindings_.size()) + ")";
+                return res;
             }
         }
 

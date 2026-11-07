@@ -34,7 +34,7 @@ On first run the node derives block #0 from the published seed and prints:
 `/api/status`. The `tip_hash_hex` must be
 
 ```
-485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d
+047f3cf7ac9f259b0eefda8cc3b0a260f86ae326b7574762823be81f5e0d0794
 ```
 
 If that hash appears — you just *proved* that your machine, your compiler

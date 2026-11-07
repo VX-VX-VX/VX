@@ -45,7 +45,7 @@ curl -s http://localhost:18099/api/status | python3 -m json.tool
     "tip_block_index": 0,
     "ledger_bytes": 65536,
     "frame_size": 65536,
-    "max_tx_per_block": 580,
+    "max_tx_per_block": 579,
     "total_supply_atomics": "254000000000000",
     "total_supply_vx": "2540000.00000000",
     "max_supply_vx": 7000000000,
@@ -55,21 +55,21 @@ curl -s http://localhost:18099/api/status | python3 -m json.tool
     "block_reward_max_vx": 1000,
     "reward_tier_count": 5,
     "tracked_accounts_count": 1,
-    "tip_hash_hex": "485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d",
+    "tip_hash_hex": "047f3cf7ac9f259b0eefda8cc3b0a260f86ae326b7574762823be81f5e0d0794",
     "crypto_engine": "3-Trunk Galois Attractor (3072-bit CRT) + VortexSponge256 (12-Round ARX)",
     "storage_engine": "POSIX mmap/mremap O(1) Zero-Copy"
 }
 ```
 
 What to look at: `tip_hash_hex` is the Sponge256 digest of the tip block's
-full frame commitment - the 472-byte header AND the 104-byte tail (VM state
+full frame commitment - the 504-byte header AND the 104-byte tail (VM state
 root, gas, PoGW nonce, bytecode), so tail metadata cannot change without
 changing the block id (external review round 5; earlier captures show the
 header-only digest of the same genesis). On a **fresh** data directory
 (no `--demo`) it must
 equal the value published in the whitepaper §16 and in
 [The Vortex Challenge](CHALLENGE.md):
-`485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d`.
+`047f3cf7ac9f259b0eefda8cc3b0a260f86ae326b7574762823be81f5e0d0794` (the VXC7 genesis - the frame gained the 32-byte witness_merkle_root header field on 2026-11-07; the pre-2.11 constant was 485f5afac16d6bec3c96efdce197c76ac9c81d0d669ed8b8f4b597669690b44d).
 After the demo block it differs (the chain grew) — that is expected.
 
 `total_supply_atomics` is a string, not a number: u64 atomics are wider

@@ -60,8 +60,45 @@ void PoGWMiner::mine_one(bool single_shot) {
         std::memset(coords, 0, 384);
     }
 
-    // Pull from mempool (up to 579, leaving room for coinbase at index 0)
-    auto txs = mempool_.pull_for_sealing(579);
+    // Pull from mempool (up to MAX_TX_PER_BLOCK - 1, leaving room for the
+    // coinbase at index 0; VXC7 capacity is 579 total)
+    auto txs = mempool_.pull_for_sealing(blockchain::MAX_TX_PER_BLOCK - 1);
+
+    // BACKLOG 2.11: a user transaction may only be sealed together with its
+    // verified witness - the header commits the witness tree and apply_block
+    // refuses a mismatching frame. The binding commits the CANONICAL root
+    // (ledger-bound, genesis-table or self-certifying PQA), not whichever
+    // candidate arrived first, so the committed tree is what every node's
+    // verifier recomputes. A mempool entry whose consensus-consistent
+    // witness has left the registry (cap eviction, restart) is SKIPPED this
+    // round and stays pooled; sealing it would mine a block our own node
+    // must refuse.
+    std::vector<blockchain::WitnessBinding> witness_bindings;
+    {
+        std::vector<blockchain::Transaction> sealed_now;
+        sealed_now.reserve(txs.size());
+        for (const auto &tx : txs) {
+            const auto sender = blockchain::tx_address(tx.sender_nfa);
+            if (blockchain::is_system_sender(sender)) {
+                sealed_now.push_back(tx); // system senders carry no witness
+                continue;
+            }
+            std::array<uint8_t, 32> root{};
+            const auto oracle = [this](const std::array<uint8_t, 42> &a,
+                                       std::array<uint8_t, 32> &out) {
+                return ledger_.pq_root_of(a, out);
+            };
+            if (!blockchain::consensus_witness_root(tx, oracle, root))
+                continue; // witness unavailable or non-canonical - leave the tx pooled
+            blockchain::WitnessBinding b;
+            b.tx_index = static_cast<uint32_t>(1 + sealed_now.size()); // coinbase at 0
+            b.sender = sender;
+            b.pq_root = root;
+            witness_bindings.push_back(b);
+            sealed_now.push_back(tx);
+        }
+        txs = std::move(sealed_now);
+    }
 
     // Coinbase reward (deterministic emission calculation)
     // 50% fees to miner, 50% burned
@@ -111,6 +148,8 @@ void PoGWMiner::mine_one(bool single_shot) {
         final_builder.set_attractor_coords(coords);
         final_builder.add_transaction(cb); // index 0
         for (const auto& tx : txs) final_builder.add_transaction(tx);
+        for (const auto &b : witness_bindings)
+            final_builder.add_witness_binding(b.tx_index, b.sender.data(), b.pq_root.data());
         final_builder.finalize();
         auto frame_view = final_builder.bytes();
 

@@ -1224,6 +1224,31 @@ bool PqWitnessRegistry::lookup_verifying(const Transaction &tx, PqSignatureWitne
     return false;
 }
 
+bool PqWitnessRegistry::lookup_verifying_with_root(const Transaction &tx,
+                                                   const std::array<uint8_t, 32> &root,
+                                                   PqSignatureWitness *out) const {
+    // Copy the candidate witnesses out under the lock; verification runs
+    // WITHOUT the registry lock (same reasoning as lookup_verifying).
+    static thread_local std::vector<PqSignatureWitness> cands;
+    cands.clear();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = by_digest_.find(tx_msg_digest(tx));
+        if (it == by_digest_.end() || it->second.empty())
+            return false;
+        for (const auto &c : it->second)
+            cands.push_back(c.witness);
+    }
+    for (const auto &w : cands) {
+        if (w.pq_pubkey_root == root && pq_verify_transaction(tx, w)) {
+            if (out)
+                *out = w;
+            return true;
+        }
+    }
+    return false;
+}
+
 void PqWitnessRegistry::set_last(const Transaction &tx, const PqSignatureWitness &w) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_tx_ = tx;

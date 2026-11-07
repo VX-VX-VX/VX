@@ -318,6 +318,11 @@ struct Harness {
         for (const auto &t : txs)
             if (!b.add_transaction(t))
                 break;
+        // BACKLOG 2.11: honest frames must commit their witness set.
+        b.bind_canonical_witnesses(
+            [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+                return ledger->pq_root_of(a, out);
+            });
         b.finalize();
         BlockFrame f;
         std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
@@ -441,6 +446,12 @@ struct Harness {
                 if (!b.add_transaction(t))
                     fuzz_fail("funding tx did not fit");
             }
+            // BACKLOG 2.11: the funding frame commits its witness set (the
+            // demo spender is genesis-table bound, so this is deterministic).
+            b.bind_canonical_witnesses(
+                [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+                    return ledger->pq_root_of(a, out);
+                });
             b.finalize();
             BlockFrame f;
             std::memcpy(f.data(), b.bytes().data(), BLOCK_SIZE_BYTES);

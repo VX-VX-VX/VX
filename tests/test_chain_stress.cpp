@@ -245,7 +245,12 @@ BlockBuilder next_block(BlockStore& store, uint64_t ts) {
     return b;
 }
 
-bool seal_and_append(BlockStore& store, BlockBuilder& b, BlockFrame& out) {
+bool seal_and_append(BlockStore &store, LedgerState &ledger, BlockBuilder &b, BlockFrame &out) {
+    // BACKLOG 2.11: bind the canonical witness set before sealing.
+    b.bind_canonical_witnesses(
+        [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return ledger.pq_root_of(a, out);
+        });
     b.finalize();
     std::memcpy(out.data(), b.bytes().data(), BLOCK_SIZE_BYTES);
     if (!seal_pogw_nonce(out, store.required_pogw_bits())) return false;
@@ -557,9 +562,8 @@ void build_blocks(ChainCtx& ctx, UndoEngine& undo, ChainRecord& rec,
 
         // Seal + journal + append + apply (the ledger is the authority).
         BlockFrame frame;
-        ASSERT_TRUE(seal_and_append(store, b, frame))
-            << "seal/append failed at height " << h << ": "
-            << store.last_error();
+        ASSERT_TRUE(seal_and_append(store, ledger, b, frame))
+            << "seal/append failed at height " << h << ": " << store.last_error();
         undo.apply_block(BlockView(frame));
         const auto res = ledger.apply_block(BlockView(frame));
         ASSERT_TRUE(res.ok) << "apply refused at height " << h << ": "
@@ -671,9 +675,8 @@ void seal_append_apply(ChainCtx& ctx, UndoEngine& undo, ChainRecord& rec,
     book_fees(rec.model, fees_sum);
 
     BlockFrame frame;
-    ASSERT_TRUE(seal_and_append(*ctx.store, b, frame))
-        << "seal/append failed at height " << h << ": "
-        << ctx.store->last_error();
+    ASSERT_TRUE(seal_and_append(*ctx.store, *ctx.ledger, b, frame))
+        << "seal/append failed at height " << h << ": " << ctx.store->last_error();
     undo.apply_block(BlockView(frame));
     const auto res = ctx.ledger->apply_block(BlockView(frame));
     ASSERT_TRUE(res.ok) << "block at height " << h << " did NOT apply"

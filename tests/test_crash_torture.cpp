@@ -226,6 +226,12 @@ BlockBuilder next_block(vx::storage::BlockStore& store, uint64_t ts) {
 bool push_journaled_block(vx::state::UndoEngine& undo,
                           vx::storage::BlockStore& store,
                           vx::state::LedgerState& ledger, BlockBuilder& b) {
+    // VXC7: the producer commits the canonical witness set (one binding
+    // per user transaction) into the header BEFORE sealing.
+    b.bind_canonical_witnesses(
+        [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+            return ledger.pq_root_of(a, out);
+        });
     b.finalize();
     BlockFrame frame;
     std::memcpy(frame.data(), b.bytes().data(), BLOCK_SIZE_BYTES);

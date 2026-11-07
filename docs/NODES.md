@@ -55,14 +55,17 @@ Every block — genesis, demo, transfer, wire-received — is the same
 
 | Region | Size | Content |
 |---|---|---|
-| Header | 472 B | height, timestamp, `prev_block_hash`, `merkle_root`, `tx_count`, 384 B attractor coords |
-| Transactions | 580 × 112 B | at most `MAX_TX_PER_BLOCK = 580` |
+| Header | 504 B | height, timestamp, `prev_block_hash`, `merkle_root`, `witness_merkle_root` (BACKLOG 2.11), `tx_count`, 384 B attractor coords |
+| Transactions | 579 × 112 B | at most `MAX_TX_PER_BLOCK = 579` (the +32 B header field took one tx slot; an 80 B body pad keeps every tail offset unchanged) |
 | Padding | 104 B | fixed size, deterministic |
 
-The tip hash is the VortexSponge256 digest of the 472-byte header. The
+The tip hash is the VortexSponge256 digest of the 504-byte header. The
 384 bytes of attractor coordinates (three 128-byte trunks X/Y/Z) are the
-3-Trunk Galois attractor state the block commits to. `tx_count` is
-structurally bounded — a hostile header claiming more than 580
+3-Trunk Galois attractor state the block commits to, and the header now
+also commits `witness_merkle_root` — the sponge tree over every user
+transaction's verified canonical PQ key identity (BACKLOG 2.11, frame
+format VXC7; pre-2.11 VXC6 frames are refused by name). `tx_count` is
+structurally bounded — a hostile header claiming more than 579
 transactions is rejected before anything is walked.
 
 ## Startup path
