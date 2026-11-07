@@ -465,6 +465,13 @@ public:
 
     size_t registered_count() const;
 
+    // Test surface for the 2.11 stage-2 parking windows: empties the
+    // by-digest witness map (bindings, certificates and the durable logs
+    // are untouched). The registry is an in-memory CACHE, never an
+    // authority, so clearing it reproduces the witnesses-in-flight state
+    // without any production effect.
+    void clear_witnesses_for_test();
+
 private:
     struct Entry {
         PqSignatureWitness witness;

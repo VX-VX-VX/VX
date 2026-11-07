@@ -34,8 +34,10 @@
 #include <pthread.h>
 #include <errno.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <fstream>
 #include <stdexcept>
 #include <iostream>
@@ -190,6 +192,9 @@ void HttpServer::attach_p2p(uint16_t p2p_port,
     swarm_node_->set_frame_hook([this](const uint8_t* frame, size_t len) {
         if (len == 65536) apply_remote_frame(frame);
     });
+    // BACKLOG 2.11 stage 2: retry parked frames when their witnesses arrive.
+    swarm_node_->set_witness_callback(
+        [this](const std::array<uint8_t, 32> &digest) { on_witness_arrived(digest); });
     if (p2p_port != 0 && !swarm_node_->bind_p2p_listener(p2p_port)) {
         std::cerr << "[NODE] VX60 P2P bind failed on port " << p2p_port
                   << " — continuing RPC-only\n";
@@ -211,8 +216,18 @@ void HttpServer::attach_p2p(uint16_t p2p_port,
     }
 }
 
-bool HttpServer::apply_remote_frame(const void* frame) {
-    const auto* bytes = static_cast<const uint8_t*>(frame);
+namespace {
+// BACKLOG 2.11 stage 2: the ledger's binding oracle, as the production
+// verifiers pass it.
+vx::blockchain::BoundRootOf ledger_bound_root_of(vx::state::LedgerState &ledger) {
+    return [&ledger](const std::array<uint8_t, 42> &a, std::array<uint8_t, 32> &out) {
+        return ledger.pq_root_of(a, out);
+    };
+}
+} // namespace
+
+HttpServer::RemoteApply HttpServer::try_apply_remote_frame(const uint8_t *bytes,
+                                                           const std::string &peer) {
     vx::blockchain::BlockView view{std::span<const uint8_t, 65536>(bytes, 65536)};
     const uint64_t h = view.header().block_height;
 
@@ -230,14 +245,48 @@ bool HttpServer::apply_remote_frame(const void* frame) {
     // Only a frame that extends our current tip is applied. Fork choice and
     // reorg handling for live peers is ROADMAP item 2 follow-up; until then
     // a competing-height frame is dropped rather than guessed at.
-    if (h != store_.chain_height()) return false;
+    if (h != store_.chain_height())
+        return RemoteApply::REFUSED;
     uint8_t tip[32] = {};
     store_.tip_hash(tip);
-    if (std::memcmp(tip, view.header().prev_block_hash, 32) != 0) return false;
+    if (std::memcmp(tip, view.header().prev_block_hash, 32) != 0)
+        return RemoteApply::REFUSED;
 
     vx::blockchain::BlockFrame f;
     std::memcpy(f.data(), bytes, 65536);
-    if (!store_.append_block(f)) return false;
+
+    // BACKLOG 2.11 stage 2: park the witnesses-in-flight window BEFORE the
+    // store is touched. A frame the canonical rules cannot resolve AT ALL
+    // (MISMATCH: the header commitment names a witness set no canonical
+    // rule produces) is not parkable - the proposer committed something
+    // wrong, which is attributable. MISSING_WITNESS is the ordinary one-hop
+    // witness lag: witnesses are broadcast only after a block applies, so
+    // a remote peer normally sees the frame first.
+    const auto wstatus = vx::blockchain::verify_witness_merkle(
+        *reinterpret_cast<const vx::blockchain::RawBlock *>(f.data()),
+        ledger_bound_root_of(ledger_));
+    if (wstatus == vx::blockchain::WitnessRootStatus::MISSING_WITNESS) {
+        purge_expired_parked_locked();
+        if (parked_witness_frames_.size() >= kMaxParkedWitnessFrames) {
+            parked_witness_frames_.erase(parked_witness_frames_.begin());
+        }
+        ParkedFrame pf;
+        std::memcpy(pf.bytes.data(), bytes, 65536);
+        pf.arrived = std::chrono::steady_clock::now();
+        parked_witness_frames_.push_back(std::move(pf));
+        return RemoteApply::PARKED;
+    }
+    if (wstatus == vx::blockchain::WitnessRootStatus::MISMATCH) {
+        // Withholding becomes attribution: the commitment names a witness
+        // set no canonical rule produces. Scored per peer; escalation to a
+        // mute/ban lives on the SwarmNode reputation surface (the third
+        // 2.11 checkbox builds on this counter).
+        ++witness_withhold_score_[peer];
+        return RemoteApply::REFUSED;
+    }
+
+    if (!store_.append_block(f))
+        return RemoteApply::REFUSED;
     auto* raw = store_.get_block(h);
     vx::blockchain::BlockView applied{std::span<const uint8_t, 65536>(
         reinterpret_cast<const uint8_t*>(raw), 65536)};
@@ -247,7 +296,7 @@ bool HttpServer::apply_remote_frame(const void* frame) {
         // refuses is removed from the ledger file before returning - the
         // next remote frame must find the store still at the old tip.
         store_.rollback_last_append();
-        return false;
+        return RemoteApply::REFUSED;
     }
 
     // Gossip one hop past the origin; peers that already have it will drop
@@ -257,7 +306,86 @@ bool HttpServer::apply_remote_frame(const void* frame) {
     // SSE push (v0.0.8): a remote frame is now our new tip — same event the
     // local miner fires, so GUI clients hear remote seals too.
     broadcast_sse_event("block_sealed", "{\"height\":" + std::to_string(h) + "}");
-    return true;
+    return RemoteApply::APPLIED;
+}
+
+bool HttpServer::apply_remote_frame(const void *frame) {
+    return try_apply_remote_frame(static_cast<const uint8_t *>(frame), "wire") ==
+           RemoteApply::APPLIED;
+}
+
+void HttpServer::purge_expired_parked_locked() {
+    const auto cutoff = std::chrono::steady_clock::now() - witness_park_ttl_;
+    parked_witness_frames_.erase(
+        std::remove_if(parked_witness_frames_.begin(), parked_witness_frames_.end(),
+                       [cutoff](const ParkedFrame &pf) { return pf.arrived < cutoff; }),
+        parked_witness_frames_.end());
+}
+
+void HttpServer::on_witness_arrived(const std::array<uint8_t, 32> &digest) {
+    std::vector<ParkedFrame> candidates;
+    {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        if (parked_witness_frames_.empty())
+            return;
+        purge_expired_parked_locked();
+        for (auto it = parked_witness_frames_.begin(); it != parked_witness_frames_.end();) {
+            const auto *raw = reinterpret_cast<const vx::blockchain::RawBlock *>(it->bytes.data());
+            const uint32_t count =
+                raw->header.tx_count > vx::blockchain::MAX_TX_PER_BLOCK ? 0u : raw->header.tx_count;
+            bool hit = false;
+            for (uint32_t i = 0; i < count && !hit; ++i) {
+                const auto &tx = raw->transactions[i];
+                const char *sk = reinterpret_cast<const char *>(tx.sender_nfa);
+                if (std::strncmp(sk, "GENESIS", 7) == 0 || std::strncmp(sk, "MINER_", 6) == 0)
+                    continue; // system senders carry no witness
+                if (vx::crypto::pq::tx_msg_digest(tx) == digest)
+                    hit = true;
+            }
+            if (hit) {
+                candidates.push_back(std::move(*it));
+                it = parked_witness_frames_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // Retry OUTSIDE the state lock: try_apply_remote_frame takes
+    // state_mutex_ -> seal_mutex_ itself (same order as the live path).
+    for (auto &pf : candidates) {
+        const auto outcome = try_apply_remote_frame(pf.bytes.data(), "parked-retry");
+        if (outcome == RemoteApply::PARKED) {
+            // Witnesses are still incomplete: re-park. pf.arrived still
+            // holds the ORIGINAL arrival time, so the TTL keeps ticking
+            // from the first attempt. The cap holds on this path too
+            // (security review residual: a concurrent retry wave must
+            // not overshoot it) - a frame that does not fit is dropped:
+            // a full park means 32 fresher frames are waiting.
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            if (parked_witness_frames_.size() < kMaxParkedWitnessFrames) {
+                parked_witness_frames_.push_back(std::move(pf));
+            }
+        }
+        // APPLIED: gossip + SSE already happened inside the apply path.
+        // REFUSED: the tip moved past the parked frame (it is dead) or the
+        // ledger refused for a permanent reason - drop it.
+    }
+}
+
+size_t HttpServer::parked_witness_count() {
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    return parked_witness_frames_.size();
+}
+
+uint64_t HttpServer::witness_withhold_count(const std::string &peer) {
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    auto it = witness_withhold_score_.find(peer);
+    return it == witness_withhold_score_.end() ? 0 : it->second;
+}
+
+void HttpServer::set_witness_park_ttl_for_test(std::chrono::milliseconds ttl) {
+    std::lock_guard<std::mutex> state_lock(state_mutex_);
+    witness_park_ttl_ = ttl;
 }
 
 // Zero-trust review P2-2: header-name matching is line-start exact — a

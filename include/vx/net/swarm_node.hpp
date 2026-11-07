@@ -231,6 +231,16 @@ public:
     using FrameHook = std::function<void(const uint8_t *frame, size_t len)>;
     void set_frame_hook(FrameHook hook);
 
+    // BACKLOG 2.11 stage 2: fired on BOTH reader loops after a PQ_WITNESS
+    // message is registered in the witness registry, so the intake layer
+    // (HttpServer) can retry block frames it parked pending witnesses. The
+    // callback runs on the reader thread with NO swarm locks held - the
+    // callee owns its own locking (the established state_mutex_ ->
+    // seal_mutex_ order; it may re-enter broadcast paths that take
+    // peers_mutex_ last, which is consistent with the existing hook).
+    using WitnessCallback = std::function<void(const std::array<uint8_t, 32> &digest)>;
+    void set_witness_callback(WitnessCallback cb);
+
     // ── VX60 wire protocol ────────────────────────────────────────
 
     // Build a 24-byte WireHeader for a payload (computes hardware CRC32C).
@@ -353,6 +363,7 @@ private:
 
     // Callback for verified inbound block frames (set by the node layer)
     FrameHook frame_hook_;
+    WitnessCallback witness_callback_;
 
     // VX60 wire statistics (atomic: updated from multiple threads)
     std::atomic<uint64_t> corrupted_packets_dropped_{0};

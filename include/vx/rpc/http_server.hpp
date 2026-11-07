@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <map>
+
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
 #include "vx/state/undo_engine.hpp"
@@ -140,12 +143,51 @@ public:
     // it extends the current tip (height == chain_height and prev_block_hash
     // == tip hash); anything else is dropped. On success the frame is
     // re-broadcast to this node's peers so it gossips past its origin.
+    //
+    // BACKLOG 2.11 stage 2: a tip-extending frame whose canonical witness
+    // set has not arrived yet (verify_witness_merkle == MISSING_WITNESS) is
+    // PARKED, not applied and not refused - witnesses travel out-of-band
+    // and normally trail the frame by one gossip hop. A parked frame is
+    // retried when its witnesses arrive (on_witness_arrived, wired from the
+    // SwarmNode witness callback) and expires after the park TTL. A frame
+    // whose header commitment does not match any canonical resolution
+    // (MISMATCH) is refused outright and counted against the sending peer:
+    // the header commitment makes withholding attributable.
     bool apply_remote_frame(const void* frame);
+
+    // Stage-2 retry seam: called by the SwarmNode witness callback (and
+    // directly by tests). Scans the parked frames for one that carries a
+    // transaction with this message digest and retries it through the same
+    // apply path. Runs on swarm reader threads - takes state_mutex_ and
+    // seal_mutex_ itself, in the established order.
+    void on_witness_arrived(const std::array<uint8_t, 32> &digest);
+
+    // Test/diagnostic surface for the parking window.
+    size_t parked_witness_count();
+    uint64_t witness_withhold_count(const std::string &peer);
+    void set_witness_park_ttl_for_test(std::chrono::milliseconds ttl);
 
 private:
     void accept_loop();
     void handle_client(int client_fd);
     void handle_sse_client(int client_fd);
+
+    // The one apply path for remote frames (wire intake and parked-retry
+    // share it, so parking can never bypass a check the live path has).
+    enum class RemoteApply { APPLIED, PARKED, REFUSED };
+    RemoteApply try_apply_remote_frame(const uint8_t *bytes, const std::string &peer);
+    void purge_expired_parked_locked();
+
+    struct ParkedFrame {
+        std::array<uint8_t, 65536> bytes{};
+        std::chrono::steady_clock::time_point arrived;
+    };
+    // Bounded park for frames whose witnesses are still in flight (DoS cap:
+    // oldest frame evicted when full). Guarded by state_mutex_.
+    static constexpr size_t kMaxParkedWitnessFrames = 32;
+    std::vector<ParkedFrame> parked_witness_frames_;
+    std::map<std::string, uint64_t> witness_withhold_score_;
+    std::chrono::milliseconds witness_park_ttl_{60000};
 
     HttpRequest parse_request(int client_fd, bool& ok);
     void send_response(int client_fd, const HttpResponse& res);

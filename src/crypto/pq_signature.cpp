@@ -1270,4 +1270,9 @@ size_t PqWitnessRegistry::registered_count() const {
     return by_digest_.size();
 }
 
+void PqWitnessRegistry::clear_witnesses_for_test() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    by_digest_.clear();
+}
+
 } // namespace vx::crypto::pq

@@ -301,6 +301,8 @@ target_link_libraries(test_apply_integrity PRIVATE vx_core gtest gtest_main)
 # BACKLOG 2.11 stage 1: the witness_merkle_root header commitment (VXC7).
 add_executable(test_witness_merkle tests/test_witness_merkle.cpp)
 target_link_libraries(test_witness_merkle PRIVATE vx_core gtest gtest_main)
+add_executable(test_witness_delivery tests/test_witness_delivery.cpp)
+target_link_libraries(test_witness_delivery PRIVATE vx_core gtest gtest_main)
 
 add_executable(test_mempool_admission tests/test_mempool_admission.cpp)
 target_link_libraries(test_mempool_admission PRIVATE vx_core gtest gtest_main)
@@ -319,6 +321,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_rpc_auth test_key_import
             test_apply_integrity test_mempool_admission test_fold_window
             test_witness_merkle
+            test_witness_delivery
             test_sponge512 test_sponge1024 test_address_v2
             test_attractor_degeneracy test_pq_rollover
             test_pq_rollover_wiring
@@ -366,6 +369,7 @@ add_test(NAME VortexRpcAuthTest COMMAND test_rpc_auth)
 add_test(NAME VortexKeyImportTest COMMAND test_key_import)
 add_test(NAME VortexApplyIntegrityTest COMMAND test_apply_integrity)
 add_test(NAME VortexWitnessMerkleTest COMMAND test_witness_merkle)
+add_test(NAME VortexWitnessDeliveryTest COMMAND test_witness_delivery)
 add_test(NAME VortexMempoolAdmissionTest COMMAND test_mempool_admission)
 
 # ── libFuzzer targets (Tier-2 hardening) ─────────────────────────────────────

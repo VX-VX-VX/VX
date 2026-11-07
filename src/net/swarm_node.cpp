@@ -259,6 +259,8 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             std::memcpy(digest.data(), payload.data(), 32);
             vx::crypto::pq::PqWitnessRegistry::instance().register_witness_bytes(
                 digest, payload.data() + 32, w);
+            if (witness_callback_)
+                witness_callback_(digest);
             continue;
         }
         if (type == WireMsgType::ROLLOVER_CERT) {
@@ -489,6 +491,10 @@ void SwarmNode::broadcast_frame(const std::span<const uint8_t, 65536> &frame) {
 // node can verify the block's user transactions on arrival (the 64 KiB
 // frame has no spare bytes — the witness rides beside the frame, never
 // inside it).
+void SwarmNode::set_witness_callback(WitnessCallback cb) {
+    witness_callback_ = std::move(cb);
+}
+
 void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536> &frame) {
     auto *raw = reinterpret_cast<const blockchain::RawBlock *>(frame.data());
     const uint32_t count =
@@ -787,6 +793,8 @@ void SwarmNode::serve_connection(int c) {
             std::memcpy(digest.data(), payload.data(), 32);
             vx::crypto::pq::PqWitnessRegistry::instance().register_witness_bytes(
                 digest, payload.data() + 32, w);
+            if (witness_callback_)
+                witness_callback_(digest);
             continue;
         }
         if (type == WireMsgType::ROLLOVER_CERT) {

@@ -1451,11 +1451,33 @@ the block itself, so witnesses necessarily travel out-of-band today.
   selection ignores a foreign pre-registered candidate). All touched
   suites patched and green on the assert lane (38 ctest entries + the
   new suite).
-- [ ] STAGE 2 (open): the delivery protocol the header commitment now
-  makes possible — a node demands the exact witness set the proposer
-  committed to; MISSING_WITNESS vs MISMATCH distinction is already in
-  place for parking: park-pending frames in apply_remote_frame, retry
-  on witness arrival, attribution/ban for withholding proposers.
+- [x] STAGE 2 DELIVERED 2026-11-07: the delivery protocol around the
+  stage-1 commitment. apply_remote_frame PARKS a tip-extending frame
+  whose canonical witness set has not arrived (verify_witness_merkle ==
+  MISSING_WITNESS) instead of refusing it — witnesses travel out-of-band
+  and normally trail the frame by one gossip hop, so parking is the
+  steady state, and the old reject-forever behavior was the 2.11
+  liveness stall. A frame whose commitment matches NO canonical rule
+  (MISMATCH) is refused outright and counted per sending peer
+  (witness_withhold_score_) — withholding is attributable; escalation
+  to mute/ban rides the SwarmNode reputation surface (still open, see
+  the third checkbox). Retry: SwarmNode fires a new witness-arrival
+  callback on BOTH reader loops after a PQ_WITNESS registration; the
+  HttpServer scans its parked frames for the matching tx digest and
+  retries through the SAME apply path (validate -> witness check ->
+  append -> apply; no bypass surface), re-parking on still-missing and
+  dropping on tip-move (a parked frame only ever extends the tip it
+  named). Park bounds: 32 frames, oldest evicted, 60 s TTL with lazy
+  purge — DoS-bounded both ways. Design draft:
+  archives/notes/witness-delivery-stage2-design.md. Tests:
+  VortexWitnessDeliveryTest, 6 sections (park-then-retry, mismatch
+  refused and attributed, cap eviction, TTL expiry, tip-move kills a
+  parked frame, unrelated witness does not retry). Honest notes: (a) a
+  brand-new REMOTE sender's first transaction still has no binding and
+  would park to expiry — the first-seen binding path (first checkbox)
+  remains open; (b) the withhold counter logs only, no ban yet; (c) a
+  dedicated WITNESS_REQUEST pull is a follow-up only if one-hop
+  witness gossip does not converge on deeper topologies.
 - [ ] Define the witness-retention window: how long a node must serve
   witnesses for blocks it proposes, and the ban/score for a peer that
   repeatedly proposes blocks whose witnesses never arrive.
