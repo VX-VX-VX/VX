@@ -856,6 +856,65 @@ Remaining (honest gaps, not hidden):
   `PqWitnessRegistry` overwrites `sender_roots_` on every registration —
   root rotation is silently accepted, which the certification chain must
   replace.
+
+  DESIGN NOTE (2026-11-07, pre-implementation; consensus change ->
+  owner sign-off required before code):
+
+  - Today's posture: `LedgerState::bind_pq_sender` REFUSES a different
+    root for an already-bound address, so a bound account is frozen at
+    its window-0 root; after 15 leaves the account is dead (today's
+    answer: a new self-certifying address). The registry-level
+    `sender_roots_` overwrite affects only the admission cache - a
+    foreign-root tx can enter the mempool but always fails the
+    consensus bound-root check (theft impossible, mempool DoS surface
+    only, already mitigated by lookup_verifying).
+  - State model: `pq_roots_` keeps holding the CURRENT root (so the
+    existing bound-root check needs no signature change); a parallel
+    map Address -> u32 current_window defaults to 0 for every bound
+    account. A certificate advances both atomically inside block
+    application.
+  - Certificate rule (sequential-window, fail-closed): a cert is
+    accepted only when (a) cert.leaf_index == 15 (the kernel
+    invariant), (b) cert.subtree_index == the account's current
+    window, (c) the target window == current + 1, (d)
+    cert.pq_pubkey_root == the account's current bound root, and (e)
+    pq_verify_rollover(bound, from, to, claimed_new_root, cert) passes
+    - the signature commits (old_root, from, to, new_root), so the
+    claimed new root cannot be substituted. After acceptance the
+    account's bound root becomes claimed_new_root and the window
+    advances; a REPLAY of the same cert then fails at (b) - windows
+    never repeat. Transaction witnesses from any window verify against
+    the CURRENT root, so older-window witnesses fail after the cert
+    (the account moved).
+  - Reorg/undo: the root/window pair joins the existing per-block undo
+    vectors (BalanceUndo/NonceUndo pattern) - a rewound block restores
+    the pre-cert root and window; replay on the winning fork re-applies
+    the cert from the sidecar. Burn discipline stays with the leaf
+    ledger (a burned leaf 15 never returns, even across a reorg - the
+    account re-certifies on the next leaf... no: leaf 15 is the ONLY
+    cert leaf; a reorg-discarded cert re-signs from the same burned
+    leaf record, which the ledger already refuses - the wallet must
+    keep the discarded cert's witness or re-derive an equivalent one;
+    documented as a wallet-policy obligation, not a consensus problem).
+  - Carrier (DECISION NEEDED from the owner, both keep the 112-byte
+    wire layout frozen):
+    A. Zero-amount self-send marker: sender == receiver == the PQA
+       address, amount == 0, fee normal. Today "zero transfer" is
+       refused for user senders; the wiring carves exactly this shape
+       out as a ROLLOVER INTENT whose authorization comes entirely
+       from the cert witness (the keyless cocoon digest is irrelevant
+       for a valueless self-send). No wire change, no new tx type.
+    B. A dedicated wire tag for a certificate record (a VX60 format
+       addition per the standing freeze rule - heavier process, new
+       format tag, old/new node separation through the migration
+       protocol).
+    Recommendation: A - smallest change, the marker is unambiguous
+    (amount 0 + self + PQ-bound sender), and the cert witness is
+    verified independently of the tx proof either way.
+  - Registry side: a parallel cert store (candidates keyed by sender,
+    same fail-closed verification discipline as register_witness) +
+    durable sidecar record type; sender_roots_ overwrite semantics
+    stay admission-cache-only and are documented as such.
 - [ ] Wallet policy: when to roll over (window exhaustion), certificate
   publication/relay, and burning leaf 15 in the ledger at rollover time.
   The leaf-15 burn is NO LONGER caller discipline: kernel invariant
