@@ -905,20 +905,61 @@ Remaining (honest gaps, not hidden):
 
   Still open under this item:
 
-- [ ] **P0 GATE (security review 2026-11-07, must close BEFORE any wallet
-  emits certificates)**: cert DELIVERY has no guarantee. Today a
-  certificate is fire-and-forget relay (`broadcast_rollover_cert`) and
-  nodes never backfill: a node that misses a relayed cert (connect
-  later, packet loss, restart with a pruned sidecar) fails
-  `apply_block` at the rotated block while its peers accept it -
-  permanent divergence, the failure the replay path cannot recover
-  from. The acceptance walk is only as consistent as the cert store
-  behind it. Required: a cert fetch/backfill protocol (cert INV +
-  GET_CERTS over VX60, replay-on-demand from the durable sidecar) and
-  a rule for which node relays which certs. While NO wallet emits
-  certificates the feature is inert and the hazard is unreachable -
-  which is exactly why this gate is pinned HERE, before the wallet
-  policy item can flip it on.
+- [x] **P0 GATE CLOSED (2026-11-08): cert delivery/backfill protocol over
+  VX60**. Delivery is no longer fire-and-forget-only:
+  - Deterministic cert identity: `rollover_cert_id(cert)` =
+    Sponge256("VX_CERT_ID_V1" || sender(42) || from_window u32 LE ||
+    to_window u32 LE || old_root(32) || new_root(32)) - a pure function of
+    the transition tuple (the WOTS+ witness is deterministic per tuple, so
+    it is NOT part of the id; two honest nodes compute the same id for the
+    same transition).
+  - New wire types `CERT_INV = 0x0B` / `GET_CERTS = 0x0C`, payload
+    count(u32 LE) + count x 32-byte ids, count <= 64 (max payload
+    2052 B); `wire_header_plausible` accepts 0x01..0x0C, 0x0D still fails
+    closed (pinned by the wiring test).
+  - Registry id index: `register_rollover_cert(cert, &fresh)` sets
+    `fresh` only when THIS call stored a NEW record (the relay cue);
+    `have_cert_id` / `lookup_cert_by_id` / `cert_inventory(max<=64)`
+    (newest-last, window 1024) index every stored record including the
+    sidecar-replay path; certs NEVER touch the sender_roots_ admission
+    cache.
+  - Relay rule: on a FRESH registration (wire OR sidecar replay) the node
+    broadcasts the full ROLLOVER_CERT one hop AND a one-id CERT_INV; on
+    CERT_INV a node answers GET_CERTS naming every unknown id; on
+    GET_CERTS a node answers with the FULL verified 2490-byte records for
+    the ids it holds (unknown id -> silence, no error channel). Pulled
+    records go through the SAME full-verification path as relayed ones -
+    nothing unverified is ever stored or indexed.
+  - Connect-time retention: `serve_witness_retention` (inside the same
+    per-IP 60 s rate gate as the witness window) announces the cert
+    inventory to every freshly promoted peer, so a node that connected
+    mid-stream learns what it missed.
+  - Handlers live in BOTH reader loops (peer_reader_loop +
+    serve_connection) and re-verify the full object on intake; sends use
+    the dup-fd discipline under peers_mutex_.
+  - Tests: wiring suite sections 10-13 (cert-id determinism and
+    tuple-distinctness, registry id index + fresh flag, payload
+    encode/decode round-trip with re-verification), three socket e2e
+    tests in VortexSwarmP2PTest (GET_CERTS round-trip returns the exact
+    full record; unknown-id CERT_INV triggers the GET_CERTS pull; count=65
+    oversized lists fail closed silently and the connection survives),
+    and the connect-time CERT_INV pin (first connect announces the id,
+    rate-gated second connect announces nothing).
+  - Honest residuals: (a) GET_CERTS has no per-peer rate limit beyond the
+    payload bounds (64 ids/request) - each request costs at most 64
+    lookups + 64 sends; (b) no targeted re-request after an apply
+    failure - recovery relies on the connect-time announcement and the
+    relay; (c) the inventory window covers the last 1024 stored certs -
+    older certs are replayed from the durable sidecar at startup, but a
+    node wanting an OLDER cert from a LIVE peer cannot name it until the
+    sidecar-scan fallback ships (recorded below); (d) a connection whose
+    FIRST packet is CERT_INV/GET_CERTS is served but not promoted into
+    the broadcast-target table (promotion hooks PING / RAW_BLOCK_64K /
+    PQ_WITNESS / ROLLOVER_CERT) - a pull-only peer relays nothing; wire
+    it into the promote set when a peer role concept lands.
+- [ ] P3: live-peer sidecar-scan fallback - serve cert ids older than the
+  1024-entry inventory window from the durable VXPQRT1 sidecar on demand
+  (bounded scan), so deep-history backfill does not depend on restarts.
 - [ ] Wallet policy: when to roll over (window exhaustion), certificate
   publication/relay (`broadcast_rollover_cert` exists at the wire
   layer; the RPC/wallet trigger does not), and the post-rollover leaf
@@ -1848,12 +1889,13 @@ amends the list as needed.
   test RemoteFirstSpendBindsAndContinues pins it (park -> witness
   arrives -> frame applies -> binding persists). Residual (policy, not a
   blocker): classic (non-PQA) addresses have no remote onboarding path.
-- [ ] **1.5 P0 GATE: cert delivery/backfill** (see 1.5): a node that
-  misses a relayed rollover cert diverges permanently. A beta network
-  with wallets running rollovers cannot ship without cert INV +
-  GET_CERTS over VX60 and replay-on-demand from the durable sidecar.
-  The gate stands until this closes - no wallet emits certificates
-  before it does.
+- [x] **1.5 P0 GATE: cert delivery/backfill** — CLOSED (2026-11-08,
+  see 1.5): CERT_INV (0x0B) / GET_CERTS (0x0C) over VX60, deterministic
+  cert ids, fresh-flag relay, connect-time inventory announcement inside
+  the retention rate gate, full-verification-only intake. Residual: no
+  per-peer GET_CERTS rate limit beyond payload bounds; live-peer deep
+  history (>1024 certs) needs the sidecar-scan fallback (P3, tracked
+  above).
 - [ ] **1.5 wallet policy**: rollover trigger on window exhaustion,
   publication/relay trigger from RPC/wallet, and the leaf-log record
   widening for window-1 leaves (a store-format change through the

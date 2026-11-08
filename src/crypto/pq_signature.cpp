@@ -919,7 +919,42 @@ bool PqWitnessRegistry::append_durable_locked(const std::array<uint8_t, 32> &dig
 
 // ── Rollover certificate store (BACKLOG 1.5 wiring) ──────────────────────────
 
-bool PqWitnessRegistry::register_rollover_cert(const PqRolloverCert &cert) {
+// ── BACKLOG 1.5 P0 GATE: deterministic certificate identifier ───────────────
+
+std::array<uint8_t, 32> rollover_cert_id(const PqRolloverCert &cert) noexcept {
+    PreimageBuf p;
+    p.put_str("VX_CERT_ID_V1", 13);
+    p.put(cert.sender.data(), 42);
+    p.put_u32(cert.from_window);
+    p.put_u32(cert.to_window);
+    p.put(cert.old_root.data(), 32);
+    p.put(cert.new_root.data(), 32);
+    std::array<uint8_t, 32> out{};
+    sponge(p.b.data(), p.n, out.data());
+    return out;
+}
+
+// Content equality over the WIRE content only (the 2490 bytes of fields),
+// never sizeof(PqRolloverCert): the struct carries 2 unspecified padding
+// bytes after sender[42] (2492 total), so a sizeof-wide memcmp compares
+// indeterminate bytes and dedup becomes compiler-dependent. Security
+// review 2026-11-08 (empirically confirmed): on a clang-built node a
+// byte-identical wire REPLAY parsed into a fresh struct could memcmp-
+// mismatch every stored copy on a padding byte, be re-stored as "fresh"
+// and re-broadcast - repeated replays fill the sender's 32-cert chain
+// with duplicates and starve its legitimate next-window certificate, a
+// replay-driven divergence GCC builds do not exhibit. PqSignatureWitness
+// has no internal padding (static_assert 2376), so memcmp over it is
+// well-defined.
+namespace {
+bool rollover_cert_content_equal(const PqRolloverCert &a, const PqRolloverCert &b) noexcept {
+    return a.sender == b.sender && a.from_window == b.from_window && a.to_window == b.to_window &&
+           a.old_root == b.old_root && a.new_root == b.new_root &&
+           std::memcmp(&a.witness, &b.witness, sizeof(a.witness)) == 0;
+}
+} // namespace
+
+bool PqWitnessRegistry::register_rollover_cert(const PqRolloverCert &cert, bool *fresh) {
     // Sequence policy first (cheap): a certificate rotates the account
     // exactly one window forward. Anything else is refused before any
     // hash work.
@@ -947,6 +982,8 @@ bool PqWitnessRegistry::register_rollover_cert(const PqRolloverCert &cert) {
     // store is: an entry exists only AFTER full cryptographic
     // verification, so filling it requires signing keys, not spam.
     std::lock_guard<std::mutex> lock(mutex_);
+    if (fresh)
+        *fresh = false;
     auto it = cert_by_sender_.find(cert.sender);
     if (it == cert_by_sender_.end()) {
         if (cert_by_sender_.size() >= kMaxCertSenders)
@@ -955,13 +992,58 @@ bool PqWitnessRegistry::register_rollover_cert(const PqRolloverCert &cert) {
     }
     auto &chain = it->second;
     for (const auto &c : chain)
-        if (std::memcmp(&c, &cert, sizeof(cert)) == 0)
+        if (rollover_cert_content_equal(c, cert))
             return true; // dedup
     if (chain.size() >= kMaxCertsPerSender)
         return false;
     chain.push_back(cert);
     append_cert_durable_locked(cert);
+    // The relay cue fires only when the id is genuinely new: a same-id
+    // re-store (hash collision or a padding-agnostic re-store path) must
+    // never re-broadcast the certificate (review 2026-11-08, defense in
+    // depth under the content-equality dedup).
+    const bool indexed_new = index_cert_locked(cert);
+    if (fresh)
+        *fresh = indexed_new;
     return true;
+}
+
+// BACKLOG 1.5 P0 GATE: id index + bounded insertion-order inventory for one
+// newly STORED certificate. Id-dedup: a replayed duplicate record must not
+// grow the inventory deque. Returns true only when the id was genuinely new.
+bool PqWitnessRegistry::index_cert_locked(const PqRolloverCert &c) {
+    const auto id = rollover_cert_id(c);
+    if (!cert_by_id_.emplace(id, c).second)
+        return false; // already indexed
+    cert_inv_order_.push_back(id);
+    if (cert_inv_order_.size() > kCertInventoryWindow)
+        cert_inv_order_.pop_front();
+    return true;
+}
+
+bool PqWitnessRegistry::have_cert_id(const std::array<uint8_t, 32> &id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cert_by_id_.count(id) != 0;
+}
+
+bool PqWitnessRegistry::lookup_cert_by_id(const std::array<uint8_t, 32> &id,
+                                          PqRolloverCert &out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = cert_by_id_.find(id);
+    if (it == cert_by_id_.end())
+        return false;
+    out = it->second;
+    return true;
+}
+
+std::vector<std::array<uint8_t, 32>> PqWitnessRegistry::cert_inventory(size_t max_ids) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::array<uint8_t, 32>> out;
+    const size_t begin = cert_inv_order_.size() > max_ids ? cert_inv_order_.size() - max_ids : 0;
+    out.reserve(cert_inv_order_.size() - begin);
+    for (size_t i = begin; i < cert_inv_order_.size(); ++i)
+        out.push_back(cert_inv_order_[i]);
+    return out;
 }
 
 bool PqWitnessRegistry::advance_root_chain(const uint8_t sender_nfa[42],
@@ -1085,7 +1167,7 @@ void PqWitnessRegistry::attach_durable_cert_log(const std::string &path) {
         good_offset += static_cast<off_t>(sizeof(rec));
         if (std::memcmp(rec, "VXPQRT1", 8) != 0)
             break; // corrupt -> stop
-        PqRolloverCert c;
+        PqRolloverCert c{}; // zero-init: no indeterminate padding in play
         std::memcpy(c.sender.data(), rec + 8, 42);
         std::memcpy(&c.from_window, rec + 50, 4);
         std::memcpy(&c.to_window, rec + 54, 4);
@@ -1099,12 +1181,14 @@ void PqWitnessRegistry::attach_durable_cert_log(const std::string &path) {
         auto &chain = cert_by_sender_[c.sender];
         bool dup = false;
         for (const auto &e : chain)
-            if (std::memcmp(&e, &c, sizeof(c)) == 0) {
+            if (rollover_cert_content_equal(e, c)) {
                 dup = true;
                 break;
             }
-        if (!dup && chain.size() < kMaxCertsPerSender)
+        if (!dup && chain.size() < kMaxCertsPerSender) {
             chain.push_back(c);
+            index_cert_locked(c);
+        }
     }
     // O_APPEND writes at the end; no explicit seek needed.
 }

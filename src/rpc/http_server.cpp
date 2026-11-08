@@ -449,6 +449,11 @@ void HttpServer::serve_witness_retention(const std::string &peer_label) {
         swarm_node_->send_witnesses_to(peer_label,
                                        std::span<const uint8_t, 65536>(f.data(), f.size()));
     }
+    // BACKLOG 1.5 P0 GATE: the same connect-time retention announces the
+    // certificate inventory (ids only, bounded 64) so a peer that connected
+    // mid-stream can pull missed rollover certificates with GET_CERTS -
+    // the pull-based recovery the fire-and-forget cert relay never had.
+    swarm_node_->send_cert_inv_to(peer_label, 64);
 }
 
 uint64_t HttpServer::witness_withhold_count(const std::string &peer) {

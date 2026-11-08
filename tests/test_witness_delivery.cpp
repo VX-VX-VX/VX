@@ -71,6 +71,26 @@ PqAccount make_pq_account(const char *tag) {
     return acc;
 }
 
+// BACKLOG 1.5 P0 GATE: one honest rollover certificate for the connect-time
+// CERT_INV assertion (same construction the wiring test uses).
+vx::crypto::pq::PqRolloverCert make_test_cert(const char *tag) {
+    std::array<uint8_t, 32> master{};
+    VortexSponge256::compute(reinterpret_cast<const uint8_t *>(tag), std::strlen(tag),
+                             master.data());
+    const auto pub_seed = vx::crypto::pq::pub_seed_from_sk(master);
+    vx::crypto::pq::PqRolloverCert cert;
+    std::memcpy(cert.sender.data(), "PQA", 3);
+    std::memcpy(cert.sender.data() + 3, master.data(), 32);
+    for (size_t i = 35; i < cert.sender.size(); ++i)
+        cert.sender[i] = static_cast<uint8_t>('A' + (i % 26));
+    cert.from_window = 0;
+    cert.to_window = 1;
+    cert.old_root = vx::crypto::pq::xmss_root_tree(master, pub_seed, 0);
+    cert.new_root = vx::crypto::pq::xmss_root_tree(master, pub_seed, 1);
+    cert.witness = vx::crypto::pq::pq_sign_rollover(master, 0, 1, nullptr);
+    return cert;
+}
+
 Transaction make_tx(const Address &sender, const Address &receiver, uint64_t amount,
                     uint32_t nonce) {
     Transaction tx{};
@@ -506,6 +526,12 @@ TEST(VortexWitnessDeliveryTest, RetentionServedOnConnect) {
     const uint16_t port = free_tcp_port();
     c.server->attach_p2p(port, {});
 
+    // P0 GATE: the registry holds one certificate, so the connect-time
+    // retention must announce its id alongside the witness window.
+    const auto cert = make_test_cert("vx_wd_cert_inv");
+    ASSERT_TRUE(vx::crypto::pq::PqWitnessRegistry::instance().register_rollover_cert(cert));
+    const auto cert_id = vx::crypto::pq::rollover_cert_id(cert);
+
     // Connect and PING: the promotion fires the retention serve before the
     // PONG goes out.
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -522,8 +548,9 @@ TEST(VortexWitnessDeliveryTest, RetentionServedOnConnect) {
     ping.crc32c = vx::net::compute_wire_crc32c(nullptr, 0);
     ASSERT_TRUE(send_full(fd, &ping, sizeof(ping)));
 
-    bool got_pong = false, got_witness = false, witness_matches = false;
-    for (int i = 0; i < 50 && !(got_pong && got_witness); ++i) {
+    bool got_pong = false, got_witness = false, witness_matches = false, got_cert_inv = false,
+         cert_inv_matches = false;
+    for (int i = 0; i < 50 && !(got_pong && got_witness && got_cert_inv); ++i) {
         vx::net::WireHeader h{};
         if (!read_full(fd, &h, sizeof(h)))
             break;
@@ -538,10 +565,26 @@ TEST(VortexWitnessDeliveryTest, RetentionServedOnConnect) {
             witness_matches = std::memcmp(payload.data(), digest.data(), 32) == 0 &&
                               std::memcmp(payload.data() + 32, c.spender.data(), 42) == 0;
         }
+        // CERT_INV: count(u32 LE) + ids; the announced id must be ours.
+        if (h.msg_type == static_cast<uint8_t>(vx::net::WireMsgType::CERT_INV) &&
+            payload.size() >= 4 && payload.size() <= 4 + 64 * 32) {
+            uint32_t n = 0;
+            std::memcpy(&n, payload.data(), 4);
+            if (n >= 1 && payload.size() >= 4 + n * 32) {
+                for (uint32_t k = 0; k < n; ++k) {
+                    if (std::memcmp(payload.data() + 4 + k * 32, cert_id.data(), 32) == 0) {
+                        got_cert_inv = true;
+                        cert_inv_matches = true;
+                    }
+                }
+            }
+        }
     }
     EXPECT_TRUE(got_pong);
     EXPECT_TRUE(got_witness) << "the retention window must re-serve the spend witness";
     EXPECT_TRUE(witness_matches) << "digest and sender must be the spend tx's";
+    EXPECT_TRUE(got_cert_inv) << "connect-time retention must announce the cert inventory";
+    EXPECT_TRUE(cert_inv_matches);
     ::close(fd);
 
     // Security review P1-2: the window is served at most once per source IP
@@ -554,7 +597,7 @@ TEST(VortexWitnessDeliveryTest, RetentionServedOnConnect) {
     vx::net::WireHeader ping2 = vx::net::SwarmNode::make_header(vx::net::WireMsgType::PING, 0, 78);
     ping2.crc32c = vx::net::compute_wire_crc32c(nullptr, 0);
     ASSERT_TRUE(send_full(fd2, &ping2, sizeof(ping2)));
-    bool pong2 = false, witness2 = false;
+    bool pong2 = false, witness2 = false, cert_inv2 = false;
     for (int i = 0; i < 50 && !pong2; ++i) {
         vx::net::WireHeader h{};
         if (!read_full(fd2, &h, sizeof(h)))
@@ -566,9 +609,12 @@ TEST(VortexWitnessDeliveryTest, RetentionServedOnConnect) {
             pong2 = true;
         if (h.msg_type == static_cast<uint8_t>(vx::net::WireMsgType::PQ_WITNESS))
             witness2 = true;
+        if (h.msg_type == static_cast<uint8_t>(vx::net::WireMsgType::CERT_INV))
+            cert_inv2 = true;
     }
     EXPECT_TRUE(pong2) << "the second connect must still be alive and promoted";
     EXPECT_FALSE(witness2) << "the same IP must not re-pull the window inside the interval";
+    EXPECT_FALSE(cert_inv2) << "the rate gate must also cover the cert inventory serve";
     ::close(fd2);
 }
 

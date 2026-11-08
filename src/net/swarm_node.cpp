@@ -42,21 +42,35 @@ static constexpr uint64_t MAGIC = 0x58564336;
 constexpr size_t kRolloverCertPayloadSize =
     42 + 4 + 4 + 32 + 32 + sizeof(vx::crypto::pq::PqSignatureWitness);
 
-// Parse + REGISTER a received rollover certificate. The registry verifies
-// the FULL certificate object (leaf 15, sequential windows, both roots,
-// the commitment, the WOTS+/XMSS chain over the binding digest) before
-// storing - a hostile relay cannot plant anything unverified.
-void handle_rollover_cert_payload(const std::vector<uint8_t> &payload) {
+// BACKLOG 1.5 P0 GATE: parse + REGISTER a received rollover certificate.
+// The registry verifies the FULL certificate object (leaf 15, sequential
+// windows, both roots, the commitment, the WOTS+/XMSS chain over the
+// binding digest) before storing - a hostile relay cannot plant anything
+// unverified. Returns true when THIS call stored a NEW certificate: the
+// caller then relays the certificate one hop further (the fire-and-forget
+// relay is no longer the ONLY delivery path - CERT_INV/GET_CERTS backfill
+// recovers whatever a peer misses).
+bool SwarmNode::handle_rollover_cert_payload(const std::vector<uint8_t> &payload) {
     if (payload.size() != kRolloverCertPayloadSize)
-        return;
-    vx::crypto::pq::PqRolloverCert cert;
+        return false;
+    vx::crypto::pq::PqRolloverCert cert{}; // zero-init: no indeterminate padding
     std::memcpy(cert.sender.data(), payload.data(), 42);
     std::memcpy(&cert.from_window, payload.data() + 42, 4);
     std::memcpy(&cert.to_window, payload.data() + 46, 4);
     std::memcpy(cert.old_root.data(), payload.data() + 50, 32);
     std::memcpy(cert.new_root.data(), payload.data() + 82, 32);
     std::memcpy(&cert.witness, payload.data() + 114, sizeof(cert.witness));
-    vx::crypto::pq::PqWitnessRegistry::instance().register_rollover_cert(cert);
+    bool fresh = false;
+    const bool ok =
+        vx::crypto::pq::PqWitnessRegistry::instance().register_rollover_cert(cert, &fresh);
+    if (ok && fresh) {
+        // Relay one hop (the pre-existing fire-and-forget path, now actually
+        // driven), plus a CERT_INV announcement so peers that miss the full
+        // record can pull it by id.
+        broadcast_rollover_cert(cert);
+        broadcast_cert_inv_for(cert);
+    }
+    return ok && fresh;
 }
 
 // ── VX60 CRC32C (tiered: x86_64 SSE4.2 / aarch64 CRC32 / scalar) ────────────
@@ -75,7 +89,7 @@ bool wire_header_plausible(const WireHeader &h) noexcept {
     if (h.payload_len > 65536)
         return false;
     const uint8_t t = h.msg_type;
-    return t >= 0x01 && t <= 0x0A; // 0x0A = ROLLOVER_CERT (BACKLOG 1.5)
+    return t >= 0x01 && t <= 0x0C; // 0x0B/0x0C = CERT_INV/GET_CERTS (1.5 P0 GATE)
 }
 
 WireHeader SwarmNode::make_header(WireMsgType type, uint32_t payload_len, uint64_t nonce,
@@ -277,6 +291,14 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
         }
         if (type == WireMsgType::ROLLOVER_CERT) {
             handle_rollover_cert_payload(payload);
+            continue;
+        }
+        if (type == WireMsgType::CERT_INV) {
+            handle_cert_inv(fd, label, payload);
+            continue;
+        }
+        if (type == WireMsgType::GET_CERTS) {
+            handle_get_certs(fd, label, payload);
             continue;
         }
         break; // unexpected message type: drop the connection
@@ -591,6 +613,159 @@ void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536> &f
         send_payloads_to(fd, payloads);
 }
 
+// BACKLOG 1.5 P0 GATE: cert backfill plumbing ────────────────────────────────
+
+// Sends one CERT_INV / GET_CERTS packet: count(u32 LE) + ids. The caller
+// owns the fd (either the connection's own reader thread or a dup taken
+// under peers_mutex_).
+bool SwarmNode::send_id_list_to(int fd, WireMsgType type,
+                                const std::vector<std::array<uint8_t, 32>> &ids) {
+    if (ids.empty() || ids.size() > 64)
+        return false;
+    std::vector<uint8_t> payload(4 + ids.size() * 32);
+    const uint32_t count = static_cast<uint32_t>(ids.size());
+    std::memcpy(payload.data(), &count, 4);
+    for (size_t i = 0; i < ids.size(); ++i)
+        std::memcpy(payload.data() + 4 + i * 32, ids[i].data(), 32);
+    WireHeader hdr =
+        make_header(type, static_cast<uint32_t>(payload.size()), session_nonce_.fetch_add(1));
+    hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
+    if (::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(hdr)))
+        return false;
+    size_t off = 0;
+    while (off < payload.size()) {
+        const ssize_t n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR)
+                continue;
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// Sends FULL certificate records (the ROLLOVER_CERT payload layout) on one
+// fd. Same dup-fd rationale as send_payloads_to applies at the label-lookup
+// call sites; here the fd is already owned or duplicated by the caller.
+bool SwarmNode::send_cert_payloads_to(
+    int fd,
+    const std::vector<
+        std::array<uint8_t, 42 + 4 + 4 + 32 + 32 + sizeof(vx::crypto::pq::PqSignatureWitness)>>
+        &payloads) {
+    for (const auto &payload : payloads) {
+        WireHeader hdr =
+            make_header(WireMsgType::ROLLOVER_CERT, static_cast<uint32_t>(payload.size()),
+                        session_nonce_.fetch_add(1));
+        hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
+        if (::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(hdr)))
+            return false;
+        size_t off = 0;
+        while (off < payload.size()) {
+            const ssize_t n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR)
+                    continue;
+                return false;
+            }
+            off += static_cast<size_t>(n);
+        }
+    }
+    return true;
+}
+
+void SwarmNode::broadcast_cert_inv_for(const vx::crypto::pq::PqRolloverCert &cert) {
+    std::vector<std::array<uint8_t, 32>> ids{vx::crypto::pq::rollover_cert_id(cert)};
+    // Snapshot + send outside the lock (same reasoning as broadcast_frame).
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        fds.reserve(peer_fds_.size());
+        for (const auto &[addr, fd] : peer_fds_) {
+            (void)addr;
+            fds.push_back(fd);
+        }
+    }
+    for (int fd : fds)
+        send_id_list_to(fd, WireMsgType::CERT_INV, ids);
+}
+
+void SwarmNode::send_cert_inv_to(const std::string &peer_label, size_t max_ids) {
+    if (max_ids > 64)
+        max_ids = 64;
+    const auto ids = vx::crypto::pq::PqWitnessRegistry::instance().cert_inventory(max_ids);
+    if (ids.empty())
+        return;
+    int fd = -1;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        auto it = peer_fds_.find(peer_label);
+        if (it == peer_fds_.end())
+            return;
+        // Dup-fd discipline (see send_witnesses_to): the label's owner
+        // thread may close the fd while this send runs.
+        fd = ::fcntl(it->second, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0)
+            return;
+    }
+    send_id_list_to(fd, WireMsgType::CERT_INV, ids);
+    ::close(fd);
+}
+
+// Parses a bounded id list (count <= 64, payload length checked by the
+// dispatch site). Answers CERT_INV with GET_CERTS naming every id this
+// node does NOT hold; answers GET_CERTS with the FULL verified certificate
+// records for every id it DOES hold. Both responses go targeted down the
+// requesting connection.
+void SwarmNode::handle_cert_inv(int fd, const std::string &peer_label,
+                                const std::vector<uint8_t> &payload) {
+    if (payload.size() < 4 || payload.size() > 4 + 64 * 32)
+        return;
+    uint32_t count = 0;
+    std::memcpy(&count, payload.data(), 4);
+    if (count > 64 || payload.size() < 4 + count * 32)
+        return;
+    std::vector<std::array<uint8_t, 32>> missing;
+    for (uint32_t i = 0; i < count; ++i) {
+        std::array<uint8_t, 32> id{};
+        std::memcpy(id.data(), payload.data() + 4 + i * 32, 32);
+        if (!vx::crypto::pq::PqWitnessRegistry::instance().have_cert_id(id))
+            missing.push_back(id);
+    }
+    if (missing.empty())
+        return;
+    send_id_list_to(fd, WireMsgType::GET_CERTS, missing);
+}
+
+void SwarmNode::handle_get_certs(int fd, const std::string &peer_label,
+                                 const std::vector<uint8_t> &payload) {
+    if (payload.size() < 4 || payload.size() > 4 + 64 * 32)
+        return;
+    uint32_t count = 0;
+    std::memcpy(&count, payload.data(), 4);
+    if (count > 64 || payload.size() < 4 + count * 32)
+        return;
+    std::vector<std::array<uint8_t, kRolloverCertPayloadSize>> payloads;
+    for (uint32_t i = 0; i < count; ++i) {
+        std::array<uint8_t, 32> id{};
+        std::memcpy(id.data(), payload.data() + 4 + i * 32, 32);
+        vx::crypto::pq::PqRolloverCert cert;
+        if (!vx::crypto::pq::PqWitnessRegistry::instance().lookup_cert_by_id(id, cert))
+            continue; // unknown id: answer nothing for it (no error channel)
+        std::array<uint8_t, kRolloverCertPayloadSize> payload{};
+        std::memcpy(payload.data(), cert.sender.data(), 42);
+        std::memcpy(payload.data() + 42, &cert.from_window, 4);
+        std::memcpy(payload.data() + 46, &cert.to_window, 4);
+        std::memcpy(payload.data() + 50, cert.old_root.data(), 32);
+        std::memcpy(payload.data() + 82, cert.new_root.data(), 32);
+        std::memcpy(payload.data() + 114, &cert.witness, sizeof(cert.witness));
+        payloads.push_back(payload);
+    }
+    if (payloads.empty())
+        return;
+    send_cert_payloads_to(fd, payloads);
+}
+
 // Sends PQ_WITNESS packets for the prebuilt payloads on one socket.
 // A short header send desyncs the peer's stream, so it is fatal there;
 // here that surfaces as returning false (the caller logs or drops).
@@ -898,6 +1073,14 @@ void SwarmNode::serve_connection(int c) {
             if (promote())
                 fire_connected();
             handle_rollover_cert_payload(payload);
+            continue;
+        }
+        if (type == WireMsgType::CERT_INV) {
+            handle_cert_inv(c, peer_label, payload);
+            continue;
+        }
+        if (type == WireMsgType::GET_CERTS) {
+            handle_get_certs(c, peer_label, payload);
             continue;
         }
         break;

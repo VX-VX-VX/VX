@@ -50,6 +50,13 @@ enum class WireMsgType : uint8_t {
     GQC_VOTE = 0x08,
     PQ_WITNESS = 0x09,    // BACKLOG 0.8: consensus-visible PQ signature
     ROLLOVER_CERT = 0x0A, // BACKLOG 1.5: certified one-window key rotation
+    // BACKLOG 1.5 P0 GATE: certificate backfill. CERT_INV announces ids of
+    // stored certificates (connect-time retention + relay); a peer that
+    // misses one answers GET_CERTS with the unknown ids and receives the
+    // FULL verified certificate records targeted. Payload for both:
+    // count(u32 LE) + count * 32-byte cert ids, count <= 64.
+    CERT_INV = 0x0B,
+    GET_CERTS = 0x0C,
 };
 
 // Wire flags
@@ -210,6 +217,13 @@ public:
     // drop the connection - the established fail-closed old/new separation
     // for unknown message types.
     void broadcast_rollover_cert(const vx::crypto::pq::PqRolloverCert &cert);
+
+    // BACKLOG 1.5 P0 GATE: cert backfill. Announces to ONE peer the ids of
+    // this node's most recently stored certificates (connect-time
+    // retention; max_ids is capped at 64 by the wire format). The peer
+    // pulls what it misses with GET_CERTS and receives full verified
+    // records targeted.
+    void send_cert_inv_to(const std::string &peer_label, size_t max_ids);
 
     // Simulate split-brain fork - create alternative history on peer partition
     void simulate_fork();
@@ -443,6 +457,25 @@ private:
         int fd,
         const std::vector<std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)>>
             &payloads);
+
+    // BACKLOG 1.5 P0 GATE: cert backfill plumbing. Handlers parse a
+    // bounded id list (count <= 64), answer targeted; senders use the same
+    // dup-fd discipline as send_payloads_to. handle_rollover_cert_payload
+    // returns true when THIS call stored a NEW certificate (the relay cue).
+    bool handle_rollover_cert_payload(const std::vector<uint8_t> &payload);
+    void handle_cert_inv(int fd, const std::string &peer_label,
+                         const std::vector<uint8_t> &payload);
+    void handle_get_certs(int fd, const std::string &peer_label,
+                          const std::vector<uint8_t> &payload);
+    bool send_cert_payloads_to(
+        int fd,
+        const std::vector<
+            std::array<uint8_t, 42 + 4 + 4 + 32 + 32 + sizeof(vx::crypto::pq::PqSignatureWitness)>>
+            &payloads);
+    bool send_id_list_to(int fd, WireMsgType type, const std::vector<std::array<uint8_t, 32>> &ids);
+    // One-hop CERT_INV fan-out for a freshly stored certificate (the
+    // relay cue; full-cert relay remains broadcast_rollover_cert).
+    void broadcast_cert_inv_for(const vx::crypto::pq::PqRolloverCert &cert);
 
     // Resolve split-brain fork using heaviest cumulative work
     void resolve_fork(const PeerInfo &challenger);

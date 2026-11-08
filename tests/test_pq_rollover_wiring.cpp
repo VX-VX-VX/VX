@@ -21,9 +21,23 @@
 //   9. Leaf15TxWitnessRefused  — a transaction witness on the reserved
 //      certificate leaf is refused at USE time (pq_verify_transaction),
 //      so the wire registration path cannot smuggle it in either.
-//  10. WireTypeBoundary        — ROLLOVER_CERT (0x0A) passes the wire
-//      plausibility gate; the first undefined type (0x0B) still fails
-//      closed.
+//  10. WireTypeBoundary        — ROLLOVER_CERT (0x0A), CERT_INV (0x0B) and
+//      GET_CERTS (0x0C) all pass the wire plausibility gate; the first
+//      undefined type (0x0D) still fails closed.
+//  11. CertIdDeterminism       — rollover_cert_id is a pure function of
+//      the transition tuple (sender, windows, roots): same tuple, same id;
+//      different tuple, different id.
+//  12. RegistryIdIndex         — have_cert_id / lookup_cert_by_id /
+//      cert_inventory index every stored certificate, the fresh out-flag
+//      fires exactly once per NEW record, and the inventory answers the
+//      newest id when asked for one.
+//  13. CertPayloadRoundTrip    — the GET_CERTS answer encodes the full
+//      record and the ROLLOVER_CERT decoder reads it back bit-exact, so a
+//      pulled certificate re-verifies like a relayed one.
+//  14. CertDedupPaddingBlind   — duplicate detection is content equality
+//      over the 2490 wire bytes, never sizeof-memcmp: two unspecified
+//      struct padding bytes must not flip a replayed certificate into a
+//      "fresh" re-store + re-broadcast (compiler-dependent otherwise).
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/net/swarm_node.hpp"
@@ -321,7 +335,8 @@ int main() {
         std::cout << "  [8] leaf-15 witness chain-valid but tx-refused at USE time OK\n";
     }
 
-    // ── 9. Wire-type boundary: 0x0A plausible, 0x0B not ────────────────────
+    // ── 9. Wire-type boundary: ROLLOVER_CERT/CERT_INV/GET_CERTS plausible,
+    //        the first undefined type (0x0D) still fails closed ─────────────
     {
         vx::net::WireHeader h{};
         h.magic = vx::net::VX60_MAGIC;
@@ -329,9 +344,160 @@ int main() {
         h.payload_len = 0;
         h.msg_type = static_cast<uint8_t>(vx::net::WireMsgType::ROLLOVER_CERT);
         assert(vx::net::wire_header_plausible(h));
-        h.msg_type = 0x0B; // first undefined type: still fails closed
+        h.msg_type = static_cast<uint8_t>(vx::net::WireMsgType::CERT_INV);
+        assert(vx::net::wire_header_plausible(h));
+        h.msg_type = static_cast<uint8_t>(vx::net::WireMsgType::GET_CERTS);
+        assert(vx::net::wire_header_plausible(h));
+        h.msg_type = 0x0D; // first undefined type: still fails closed
         assert(!vx::net::wire_header_plausible(h));
-        std::cout << "  [9] wire-type boundary 0x0A accepted, 0x0B refused OK\n";
+        std::cout << "  [9] wire-type boundary 0x0A..0x0C accepted, 0x0D refused OK\n";
+    }
+
+    // ── 10. Cert id: deterministic over the tuple, distinct across tuples ──
+    {
+        const auto master = pseudo_bytes("VX_BACKFILL_ID_V1", 7);
+        const auto pub_seed = pub_seed_from_sk(master);
+        const auto sender = make_sender("VX_BACKFILL_ID_SENDER_V1");
+        PqRolloverCert a;
+        a.sender = sender;
+        a.from_window = 0;
+        a.to_window = 1;
+        a.old_root = xmss_root_tree(master, pub_seed, 0);
+        a.new_root = xmss_root_tree(master, pub_seed, 1);
+        a.witness = pq_sign_rollover(master, 0, 1, nullptr);
+        PqRolloverCert b = a;
+        assert(rollover_cert_id(a) == rollover_cert_id(b));
+        b.from_window = 1;
+        b.to_window = 2;
+        b.old_root = a.new_root;
+        b.new_root = xmss_root_tree(master, pub_seed, 2);
+        b.witness = pq_sign_rollover(master, 1, 2, nullptr);
+        assert(rollover_cert_id(a) != rollover_cert_id(b));
+        std::cout << "  [10] cert id deterministic, tuple-distinct OK\n";
+    }
+
+    // ── 11. Registry id index: have/lookup/inventory, fresh flag, replay ───
+    {
+        const auto master = pseudo_bytes("VX_BACKFILL_IDX_V1", 9);
+        const auto pub_seed = pub_seed_from_sk(master);
+        const auto sender = make_sender("VX_BACKFILL_IDX_SENDER_V1");
+        PqRolloverCert c0;
+        c0.sender = sender;
+        c0.from_window = 0;
+        c0.to_window = 1;
+        c0.old_root = xmss_root_tree(master, pub_seed, 0);
+        c0.new_root = xmss_root_tree(master, pub_seed, 1);
+        c0.witness = pq_sign_rollover(master, 0, 1, nullptr);
+        const auto id0 = rollover_cert_id(c0);
+
+        bool fresh = true;
+        assert(PqWitnessRegistry::instance().register_rollover_cert(c0, &fresh));
+        assert(fresh); // first registration STORES
+        assert(PqWitnessRegistry::instance().register_rollover_cert(c0, &fresh));
+        assert(!fresh); // duplicate is not a relay cue
+
+        assert(PqWitnessRegistry::instance().have_cert_id(id0));
+        PqRolloverCert out{};
+        assert(PqWitnessRegistry::instance().lookup_cert_by_id(id0, out));
+        assert(roots_equal(out.new_root, c0.new_root));
+        std::array<uint8_t, 32> bogus{};
+        bogus[0] = 0xAB;
+        assert(!PqWitnessRegistry::instance().have_cert_id(bogus));
+        assert(!PqWitnessRegistry::instance().lookup_cert_by_id(bogus, out));
+
+        const auto inv = PqWitnessRegistry::instance().cert_inventory(64);
+        bool found = false;
+        for (const auto &id : inv)
+            if (id == id0)
+                found = true;
+        assert(found);
+
+        // The id index survives the sidecar replay path too: attach a fresh
+        // durable log AFTER this registration? No - registration appended to
+        // any attached log. Instead pin the ordering property: the inventory
+        // is capped and ordered newest-last.
+        const auto inv1 = PqWitnessRegistry::instance().cert_inventory(1);
+        assert(inv1.size() == 1 && inv1[0] == id0);
+        std::cout << "  [11] registry id index (have/lookup/inventory/fresh) OK\n";
+    }
+
+    // ── 12. Wire payload round-trip: id -> GET_CERTS -> full record ────────
+    {
+        // The full record must decode back to the exact certificate, so a
+        // pulled cert verifies identically to a locally registered one.
+        const auto master = pseudo_bytes("VX_BACKFILL_RT_V1", 11);
+        const auto pub_seed = pub_seed_from_sk(master);
+        const auto sender = make_sender("VX_BACKFILL_RT_SENDER_V1");
+        PqRolloverCert c;
+        c.sender = sender;
+        c.from_window = 0;
+        c.to_window = 1;
+        c.old_root = xmss_root_tree(master, pub_seed, 0);
+        c.new_root = xmss_root_tree(master, pub_seed, 1);
+        c.witness = pq_sign_rollover(master, 0, 1, nullptr);
+        assert(PqWitnessRegistry::instance().register_rollover_cert(c));
+
+        // Encode the way SwarmNode::handle_get_certs answers...
+        std::array<uint8_t, 42 + 4 + 4 + 32 + 32 + sizeof(PqSignatureWitness)> payload{};
+        std::memcpy(payload.data(), c.sender.data(), 42);
+        std::memcpy(payload.data() + 42, &c.from_window, 4);
+        std::memcpy(payload.data() + 46, &c.to_window, 4);
+        std::memcpy(payload.data() + 50, c.old_root.data(), 32);
+        std::memcpy(payload.data() + 82, c.new_root.data(), 32);
+        std::memcpy(payload.data() + 114, &c.witness, sizeof(c.witness));
+        // ...and decode the way handle_rollover_cert_payload parses.
+        PqRolloverCert back;
+        std::memcpy(back.sender.data(), payload.data(), 42);
+        std::memcpy(&back.from_window, payload.data() + 42, 4);
+        std::memcpy(&back.to_window, payload.data() + 46, 4);
+        std::memcpy(back.old_root.data(), payload.data() + 50, 32);
+        std::memcpy(back.new_root.data(), payload.data() + 82, 32);
+        std::memcpy(&back.witness, payload.data() + 114, sizeof(back.witness));
+        assert(rollover_cert_id(back) == rollover_cert_id(c));
+        assert(roots_equal(back.new_root, c.new_root));
+        // A decoded-back record re-verifies: the pull path plants only
+        // cryptographically valid objects.
+        assert(pq_verify_rollover(back.old_root, back.from_window, back.to_window, back.new_root,
+                                  back.witness));
+        std::cout << "  [12] cert payload round-trip (encode/decode/verify) OK\n";
+    }
+
+    // ── 13. Dedup is content-equality, NOT sizeof-memcmp ───────────────────
+    // sizeof(PqRolloverCert) is 2492: two unspecified padding bytes after
+    // sender[42]. A sizeof-wide memcmp dedup compares indeterminate bytes -
+    // security review 2026-11-08 confirmed empirically that clang does NOT
+    // zero them on a parse, so a byte-identical wire replay could be
+    // re-stored as "fresh" and re-broadcast on a clang-built node. The
+    // object-representation write below is what a padding byte difference
+    // looks like; dedup must be padding-blind.
+    {
+        const auto master = pseudo_bytes("VX_BACKFILL_PAD_V1", 13);
+        const auto pub_seed = pub_seed_from_sk(master);
+        PqRolloverCert c;
+        c.sender = make_sender("VX_BACKFILL_PAD_SENDER_V1");
+        c.from_window = 0;
+        c.to_window = 1;
+        c.old_root = xmss_root_tree(master, pub_seed, 0);
+        c.new_root = xmss_root_tree(master, pub_seed, 1);
+        c.witness = pq_sign_rollover(master, 0, 1, nullptr);
+
+        bool fresh = false;
+        assert(PqWitnessRegistry::instance().register_rollover_cert(c, &fresh));
+        assert(fresh); // first registration is the relay cue
+
+        // Same content, different padding bytes (write the object
+        // representation directly - padding is addressable).
+        PqRolloverCert repadded = c;
+        auto *raw = reinterpret_cast<unsigned char *>(&repadded);
+        raw[42] = static_cast<unsigned char>(raw[42] ^ 0x5A);
+        raw[43] = static_cast<unsigned char>(raw[43] ^ 0xA5);
+        assert(PqWitnessRegistry::instance().register_rollover_cert(repadded, &fresh));
+        assert(!fresh); // deduped - NOT a relay cue
+
+        // And the registry still answers the id exactly once.
+        const auto id = rollover_cert_id(c);
+        assert(PqWitnessRegistry::instance().have_cert_id(id));
+        std::cout << "  [13] dedup is padding-blind (content equality) OK\n";
     }
 
     std::cout << "test_pq_rollover_wiring: ALL SECTIONS PASSED\n";

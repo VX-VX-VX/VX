@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <mutex>
 #include <string>
+#include <deque>
 #include <unordered_map>
 
 namespace vx::crypto::pq {
@@ -197,6 +198,14 @@ struct PqRolloverCert {
     std::array<uint8_t, 32> new_root{}; // the target window's root
     PqSignatureWitness witness{};       // leaf 15 of window `from_window`
 };
+
+// BACKLOG 1.5 P0 GATE: deterministic certificate identifier for the
+// CERT_INV / GET_CERTS backfill protocol over VX60. Digests the binding
+// tuple (sender, from, to, old_root, new_root) - NOT the witness, which
+// deterministic WOTS+ signing fixes per tuple, so two honest nodes always
+// announce the same id for the same certificate and a hostile relay cannot
+// make one tuple look like two.
+std::array<uint8_t, 32> rollover_cert_id(const PqRolloverCert &cert) noexcept;
 
 // Maximum certified hops a verification walks from the anchor: the
 // same-address identity supports this many key rotations before the
@@ -416,7 +425,20 @@ public:
     // from_window, to_window == from_window + 1, both roots match the
     // witness, the commitment matches, and pq_verify_rollover passes over
     // THIS (old_root, from, to, new_root) tuple. Returns false otherwise.
-    bool register_rollover_cert(const PqRolloverCert &cert);
+    // When `fresh` is non-null it reports whether THIS call STORED a new
+    // record (false for a duplicate) - the wire relay uses it to decide
+    // whether to gossip the certificate one hop further.
+    bool register_rollover_cert(const PqRolloverCert &cert, bool *fresh = nullptr);
+
+    // BACKLOG 1.5 P0 GATE: certificate id index for the backfill protocol.
+    // Ids cover every stored certificate (wire-accepted and replayed from
+    // the durable sidecar alike).
+    bool have_cert_id(const std::array<uint8_t, 32> &id) const;
+    bool lookup_cert_by_id(const std::array<uint8_t, 32> &id, PqRolloverCert &out) const;
+    // The most recently stored certificate ids, newest last, capped at
+    // max_ids - the retention/connect-time inventory a node announces to a
+    // newly connected peer.
+    std::vector<std::array<uint8_t, 32>> cert_inventory(size_t max_ids) const;
 
     // Walks the certified chain from the anchor root (window 0) as far as
     // valid sequential certificates reach, capped at
@@ -480,12 +502,24 @@ private:
     bool append_durable_locked(const std::array<uint8_t, 32> &digest,
                                const std::array<uint8_t, 42> &sender, const PqSignatureWitness &w);
     bool append_cert_durable_locked(const PqRolloverCert &c);
+    // BACKLOG 1.5 P0 GATE: maintains the id index + inventory order for one
+    // newly STORED certificate (id-dedup inside). Callers hold mutex_.
+    // Indexes one stored certificate into the id inventory. Returns true
+    // when the id was genuinely new (the relay cue is gated on this, so a
+    // same-id re-store can never re-broadcast).
+    bool index_cert_locked(const PqRolloverCert &c);
 
     mutable std::mutex mutex_;
     std::unordered_map<std::array<uint8_t, 32>, std::vector<Entry>, PqArrayHash> by_digest_;
     std::unordered_map<std::array<uint8_t, 42>, std::array<uint8_t, 32>, PqArrayHash> sender_roots_;
     std::unordered_map<std::array<uint8_t, 42>, std::vector<PqRolloverCert>, PqArrayHash>
         cert_by_sender_;
+    // BACKLOG 1.5 P0 GATE: id -> certificate (both wire-accepted and
+    // replayed), plus the insertion order capped at kCertInventoryWindow
+    // for the connect-time inventory announcement.
+    std::unordered_map<std::array<uint8_t, 32>, PqRolloverCert, PqArrayHash> cert_by_id_;
+    std::deque<std::array<uint8_t, 32>> cert_inv_order_;
+    static constexpr size_t kCertInventoryWindow = 1024;
     blockchain::Transaction last_tx_{};
     PqSignatureWitness last_witness_{};
     bool has_last_ = false;
