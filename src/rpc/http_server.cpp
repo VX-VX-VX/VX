@@ -234,8 +234,15 @@ void HttpServer::stop() {
 // listener, relay verified inbound block frames into the ledger (tip-extending
 // frames only), and broadcast locally mined blocks to peers.
 
-void HttpServer::attach_p2p(uint16_t p2p_port,
-                            const std::vector<std::string>& peer_endpoints) {
+void HttpServer::attach_p2p(uint16_t p2p_port, const std::vector<std::string> &peer_endpoints,
+                            const std::vector<std::string> &seed_hosts) {
+    // Peer discovery: the durable node identity must exist before the first
+    // handshake leaves this process (self-dial detection depends on it).
+    swarm_node_->load_or_create_node_id(data_dir_);
+    // Seed hosts resolve into the candidate store BEFORE start(): the health
+    // loop begins dialing candidates on its first tick.
+    for (const auto &seed : seed_hosts)
+        swarm_node_->add_seed_host(seed);
     swarm_node_->set_frame_hook(
         [this](const uint8_t *frame, size_t len, const std::string &peer_label) {
             if (len == 65536)

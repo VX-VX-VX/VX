@@ -35,6 +35,8 @@ Options:
   --port PORT        HTTP/RPC port (default 8088)
   --p2p PORT         VX60 P2P wire protocol port (default 19088)
   --peer HOST:PORT   Connect to a peer at startup (repeatable)
+  --seed HOST[:PORT] Resolve a DNS seed host into peer candidates
+                     (repeatable; port defaults to 19088)
   --data-dir DIR     Directory for chain data (default ./data)
   --demo             Run the scripted demo: mine the secondary genesis
                      mint (100 000 VX) and a 25 000 VX transfer between
@@ -222,6 +224,7 @@ int main(int argc, char* argv[]) {
     uint16_t port = 8088;       // HTTP/RPC port (never 8080)
     uint16_t p2p_port = 19088;  // VX60 P2P wire port
     std::vector<std::string> peer_endpoints; // --peer host:port
+    std::vector<std::string> seed_hosts;     // --seed HOST[:PORT] (DNS)
     std::string data_dir = "data";
     uint32_t iterations = 1000;
 
@@ -244,6 +247,9 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc) p2p_port = static_cast<uint16_t>(std::stoul(argv[++i]));
         } else if (arg == "--peer") {
             if (i + 1 < argc) peer_endpoints.emplace_back(argv[++i]);
+        } else if (arg == "--seed") {
+            if (i + 1 < argc)
+                seed_hosts.emplace_back(argv[++i]);
         } else if (arg == "--data-dir") {
             if (i + 1 < argc) data_dir = argv[++i];
         } else if (arg == "--demo") {
@@ -341,7 +347,7 @@ int main(int argc, char* argv[]) {
                   << " | data-dir: " << data_dir
                   << " | peers: " << peer_endpoints.size() << "\n";
         vx::rpc::HttpServer server(store, state, port, data_dir);
-        server.attach_p2p(p2p_port, peer_endpoints);
+        server.attach_p2p(p2p_port, peer_endpoints, seed_hosts);
         std::signal(SIGINT, [](int) { std::exit(0); });
         server.start();
         return 0;

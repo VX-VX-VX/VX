@@ -13,6 +13,7 @@
 #include "vx/blockchain/block.hpp"
 #include "vx/crypto/pq_signature.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -57,6 +58,14 @@ enum class WireMsgType : uint8_t {
     // count(u32 LE) + count * 32-byte cert ids, count <= 64.
     CERT_INV = 0x0B,
     GET_CERTS = 0x0C,
+    // Peer discovery (BACKLOG: DNS seeds / peer exchange). ADDRS is a
+    // one-shot push per connection, sent by BOTH sides right after the
+    // HANDSHAKE exchange: count(u32 LE) + count * [IPv4(4) | port(u16 BE)],
+    // count <= 16. Entries are LISTEN addresses only - never the observed
+    // (ephemeral-port) address of a connection - so a dialed node is
+    // reachable again by a third node. The old fail-closed rule is
+    // preserved one notch further out: 0x0E still fails closed.
+    ADDRS = 0x0D,
 };
 
 // Wire flags
@@ -95,6 +104,15 @@ struct PeerInfo {
     bool is_banned;           // Immediate ban flag
     bool is_loopback;         // Local loopback peer for testing
     std::chrono::system_clock::time_point last_seen;
+
+    // Peer discovery (ADDRS / handshake v2): the peer's LISTENING endpoint,
+    // as it announced itself. Only listen addresses are ever advertised in
+    // ADDRS - an observed address carries the outbound ephemeral port and
+    // is worthless to a third node. listen_valid is false for old-world
+    // peers that never sent the v2 handshake fields (48-byte payload).
+    uint32_t listen_ip = 0;   // network byte order
+    uint16_t listen_port = 0; // host byte order
+    bool listen_valid = false;
 
     // Kademlia XOR distance to our node ID
     uint64_t xor_distance() const;
@@ -362,6 +380,58 @@ public:
     // --p2p mode). Returns false if the port is already taken.
     bool bind_p2p_listener(uint16_t port);
 
+    // ── Peer discovery (ADDRS / PEX) ──────────────────────────────
+
+    // Durable node identity for the v2 handshake: 32 random bytes created
+    // once and persisted at data_dir/node_id (0600, O_EXCL). A peer that
+    // announces OUR node_id is ourselves (self-dial through discovery) and
+    // is disconnected on sight. KNOWN GAP (security review 2026-11-11,
+    // open): strike/withhold accounting is STILL keyed by the connection
+    // address, not by the node_id - an attacker rotating source ports
+    // accumulates no strikes, and no durable banlist exists yet. Treat the
+    // node_id-keyed enforcement as designed-but-unwired until it lands.
+    // Must be called once before start(); with no call the node sends a
+    // zero id and self-detection is disabled (48-byte old-world handshake).
+    void load_or_create_node_id(const std::string &data_dir);
+
+    const std::array<uint8_t, 32> &node_id() const noexcept {
+        return node_id_;
+    }
+
+    // Test seam: force a known node id (e.g. two nodes sharing one id for
+    // the self-dial test). In-memory only; does not touch any file.
+    void set_node_id_for_test(const std::array<uint8_t, 32> &id) {
+        node_id_ = id;
+    }
+
+    // Feed one listen address into the candidate store (from --seed DNS
+    // resolution or the ADDRS wire). Deduped by ip:port, bounded (oldest
+    // evicted). Callers never cause a dial directly: the health loop dials
+    // at most ONE candidate per 5 s tick and only while connected peers
+    // are below the discovery floor.
+    bool add_addr_candidate(uint32_t ip_net, uint16_t port);
+
+    // Test/diagnostic: current candidate count.
+    size_t addr_candidate_count() const;
+
+    // --seed client side: resolve HOST or HOST:PORT (default VX60 19088)
+    // with getaddrinfo and feed every A record into the candidate store.
+    // Failure to resolve is a warning, never a node failure (a seed host
+    // may be down; the mesh does not depend on it once connected).
+    // Returns the number of candidates queued.
+    size_t add_seed_host(const std::string &host_or_hostport);
+
+    // The endpoint this node advertises in HANDSHAKE v2 / ADDRS. Set by
+    // bind_p2p_listener; ip is the best non-loopback IPv4 (loopback as the
+    // fallback), 0 when no listener is bound (then listen_valid is false
+    // and the node advertises nothing).
+    uint32_t self_listen_ip() const noexcept {
+        return self_listen_ip_;
+    }
+    uint16_t self_listen_port() const noexcept {
+        return listen_port_.load();
+    }
+
 private:
     // P2P networking threads
     std::thread listener_thread_;
@@ -376,6 +446,37 @@ private:
 
     // Peer table
     std::set<PeerInfo> peer_table_;
+
+    // ── Peer discovery state (guarded by peers_mutex_) ─────────────
+    // Listen addresses learned from ADDRS / --seed. Bounded: oldest
+    // evicted at 128 entries. The health loop drains candidates OUTSIDE
+    // peers_mutex_ (connect_peer_tcp takes it internally) and dials at
+    // most one per tick.
+    struct PeerCandidate {
+        uint32_t ip;      // network byte order
+        uint16_t port;    // host byte order
+        int attempts = 0; // failed dial count; evicted at 3
+    };
+    static constexpr size_t kMaxAddrCandidates = 128;
+    static constexpr size_t kMinAutoDialPeers = 3;
+    static constexpr int kMaxCandidateAttempts = 3;
+    std::deque<PeerCandidate> addr_candidates_;
+
+    // Durable node identity (v2 handshake); zero = unknown/old-world.
+    std::array<uint8_t, 32> node_id_{};
+
+    // The endpoint advertised to peers. ip stays 0 when unbound.
+    uint32_t self_listen_ip_ = 0;
+
+    // Handshake/ADDRS helpers shared by both connection loops.
+    void send_self_announce(int fd);
+    void send_addrs_to(int fd, const std::string &exclude_label);
+    // Parses an ADDRS payload (bounds-checked) and ingests candidates,
+    // excluding self, the sender's listen endpoint (network-order ip /
+    // host-order port; 0-port = unknown), and duplicates. Returns the
+    // number of entries ingested; 0 on malformed (caller scores DoS).
+    int ingest_addrs(const std::vector<uint8_t> &payload, uint32_t exclude_ip_net,
+                     uint16_t exclude_port);
 
     // Live TCP connections: address -> socket fd
     std::unordered_map<std::string, int> peer_fds_;

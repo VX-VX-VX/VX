@@ -1998,6 +1998,19 @@ amends the list as needed.
     thread had not started yet - caught by self-review, registration
     moved into the accept loop where the joinable accept thread orders
     it before stop(). Final: assert/SAN/TSan all 41/41 on one tree.
+- **Public binary surface pass (owner-agreed 2026-11-11)**: before the
+  beta flip, walk the entire public surface of the shipped binary as an
+  attacker - every RPC endpoint (including the fuzz/chaos/flood handlers,
+  which are behind the auth gate but still compiled in) and every CLI
+  utility - and remove or hard-gate anything that has no business in a
+  public build. Related residuals discovered with peer discovery
+  (2026-11-11): loopback acceptance in `add_addr_candidate` is a
+  localhost-SSRF/probe primitive on a real network and must gain a
+  default-off switch together with real-interface advertisement in
+  `bind_p2p_listener` (testnet keeps loopback: the three-node topology
+  depends on it); strike/withhold keying is still by connection address,
+  not node_id, and no durable banlist exists (designed-but-unwired - see
+  the honest gap note in swarm_node.hpp).
 - Owner-decision items (NOT beta blockers, tracked in the Q2-Q4
   directive): the 2.12(e) Guard decision, ord_P(7) ECM analysis, the
   CRT-collision formal proof. These gate the NEXT major release, not

@@ -14,11 +14,14 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 #include <netinet/in.h>
-#include <unistd.h>
 #include <netinet/tcp.h>
-#include <sys/socket.h>
+#include <poll.h>
+#include <sys/random.h> // getrandom: durable node identity
 #include <sys/sendfile.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -30,10 +33,84 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <thread>
 
 namespace vx::net {
+
+namespace {
+
+// HANDSHAKE payload v2 (87 bytes): height(8 LE) | cumulative_pogw(8 LE) |
+// tip(32) | node_id(32) | listen_ip(4, network order) | listen_port(2,
+// network order) | listen_valid(1). The old-world 48-byte payload
+// (height|work|tip) is still accepted by every reader: a shorter packet
+// simply carries no identity and no listen endpoint. NOTE (byte-order
+// contract, security review 2026-11-11): the mixed-looking layout is real
+// and intentional - the two u64 counter fields are little-endian, every
+// IP and PORT field on VX60 is network byte order. Third-party
+// implementers follow exactly this comment.
+constexpr size_t kHandshakeV2Size = 87;
+constexpr size_t kHandshakeOldSize = 48;
+// ADDRS payload: count(u32 LE) + count * [IPv4(4, network order) |
+// port(2, network order)], cap 16.
+constexpr size_t kAddrEntrySize = 6;
+constexpr size_t kMaxAddrEntries = 16;
+
+// Fold the 32-byte durable identity into the PeerInfo.node_id field (the
+// Kademlia ordering key). Folding is display/ordering only; self-detection
+// compares the full 32 bytes at parse time.
+uint64_t fold_node_id(const uint8_t id[32]) {
+    uint64_t v = 0;
+    std::memcpy(&v, id, 8);
+    return v;
+}
+
+// True when a 32-byte identity is all zeros: an old-world announce that
+// carries no identity at all (upsert must not create entries for it).
+bool id_full_zero(const std::array<uint8_t, 32> &id) {
+    for (const uint8_t b : id)
+        if (b != 0)
+            return false;
+    return true;
+}
+
+} // namespace
+
+// Shared HANDSHAKE parse: fills height/work/tip always (>=48), identity and
+// listen endpoint when the v2 tail is present (>=87). Returns false when the
+// payload predates even the old-world minimum. self_peer is true when the
+// payload carries OUR OWN node_id (a discovery self-dial): the caller must
+// drop the connection.
+bool parse_handshake_payload(const std::vector<uint8_t> &payload, uint64_t &height, uint64_t &work,
+                             uint8_t tip_out[32], const std::array<uint8_t, 32> &our_id,
+                             bool &is_self, std::array<uint8_t, 32> &their_id,
+                             uint32_t &listen_ip_net, uint16_t &listen_port, bool &listen_valid) {
+    if (payload.size() < kHandshakeOldSize)
+        return false;
+    std::memcpy(&height, payload.data(), 8);
+    std::memcpy(&work, payload.data() + 8, 8);
+    std::memcpy(tip_out, payload.data() + 16, 32);
+    is_self = false;
+    listen_valid = false;
+    listen_ip_net = 0;
+    listen_port = 0;
+    their_id.fill(0);
+    if (payload.size() >= kHandshakeV2Size) {
+        std::memcpy(their_id.data(), payload.data() + 48, 32);
+        // Zero identity = old-world peer without one: not "self".
+        if (our_id != std::array<uint8_t, 32>{} && their_id == our_id)
+            is_self = true;
+        std::memcpy(&listen_ip_net, payload.data() + 80, 4);
+        std::memcpy(&listen_port, payload.data() + 84, 2);
+        listen_port = ntohs(listen_port);
+        // listen_valid requires a real endpoint: an all-zero listen ip
+        // (0.0.0.0) must not propagate as an advertised dial target
+        // (security review P2, 2026-11-11).
+        listen_valid = payload[86] == 1 && listen_port != 0 && listen_ip_net != 0;
+    }
+    return true;
+}
 
 static constexpr uint64_t MAGIC = 0x58564336;
 
@@ -89,7 +166,9 @@ bool wire_header_plausible(const WireHeader &h) noexcept {
     if (h.payload_len > 65536)
         return false;
     const uint8_t t = h.msg_type;
-    return t >= 0x01 && t <= 0x0C; // 0x0B/0x0C = CERT_INV/GET_CERTS (1.5 P0 GATE)
+    // 0x0D = ADDRS (peer discovery, one-shot push after the v2 handshake);
+    // 0x0E still fails closed.
+    return t >= 0x01 && t <= 0x0D;
 }
 
 WireHeader SwarmNode::make_header(WireMsgType type, uint32_t payload_len, uint64_t nonce,
@@ -112,7 +191,16 @@ uint64_t PeerInfo::xor_distance() const {
 }
 
 bool PeerInfo::operator<(const PeerInfo &other) const {
-    return xor_distance() < other.xor_distance();
+    // Security review P1 (peer discovery, 2026-11-11): the xor_distance
+    // alone is NOT a total order - a wire-supplied node_id can collide
+    // with another peer's fold, and in a std::set "equal" means "equivalent":
+    // a collide-with claim then makes the legit peer's erase+insert UPDATE
+    // silently vanish (peer squatting) and destroys the squatter's own DoS
+    // record (strike laundering). Tie-break on the local address label,
+    // which is unique per connection.
+    if (xor_distance() != other.xor_distance())
+        return xor_distance() < other.xor_distance();
+    return address < other.address;
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -207,6 +295,18 @@ void SwarmNode::close_all_peers() {
 // ── TCP peer connections ────────────────────────────────────────────────────
 
 bool SwarmNode::connect_peer_tcp(const std::string &host, uint16_t port) {
+    // Security review P0 (peer discovery, 2026-11-11): a second dial to the
+    // same label used to overwrite peer_fds_[label], leaking the previous
+    // fd while its reader thread stayed blocked on it forever - with the
+    // health-loop auto-dial this became a remote fd/thread/connection
+    // exhaustion (EMFILE in about an hour) and the orphaned readers also
+    // hung emergency_stop() (peer_readers_ join never returned). Refuse a
+    // duplicate connection instead: one fd, one owner thread, one label.
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        if (peer_fds_.count(host + ":" + std::to_string(port)) != 0)
+            return false;
+    }
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
         return false;
@@ -214,12 +314,45 @@ bool SwarmNode::connect_peer_tcp(const std::string &host, uint16_t port) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1 ||
-        ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
         ::close(fd);
         std::cerr << "[Swarm] TCP connect " << host << ":" << port << " failed\n";
         return false;
     }
+    // Bound the connect itself: discovery dials candidates that may be dead,
+    // and a blocking connect to an unroutable address can hang for minutes
+    // (kernel SYN retransmits), stalling the health loop that must keep
+    // enforcing bans. Non-blocking connect + 2 s deadline, then restore
+    // blocking mode for the handshake/reader path.
+    const int fl = ::fcntl(fd, F_GETFL, 0);
+    if (fl >= 0)
+        ::fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    const int cr = ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    if (cr < 0 && errno != EINPROGRESS) {
+        ::close(fd);
+        std::cerr << "[Swarm] TCP connect " << host << ":" << port << " failed\n";
+        return false;
+    }
+    if (cr < 0) {
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        const int pr = ::poll(&pfd, 1, 2000);
+        int soerr = 0;
+        socklen_t elen = sizeof(soerr);
+        if (pr <= 0 || ::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &elen) < 0 || soerr != 0) {
+            ::close(fd);
+            std::cerr << "[Swarm] TCP connect " << host << ":" << port << " timeout\n";
+            return false;
+        }
+        if (fl >= 0)
+            ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+    }
+    // Restore blocking mode on the immediate-connect path too: the restore
+    // above only runs when poll() was taken. A socket that stays O_NONBLOCK
+    // would turn every later handshake send into EAGAIN short-writes.
+    if (fl >= 0)
+        ::fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
 
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -240,14 +373,30 @@ bool SwarmNode::connect_peer_tcp(const std::string &host, uint16_t port) {
         std::cerr << "[Swarm] handshake send " << host << ":" << port << " failed\n";
         return false;
     }
-
     const std::string label = host + ":" + std::to_string(port);
+    // Peer discovery: self-announce (v2 handshake) + one-shot ADDRS push.
+    // The dialed side answers in kind through its serve loop, so after the
+    // exchange both ends know each other's listen endpoint and one hop of
+    // the mesh graph. Plain socket writes, no swarm lock held.
+    send_self_announce(fd);
+    send_addrs_to(fd, label);
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         peer_fds_[label] = fd;
+        // Security review P1 (peer discovery, 2026-11-11): outbound peers
+        // must exist in peer_table_ from connect time. Without an insert,
+        // the reader's HANDSHAKE handler only ever UPDATED an entry that
+        // never existed, which made every report_withhold() on this label
+        // a silent no-op (unlimited ADDRS flood from a dialed peer) and
+        // left discovery-visible tests unable to see the dialed node.
+        PeerInfo peer{};
+        peer.address = label;
+        peer.last_seen = std::chrono::system_clock::now();
+        peer.is_loopback = host == "127.0.0.1";
+        peer_table_.insert(peer);
     }
-    // Reader thread: our outgoing socket must also ingest — otherwise blocks
-    // broadcast back to us by the dialed peer are never received.
+    // Reader thread: our outgoing socket must also ingest — otherwise
+    // broadcast back to us by the dialed peer is never received.
     {
         std::lock_guard<std::mutex> readers_lock(readers_mu_);
         peer_readers_.emplace_back(&SwarmNode::peer_reader_loop, this, fd, label);
@@ -264,6 +413,9 @@ bool SwarmNode::connect_peer_tcp(const std::string &host, uint16_t port) {
 }
 
 void SwarmNode::peer_reader_loop(int fd, std::string label) {
+    // Discovery state for THIS connection: one self-announce / one ADDRS
+    // per direction; a second ADDRS from the same peer is a flood signal.
+    bool addr_seen = false;
     for (;;) {
         WireHeader hdr{};
         std::vector<uint8_t> payload;
@@ -272,6 +424,100 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
         const auto type = static_cast<WireMsgType>(hdr.msg_type);
         if (type == WireMsgType::PONG)
             continue; // keepalive reply
+        if (type == WireMsgType::HANDSHAKE) {
+            // v2 self-announce from the dialed peer: record its durable
+            // identity and listen endpoint. A peer announcing OUR node_id
+            // is ourselves reached through discovery (seed/ADDRS loop) -
+            // drop the connection immediately, before any state records it.
+            uint64_t height = 0, work = 0;
+            uint8_t tip[32] = {0};
+            std::array<uint8_t, 32> their_id{};
+            uint32_t lip = 0;
+            uint16_t lport = 0;
+            bool lvalid = false, is_self = false;
+            if (!parse_handshake_payload(payload, height, work, tip, node_id_, is_self, their_id,
+                                         lip, lport, lvalid)) {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                peer_fds_.erase(label);
+                ::close(fd);
+                return;
+            }
+            if (is_self) {
+                std::cerr << "[Swarm] self-dial detected via node_id, dropping " << label << "\n";
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                peer_fds_.erase(label);
+                ::close(fd);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                for (auto &peer : peer_table_) {
+                    if (peer.address == label) {
+                        PeerInfo updated = peer;
+                        // Fold the 32-byte identity into the ordering key
+                        // (display/order only; self-detection compared the
+                        // full 32 bytes above). With the total-order
+                        // operator< the erase+insert cannot collide.
+                        std::memcpy(&updated.node_id, their_id.data(), 8);
+                        updated.listen_ip = lip; // network order on the wire
+                        updated.listen_port = lport;
+                        updated.listen_valid = lvalid;
+                        updated.last_seen = std::chrono::system_clock::now();
+                        peer_table_.erase(peer);
+                        peer_table_.insert(updated);
+                        break;
+                    }
+                }
+                // Upsert path: an outbound connection whose announce beat
+                // this reader to the table has no entry yet (connect_peer_tcp
+                // now inserts one; old-world peers that never announce still
+                // get the connect-time entry). Insert what we learned.
+                bool entry_found = false;
+                for (const auto &peer : peer_table_) {
+                    if (peer.address == label) {
+                        entry_found = true;
+                        break;
+                    }
+                }
+                if (!entry_found && !id_full_zero(their_id)) {
+                    PeerInfo peer{};
+                    peer.address = label;
+                    std::memcpy(&peer.node_id, their_id.data(), 8);
+                    peer.listen_ip = lip;
+                    peer.listen_port = lport;
+                    peer.listen_valid = lvalid;
+                    peer.last_seen = std::chrono::system_clock::now();
+                    peer_table_.insert(peer);
+                }
+            }
+            continue;
+        }
+        if (type == WireMsgType::ADDRS) {
+            // Outbound side: the connection is ours and handshaked by
+            // construction, but keep the one-per-connection flood gate
+            // symmetric with the inbound loop.
+            if (addr_seen) {
+                report_withhold(label, 20);
+                continue;
+            }
+            addr_seen = true;
+            // Exclude the peer's own listen endpoint from candidates.
+            uint32_t lip = 0;
+            uint16_t lport = 0;
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                for (const auto &peer : peer_table_) {
+                    if (peer.address == label && peer.listen_valid) {
+                        lip = peer.listen_ip;
+                        lport = peer.listen_port;
+                        break;
+                    }
+                }
+            }
+            if (ingest_addrs(payload, lip, lport) < 0)
+                report_withhold(label, 20); // malformed payload
+            continue;
+        }
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
             handle_incoming_frame(label,
                                   std::span<const uint8_t, 65536>(payload.data(), payload.size()));
@@ -935,7 +1181,261 @@ bool SwarmNode::bind_p2p_listener(uint16_t port) {
     }
     listen_fd_ = fd;
     listen_port_.store(port);
+    // Peer discovery: we advertise exactly what we bound (loopback today;
+    // a broader --bind rides its own backlog item). Advertising anything
+    // else would be a lie to dialers. self_listen_ip_ is NETWORK byte
+    // order, same representation as every other listen ip on this node.
+    self_listen_ip_ = htonl(INADDR_LOOPBACK);
     return true;
+}
+
+// ── Peer discovery (ADDRS / PEX) ────────────────────────────────────────────
+//
+// Design (archives/notes/pex-addr-design.md): both sides of a connection
+// push ONE ADDRS message right after the handshake exchange. Entries are
+// LISTEN addresses only (an observed address carries an ephemeral port and
+// is worthless to a third node). The health loop dials at most one
+// candidate per 5 s tick and only while connected peers are below the
+// discovery floor - a 128-entry candidate list can never become a dial
+// storm (<= 1 outbound per 5 s).
+
+void SwarmNode::load_or_create_node_id(const std::string &data_dir) {
+    if (node_id_ != std::array<uint8_t, 32>{})
+        return; // already loaded (explicit call order guard)
+    std::array<uint8_t, 32> id{};
+    const std::filesystem::path file = std::filesystem::path(data_dir) / "node_id";
+    std::error_code ec;
+    // Read an existing identity. A short or unreadable file is treated as
+    // absent: we do NOT fail the node over identity creation.
+    if (std::filesystem::exists(file, ec)) {
+        int fd = ::open(file.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            size_t got = 0;
+            while (got < id.size()) {
+                ssize_t n = ::read(fd, id.data() + got, id.size() - got);
+                if (n <= 0)
+                    break;
+                got += static_cast<size_t>(n);
+            }
+            ::close(fd);
+            if (got == id.size()) {
+                node_id_ = id;
+                std::cout << "[Swarm] node identity loaded (" << data_dir << "/node_id)\n";
+                return;
+            }
+            // Security review P2 (peer discovery, 2026-11-11): a corrupt /
+            // truncated identity file used to fall straight through to the
+            // O_EXCL create, which fails EEXIST forever - the node ran
+            // PERMANENTLY identityless (self-dial detection silently
+            // disabled). Replace the dead file instead: unlink the corrupt
+            // bytes, then create below.
+            ::unlink(file.c_str());
+        }
+        std::cerr << "[Swarm] node_id file unreadable, regenerating\n";
+    }
+    // Create: O_EXCL so a concurrent plant loses; 0600 so the identity is
+    // owner-private. getrandom failure falls back to std::random_device.
+    int fd = ::open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd >= 0) {
+        if (::getrandom(id.data(), id.size(), 0) != static_cast<ssize_t>(id.size())) {
+            std::random_device rd;
+            for (auto &b : id)
+                b = static_cast<uint8_t>(rd());
+        }
+        ssize_t put = ::write(fd, id.data(), id.size());
+        ::close(fd);
+        if (put == static_cast<ssize_t>(id.size())) {
+            node_id_ = id;
+            std::cout << "[Swarm] node identity created (" << file.string() << ")\n";
+            return;
+        }
+        std::cerr << "[Swarm] node_id write failed; running identityless this session\n";
+        std::array<uint8_t, 32>{}.swap(id);
+        node_id_ = id;
+        return;
+    }
+    std::cerr << "[Swarm] node_id create failed (errno " << errno
+              << "); running identityless this session\n";
+}
+
+bool SwarmNode::add_addr_candidate(uint32_t ip_net, uint16_t port) {
+    if (port == 0)
+        return false;
+    // Never a self-candidate: dialing ourselves is filtered at handshake
+    // (node_id match), but not even queueing it is cheaper.
+    if (listen_port_.load() != 0 && ip_net == self_listen_ip_ && port == listen_port_.load())
+        return false;
+    // Security review P2 (peer discovery, 2026-11-11): never dial
+    // unspecified or multicast targets - they are pure waste of the
+    // bounded dial budget at best and a probe primitive at worst. Loopback
+    // is ALLOWED on purpose: the testnet topology (single host, three
+    // nodes) is loopback-only, and the discovery integration test depends
+    // on it. OPEN ITEM before any multi-host deployment: loopback
+    // acceptance is a localhost-SSRF/probe primitive on a real network
+    // (a peer can aim our dial budget at our own RPC port); it must gain
+    // a default-off switch together with real-interface advertisement in
+    // bind_p2p_listener (see BACKLOG "public binary surface pass").
+    const uint32_t ip_host = ntohl(ip_net);
+    if (ip_host == INADDR_ANY || (ip_host >> 24) == 224 || (ip_host >> 24) == 255)
+        return false;
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    for (const auto &c : addr_candidates_)
+        if (c.ip == ip_net && c.port == port)
+            return false;
+    if (addr_candidates_.size() >= kMaxAddrCandidates)
+        addr_candidates_.pop_front();
+    addr_candidates_.push_back(PeerCandidate{ip_net, port, 0});
+    return true;
+}
+
+size_t SwarmNode::addr_candidate_count() const {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    return addr_candidates_.size();
+}
+
+size_t SwarmNode::add_seed_host(const std::string &host_or_hostport) {
+    std::string host = host_or_hostport;
+    uint16_t port = 19088; // default VX60 wire port (--p2p default in main)
+    const size_t colon = host.rfind(':');
+    if (colon != std::string::npos && host.find(':') == colon) {
+        // Security review P2 (peer discovery, 2026-11-11): a garbage port
+        // ("host:", "host:abc") used to throw uncaught from main() and
+        // kill the node at startup. A seed host is advisory input: warn
+        // and skip instead of terminating.
+        try {
+            const unsigned long p = std::stoul(host.substr(colon + 1));
+            if (p == 0 || p > 65535) {
+                std::cerr << "[Swarm] seed host '" << host_or_hostport
+                          << "' port out of range, skipping\n";
+                return 0;
+            }
+            port = static_cast<uint16_t>(p);
+        } catch (const std::exception &) {
+            std::cerr << "[Swarm] seed host '" << host_or_hostport
+                      << "' has a malformed port, skipping\n";
+            return 0;
+        }
+        host = host.substr(0, colon);
+    }
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo *res = nullptr;
+    if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+        std::cerr << "[Swarm] seed host '" << host_or_hostport << "' did not resolve\n";
+        return 0;
+    }
+    size_t queued = 0;
+    for (addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
+        auto *sa = reinterpret_cast<sockaddr_in *>(ai->ai_addr);
+        if (add_addr_candidate(sa->sin_addr.s_addr, port))
+            ++queued;
+    }
+    ::freeaddrinfo(res);
+    if (queued > 0)
+        std::cout << "[Swarm] seed '" << host_or_hostport << "': " << queued
+                  << " candidate(s) queued\n";
+    return queued;
+}
+
+// Returns -1 when the payload is MALFORMED (a protocol violation worth a
+// DoS strike), otherwise the number of candidates newly ingested. Zero is
+// a legal outcome - the receiver may already know every advertised
+// endpoint - and must never be punished: striking on it would penalize
+// honest peers in a steady-state mesh (security review P2, 2026-11-11).
+int SwarmNode::ingest_addrs(const std::vector<uint8_t> &payload, uint32_t exclude_ip_net,
+                            uint16_t exclude_port) {
+    if (payload.size() < 4)
+        return -1;
+    uint32_t count = 0;
+    std::memcpy(&count, payload.data(), 4);
+    if (count > kMaxAddrEntries ||
+        payload.size() != 4 + static_cast<size_t>(count) * kAddrEntrySize)
+        return -1;
+    int ingested = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t *e = payload.data() + 4 + i * kAddrEntrySize;
+        uint32_t ip_net;
+        uint16_t port_le;
+        std::memcpy(&ip_net, e, 4);
+        std::memcpy(&port_le, e + 4, 2);
+        uint16_t port = ntohs(port_le);
+        if (port == 0)
+            continue;
+        // Exclude self (exact bound-endpoint match) and the sender's listen
+        // endpoint (dialing it back over the same socket we already have is
+        // a loop, not discovery).
+        if (listen_port_.load() != 0 && ip_net == self_listen_ip_ && port == listen_port_.load())
+            continue;
+        if (ip_net == exclude_ip_net && port == exclude_port)
+            continue;
+        if (add_addr_candidate(ip_net, port))
+            ++ingested;
+    }
+    return ingested;
+}
+
+void SwarmNode::send_self_announce(int fd) {
+    // Height/work/tip stay 0 on the live discovery path: the real mesh has
+    // no fork-resolution use for them yet (the split-brain simulator sends
+    // real values over its own raw sockets).
+    std::vector<uint8_t> p(kHandshakeV2Size, 0);
+    const uint64_t zero64 = 0;
+    std::memcpy(p.data(), &zero64, 8);
+    std::memcpy(p.data() + 8, &zero64, 8);
+    std::memcpy(p.data() + 48, node_id_.data(), 32);
+    if (listen_port_.load() != 0 && self_listen_ip_ != 0) {
+        const uint32_t ip_net = self_listen_ip_; // already network order
+        const uint16_t port_le = htons(listen_port_.load());
+        std::memcpy(p.data() + 80, &ip_net, 4);
+        std::memcpy(p.data() + 84, &port_le, 2);
+        p[86] = 1;
+    }
+    WireHeader h = make_header(WireMsgType::HANDSHAKE, static_cast<uint32_t>(p.size()),
+                               session_nonce_.fetch_add(1));
+    h.crc32c = compute_wire_crc32c(p.data(), p.size());
+    (void)send_packet(fd, h, p.data());
+}
+
+void SwarmNode::send_addrs_to(int fd, const std::string &exclude_label) {
+    std::vector<std::pair<uint32_t, uint16_t>> entries;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        std::set<std::pair<uint32_t, uint16_t>> seen;
+        // Connected peers first: their listen endpoints are confirmed live.
+        // listen_ip is stored network-order (PeerInfo comment).
+        for (const auto &peer : peer_table_) {
+            if (!peer.listen_valid || peer.address == exclude_label)
+                continue;
+            auto key = std::make_pair(peer.listen_ip, peer.listen_port);
+            if (seen.insert(key).second)
+                entries.push_back(key);
+        }
+        for (const auto &c : addr_candidates_) {
+            if (entries.size() >= kMaxAddrEntries)
+                break;
+            auto key = std::make_pair(c.ip, c.port);
+            if (seen.insert(key).second)
+                entries.push_back(key);
+        }
+    }
+    if (entries.empty())
+        return;
+    if (entries.size() > kMaxAddrEntries)
+        entries.resize(kMaxAddrEntries);
+    std::vector<uint8_t> p(4 + entries.size() * kAddrEntrySize);
+    uint32_t count = static_cast<uint32_t>(entries.size());
+    std::memcpy(p.data(), &count, 4);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        uint8_t *e = p.data() + 4 + i * kAddrEntrySize;
+        std::memcpy(e, &entries[i].first, 4);
+        uint16_t port_le = htons(entries[i].second);
+        std::memcpy(e + 4, &port_le, 2);
+    }
+    WireHeader h = make_header(WireMsgType::ADDRS, static_cast<uint32_t>(p.size()),
+                               session_nonce_.fetch_add(1));
+    h.crc32c = compute_wire_crc32c(p.data(), p.size());
+    (void)send_packet(fd, h, p.data());
 }
 
 // ── Background loops ────────────────────────────────────────────────────────
@@ -1034,6 +1534,17 @@ void SwarmNode::serve_connection(int c) {
         if (peer_connected_callback_)
             peer_connected_callback_(peer_label);
     };
+    // Discovery (one-shot per connection, sent on the promote call): the
+    // v2 self-announce (identity + listen endpoint) and one ADDRS push of
+    // our known listen endpoints. Sends happen with NO swarm lock held -
+    // they are plain socket writes like every other handler here.
+    auto announce = [&]() {
+        send_self_announce(c);
+        send_addrs_to(c, peer_label);
+    };
+    // Discovery state: ADDRS is accepted at most once per connection (a
+    // second one is a flood signal -> DoS strike); malformed likewise.
+    bool addr_seen = false;
     for (;;) {
         WireHeader hdr{};
         std::vector<uint8_t> payload;
@@ -1041,24 +1552,104 @@ void SwarmNode::serve_connection(int c) {
             break;
         const auto type = static_cast<WireMsgType>(hdr.msg_type);
         if (type == WireMsgType::PING) {
-            if (promote())
+            if (promote()) {
                 fire_connected();
+                announce();
+            }
             WireHeader pong = make_header(WireMsgType::PONG, 0, session_nonce_.fetch_add(1));
             pong.crc32c = compute_wire_crc32c(nullptr, 0);
             ::send(c, &pong, sizeof(pong), MSG_NOSIGNAL);
             continue;
         }
-        if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
-            if (promote())
+        if (type == WireMsgType::HANDSHAKE) {
+            // v2 self-announce from the peer: record identity + listen
+            // endpoint; a peer announcing OUR node_id is ourselves (self-dial
+            // through discovery) - drop the connection on sight.
+            uint64_t height = 0, work = 0;
+            uint8_t tip[32] = {0};
+            std::array<uint8_t, 32> their_id{};
+            uint32_t lip = 0;
+            uint16_t lport = 0;
+            bool lvalid = false, is_self = false;
+            if (!parse_handshake_payload(payload, height, work, tip, node_id_, is_self, their_id,
+                                         lip, lport, lvalid)) {
+                break; // malformed: unexpected message shape, close like the rest
+            }
+            if (is_self) {
+                std::cerr << "[Swarm] self-dial detected via node_id, dropping " << peer_label
+                          << "\n";
+                break;
+            }
+            if (promote()) {
                 fire_connected();
+                announce();
+            }
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                for (auto &peer : peer_table_) {
+                    if (peer.address == peer_label) {
+                        PeerInfo updated = peer;
+                        // Fold the 32-byte identity into the ordering key
+                        // (display/order only; self-detection compared the
+                        // full 32 bytes above).
+                        std::memcpy(&updated.node_id, their_id.data(), 8);
+                        updated.listen_ip = lip;
+                        updated.listen_port = lport;
+                        updated.listen_valid = lvalid;
+                        updated.last_seen = std::chrono::system_clock::now();
+                        peer_table_.erase(peer);
+                        peer_table_.insert(updated);
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if (type == WireMsgType::ADDRS) {
+            // Only a promoted (handshaked) connection may feed candidates:
+            // an unauthenticated pre-promote push is dropped unanswered.
+            if (!registered) {
+                corrupted_packets_dropped_.fetch_add(1);
+                continue;
+            }
+            if (addr_seen) {
+                report_withhold(peer_label, 20);
+                continue;
+            }
+            addr_seen = true;
+            // Exclude the sender's own listen endpoint: dialing it back over
+            // the same socket we already have is a loop, not discovery.
+            uint32_t lip = 0;
+            uint16_t lport = 0;
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                for (const auto &peer : peer_table_) {
+                    if (peer.address == peer_label && peer.listen_valid) {
+                        lip = peer.listen_ip;
+                        lport = peer.listen_port;
+                        break;
+                    }
+                }
+            }
+            if (ingest_addrs(payload, lip, lport) < 0)
+                report_withhold(peer_label, 20); // malformed payload
+            continue;
+        }
+        if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
+            if (promote()) {
+                fire_connected();
+                announce();
+            }
             handle_incoming_frame(peer_label,
                                   std::span<const uint8_t, 65536>(payload.data(), payload.size()));
             continue;
         }
         if (type == WireMsgType::PQ_WITNESS &&
             payload.size() == 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)) {
-            if (promote())
+            if (promote()) {
                 fire_connected();
+                announce();
+            }
             vx::crypto::pq::PqSignatureWitness w;
             std::memcpy(&w, payload.data() + 74, sizeof(w));
             std::array<uint8_t, 32> digest{};
@@ -1070,8 +1661,10 @@ void SwarmNode::serve_connection(int c) {
             continue;
         }
         if (type == WireMsgType::ROLLOVER_CERT) {
-            if (promote())
+            if (promote()) {
                 fire_connected();
+                announce();
+            }
             handle_rollover_cert_payload(payload);
             continue;
         }
@@ -1151,6 +1744,49 @@ void SwarmNode::health_loop() {
             if (fd >= 0)
                 ::shutdown(fd, SHUT_RDWR);
         }
+
+        // Peer discovery auto-dial: at most ONE outbound attempt per tick
+        // (5 s) and only while the mesh is below the discovery floor, so a
+        // poisoned candidate list can never become a dial storm. The
+        // candidate is consumed under the lock, dialed OUTSIDE it
+        // (connect_peer_tcp takes peers_mutex_ itself), and evicted after
+        // kMaxCandidateAttempts failed rounds.
+        {
+            uint32_t dip = 0;
+            uint16_t dport = 0;
+            bool have = false;
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                if (peer_fds_.size() < kMinAutoDialPeers && !addr_candidates_.empty()) {
+                    auto &cand = addr_candidates_.front();
+                    if (cand.attempts >= kMaxCandidateAttempts) {
+                        addr_candidates_.pop_front();
+                    } else {
+                        cand.attempts += 1;
+                        dip = cand.ip;
+                        dport = cand.port;
+                        have = true;
+                    }
+                }
+            }
+            if (have) {
+                char ipstr[INET_ADDRSTRLEN] = {0};
+                ::inet_ntop(AF_INET, &dip, ipstr, sizeof(ipstr));
+                // Pop on SUCCESS: a connected candidate has served its
+                // purpose and must not be re-dialed every tick (with the
+                // duplicate-dial refusal this would otherwise spin forever
+                // on an already-connected endpoint). On failure the
+                // attempts counter (incremented above) evicts it after
+                // kMaxCandidateAttempts rounds.
+                if (connect_peer_tcp(ipstr, dport)) {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    if (!addr_candidates_.empty() && addr_candidates_.front().ip == dip &&
+                        addr_candidates_.front().port == dport)
+                        addr_candidates_.pop_front();
+                }
+            }
+        }
+
         for (int i = 0; i < 50 && !emergency_stop_requested_.load(); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
