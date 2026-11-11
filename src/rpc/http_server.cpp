@@ -314,8 +314,8 @@ struct ConnThreadGuard {
 };
 } // namespace
 
-HttpServer::RemoteApply HttpServer::try_apply_remote_frame(const uint8_t *bytes,
-                                                           const std::string &peer) {
+HttpServer::RemoteApply
+HttpServer::try_apply_remote_frame(const uint8_t *bytes, const std::string &peer, bool from_park) {
     vx::blockchain::BlockView view{std::span<const uint8_t, 65536>(bytes, 65536)};
     const uint64_t h = view.header().block_height;
 
@@ -355,6 +355,29 @@ HttpServer::RemoteApply HttpServer::try_apply_remote_frame(const uint8_t *bytes,
         ledger_bound_root_of(ledger_));
     if (wstatus == vx::blockchain::WitnessRootStatus::MISSING_WITNESS) {
         purge_expired_parked_locked();
+        // Security review 2026-11-12 (MEDIUM): the global park cap alone
+        // lets one peer evict frames other peers delivered — parking runs
+        // BEFORE the expensive full-frame PoGW hash, so junk frames are
+        // cheap to flood. Bound each peer to a share of the park; a peer
+        // over its cap has its excess frames dropped, never parked. The
+        // cap is keyed by source IP (label minus the ephemeral port, same
+        // normalization the retention limiter uses): a 4-connection or
+        // reconnect churn from one host must not multiply its share.
+        std::string ip = peer;
+        const auto colon = ip.rfind(':');
+        if (colon != std::string::npos)
+            ip.resize(colon);
+        size_t peer_parked = 0;
+        for (const auto &p : parked_witness_frames_) {
+            std::string peer_ip = p.peer_label;
+            const auto pcolon = peer_ip.rfind(':');
+            if (pcolon != std::string::npos)
+                peer_ip.resize(pcolon);
+            if (peer_ip == ip)
+                ++peer_parked;
+        }
+        if (peer_parked >= kMaxParkedFramesPerPeer)
+            return RemoteApply::REFUSED;
         if (parked_witness_frames_.size() >= kMaxParkedWitnessFrames) {
             parked_witness_frames_.erase(parked_witness_frames_.begin());
         }
@@ -371,16 +394,27 @@ HttpServer::RemoteApply HttpServer::try_apply_remote_frame(const uint8_t *bytes,
         // Withholding becomes attribution: the commitment names a witness
         // set no canonical rule produces. Scored per peer; escalation to a
         // mute/ban rides the SwarmNode reputation surface.
-        ++witness_withhold_score_[peer];
-        // Security review P2-4 (2.11 third checkbox): the map is bounded -
-        // churned labels must not accumulate forever. Drop the first entry
-        // (key order) when full; an attacker buying evictions only churns
-        // other attackers' entries.
-        if (witness_withhold_score_.size() > kMaxWithholdScoreEntries)
-            witness_withhold_score_.erase(witness_withhold_score_.begin());
-        // BACKLOG 2.11 third checkbox: the counter now has a consumer -
-        // three strikes (34 each) cross the SwarmNode ban threshold.
-        swarm_node_->report_withhold(peer, 34);
+        // Security review 2026-11-12 (MEDIUM): a MISMATCH on a PARKED-RETRY
+        // must not blame the frame's original deliverer. Between park and
+        // retry the witness registry changed — the refusal reflects the
+        // frame's PROPOSER (or a poisoned witness entry), not the relayer,
+        // and in gossip the relayer is usually honest. Strike only on live
+        // first delivery (that label chose to send this frame now); a
+        // retry drops silently. The strike is BOTH the score bump and the
+        // ban-channel report_withhold (3 x 34 crosses the ban threshold) —
+        // the whole block is gated, not just the diagnostics.
+        if (!from_park) {
+            ++witness_withhold_score_[peer];
+            // Security review P2-4 (2.11 third checkbox): the map is bounded
+            // - churned labels must not accumulate forever. Drop the first
+            // entry (key order) when full; an attacker buying evictions
+            // only churns other attackers' entries.
+            if (witness_withhold_score_.size() > kMaxWithholdScoreEntries)
+                witness_withhold_score_.erase(witness_withhold_score_.begin());
+            // BACKLOG 2.11 third checkbox: the counter now has a consumer -
+            // three strikes (34 each) cross the SwarmNode ban threshold.
+            swarm_node_->report_withhold(peer, 34);
+        }
         return RemoteApply::REFUSED;
     }
 
@@ -452,17 +486,21 @@ void HttpServer::on_witness_arrived(const std::array<uint8_t, 32> &digest) {
     // Retry OUTSIDE the state lock: try_apply_remote_frame takes
     // state_mutex_ -> seal_mutex_ itself (same order as the live path).
     for (auto &pf : candidates) {
-        // Retry under the frame's ORIGINAL delivery label (security review
-        // P2-3): a MISMATCH on retry must land on the peer that submitted
-        // the frame, not on the meaningless "parked-retry" constant.
-        const auto outcome = try_apply_remote_frame(pf.bytes.data(), pf.peer_label);
+        // Retry under the frame's ORIGINAL delivery label, marked as a
+        // parked retry (security review 2026-11-12): a MISMATCH on retry
+        // must not strike the deliverer — see the MISMATCH branch in
+        // try_apply_remote_frame.
+        const auto outcome =
+            try_apply_remote_frame(pf.bytes.data(), pf.peer_label, /*from_park=*/true);
         if (outcome == RemoteApply::PARKED) {
             // Witnesses are still incomplete: re-park. pf.arrived still
             // holds the ORIGINAL arrival time, so the TTL keeps ticking
-            // from the first attempt. The cap holds on this path too
-            // (security review residual: a concurrent retry wave must
-            // not overshoot it) - a frame that does not fit is dropped:
-            // a full park means 32 fresher frames are waiting.
+            // from the first attempt. The GLOBAL cap holds on this path
+            // too (a concurrent retry wave must not overshoot it) - a
+            // frame that does not fit is dropped. The per-peer count is
+            // consistent by construction: the retried frame was erased
+            // from the park above, so re-parking restores its previous
+            // per-peer share rather than growing it.
             std::lock_guard<std::mutex> state_lock(state_mutex_);
             if (parked_witness_frames_.size() < kMaxParkedWitnessFrames) {
                 parked_witness_frames_.push_back(std::move(pf));

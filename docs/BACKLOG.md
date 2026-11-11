@@ -1932,15 +1932,22 @@ amends the list as needed.
   retirement-refused frames as attributable refusals rather than parkable
   witness-lag, and track cert coverage in fork choice when reorg/
   fork-choice work lands.
-- [ ] P3 (security review 2026-11-11): certificate-slot griefing —
-  register_rollover_cert caps 32 certs per sender; junk certificates
-  under a victim's sender (attacker's own lineage — inert for consensus)
-  durably fill those slots so the VICTIM's own rollover registration
-  refuses with 409 forever. Reachable already via the ROLLOVER_CERT wire
-  path (no auth); the wallet RPC adds a convenient trigger, not a new
-  capability. Fix candidates: prune stored certs whose old_root does not
-  chain from the sender's known anchor, or key the per-sender cap by
-  (sender, old_root).
+- [x] ~~P3 (security review 2026-11-11): certificate-slot griefing~~
+  **CLOSED (2026-11-12, escalated to HIGH by automated review — fixed
+  same day)**: the registry is no longer keyed by the attacker-choosable
+  sender label at all. Storage is keyed by the SIGNED transition
+  (old_root, from_window) — one record per key, global cap 50000 — so
+  occupying a slot requires a signature from the owner of that exact
+  tree, and advance_root_chain walks purely from the caller's own anchor
+  (the sender param is ignored). Residual note: an attacker can still
+  pre-occupy one transition with a wrong-labeled copy of the same cert;
+  the walk is unaffected (labels are not part of the walk), so impact is
+  nil. Same-day companion fixes from the same review: parked-retry
+  MISMATCH no longer strikes the frame's original deliverer (the witness
+  registry changed between park and retry — blame the proposer, not the
+  honest relayer), and the witness park gained a per-peer cap (8 of 32)
+  so one peer cannot evict frames other peers delivered by flooding
+  cheap junk into the pre-PoGW park window.
 - [ ] P3: RingPipelineThroughputNoAllocs floor is TSan-lane flaky — the
   500k ops/s throughput assertion lands ~9% short under ThreadSanitizer
   instrumentation on the dev machine (452-458k observed; reproduced on

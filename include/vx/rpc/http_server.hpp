@@ -185,8 +185,13 @@ private:
 
     // The one apply path for remote frames (wire intake and parked-retry
     // share it, so parking can never bypass a check the live path has).
+    // from_park=true marks the parked-retry entry: a MISMATCH then drops
+    // without striking the original deliverer (security review 2026-11-12
+    // — the registry changed between park and retry, so the refusal
+    // reflects the proposer or a poisoned witness, not the relayer).
     enum class RemoteApply { APPLIED, PARKED, REFUSED };
-    RemoteApply try_apply_remote_frame(const uint8_t *bytes, const std::string &peer);
+    RemoteApply try_apply_remote_frame(const uint8_t *bytes, const std::string &peer,
+                                       bool from_park = false);
     void purge_expired_parked_locked();
 
     struct ParkedFrame {
@@ -199,8 +204,12 @@ private:
         std::string peer_label;
     };
     // Bounded park for frames whose witnesses are still in flight (DoS cap:
-    // oldest frame evicted when full). Guarded by state_mutex_.
+    // oldest frame evicted when full). Guarded by state_mutex_. The
+    // per-peer cap (security review 2026-11-12) stops one peer from
+    // evicting everyone else's frames by flooding cheap junk — parking
+    // runs before the expensive full-frame PoGW hash.
     static constexpr size_t kMaxParkedWitnessFrames = 32;
+    static constexpr size_t kMaxParkedFramesPerPeer = 8;
     // Witness retention window (blocks): how far back a newly connected
     // peer is re-served witnesses for.
     static constexpr uint64_t kWitnessRetentionBlocks = 16;

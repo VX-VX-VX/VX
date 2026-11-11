@@ -285,9 +285,11 @@ TEST(VortexWitnessDeliveryTest, MismatchRefusedAndAttributed) {
     EXPECT_EQ(c.server->witness_withhold_count("other-peer"), 0u);
 }
 
-// -- The park is bounded: the oldest parked frame is evicted when the
-// cap is hit, so a peer cannot make the node buffer unbounded witness
-// traffic.
+// -- The park is bounded TWICE (security review 2026-11-12): per peer
+// first (one peer cannot evict frames other peers delivered by flooding
+// cheap junk — parking runs before the expensive PoGW hash), then
+// globally (the oldest parked frame is evicted when the global cap is
+// hit, so the node never buffers unbounded witness traffic).
 TEST(VortexWitnessDeliveryTest, ParkSetIsBounded) {
     DeliveryChain c("vx_wd_cap");
     ASSERT_TRUE(c.server != nullptr);
@@ -295,11 +297,12 @@ TEST(VortexWitnessDeliveryTest, ParkSetIsBounded) {
     const BlockFrame f =
         honest_spend_frame(c, "NFA_WD_SINK_C_000000000000000000000000", 0, 1000000000u);
     vx::crypto::pq::PqWitnessRegistry::instance().clear_witnesses_for_test();
+    // 40 deliveries from ONE label: the per-peer cap binds at 8.
     for (int i = 0; i < 40; ++i) {
         EXPECT_FALSE(c.server->apply_remote_frame(f.data()));
     }
-    EXPECT_EQ(c.server->parked_witness_count(), 32u)
-        << "the park must evict the oldest, never grow past 32";
+    EXPECT_EQ(c.server->parked_witness_count(), 8u)
+        << "one peer must not hold the whole park (per-peer cap)";
 }
 
 // -- Every parked frame expires after the park TTL: the witnesses-in-

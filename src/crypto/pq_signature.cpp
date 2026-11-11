@@ -967,6 +967,18 @@ bool rollover_cert_content_equal(const PqRolloverCert &a, const PqRolloverCert &
            a.old_root == b.old_root && a.new_root == b.new_root &&
            std::memcmp(&a.witness, &b.witness, sizeof(a.witness)) == 0;
 }
+
+// Security review 2026-11-12 (HIGH): the storage key is the SIGNED part of
+// a certificate — (old_root, from_window) — never the attacker-choosable
+// sender label. A chain walk starts at the account's own anchor and hops
+// through exactly these keys, so a foreign transition cannot attach to (or
+// exhaust a quota of) another account's lineage.
+std::array<uint8_t, 36> cert_transition_key(const PqRolloverCert &c) noexcept {
+    std::array<uint8_t, 36> k{};
+    std::memcpy(k.data(), c.old_root.data(), 32);
+    std::memcpy(k.data() + 32, &c.from_window, sizeof(c.from_window));
+    return k;
+}
 } // namespace
 
 bool PqWitnessRegistry::register_rollover_cert(const PqRolloverCert &cert, bool *fresh) {
@@ -983,35 +995,38 @@ bool PqWitnessRegistry::register_rollover_cert(const PqRolloverCert &cert, bool 
                             cert.witness))
         return false;
 
-    // NOTE on sender binding (security review 2026-11-07): cert.sender is
-    // attacker-choosable on the wire and is deliberately NOT part of the
-    // signed binding digest - registration is out-of-band relay and may
-    // arrive before this node has seen any transaction from the sender,
-    // so requiring a bound anchor here would break relay. The structural
-    // defense lives in advance_root_chain: a walk for address A starts at
-    // A's OWN anchor and only links certificates whose old_root equals the
-    // walked root, so a relabeled or foreign certificate can never attach
-    // to a victim's chain (its old_root is the SIGNER's window root, which
-    // only matches a walk that is already inside the signer's own key
-    // lineage). Storage exhaustion is bounded the same way the witness
-    // store is: an entry exists only AFTER full cryptographic
-    // verification, so filling it requires signing keys, not spam.
+    // NOTE on sender binding (security review 2026-11-07, revised
+    // 2026-11-12): cert.sender is attacker-choosable on the wire and is
+    // deliberately NOT part of the signed binding digest - registration is
+    // out-of-band relay and may arrive before this node has seen any
+    // transaction from the sender, so requiring a bound anchor here would
+    // break relay. The sender label is therefore NOT a storage key either
+    // (the original per-sender chain map let an attacker fill a victim's
+    // 32-cert quota with its OWN validly signed, relabeled certificates -
+    // a durable rollover refusal for the victim). Storage is keyed by the
+    // SIGNED transition (old_root, from_window): occupying a slot requires
+    // a signature from the owner of that exact tree, and advance_root_chain
+    // walks from the caller's OWN anchor through exactly these keys, so a
+    // relabeled or foreign certificate can never attach to a victim's
+    // chain. An entry exists only AFTER full cryptographic verification,
+    // so filling the map requires signing keys, not spam.
     std::lock_guard<std::mutex> lock(mutex_);
     if (fresh)
         *fresh = false;
-    auto it = cert_by_sender_.find(cert.sender);
-    if (it == cert_by_sender_.end()) {
-        if (cert_by_sender_.size() >= kMaxCertSenders)
-            return false;
-        it = cert_by_sender_.emplace(cert.sender, std::vector<PqRolloverCert>{}).first;
-    }
-    auto &chain = it->second;
-    for (const auto &c : chain)
-        if (rollover_cert_content_equal(c, cert))
+    const auto key = cert_transition_key(cert);
+    const auto it = cert_by_transition_.find(key);
+    if (it != cert_by_transition_.end()) {
+        // Deterministic WOTS+ signing makes at most one valid certificate
+        // per signed transition: a byte-identical re-store is a dedup hit,
+        // a DISTINCT record for the same transition cannot be genuine
+        // (hash break territory) and is refused.
+        if (rollover_cert_content_equal(it->second, cert))
             return true; // dedup
-    if (chain.size() >= kMaxCertsPerSender)
         return false;
-    chain.push_back(cert);
+    }
+    if (cert_by_transition_.size() >= kMaxCertsTotal)
+        return false;
+    cert_by_transition_.emplace(key, cert);
     append_cert_durable_locked(cert);
     // The relay cue fires only when the id is genuinely new: a same-id
     // re-store (hash collision or a padding-agnostic re-store path) must
@@ -1065,40 +1080,30 @@ bool PqWitnessRegistry::advance_root_chain(const uint8_t sender_nfa[42],
                                            const std::array<uint8_t, 32> &anchor,
                                            std::array<uint8_t, 32> &out_root,
                                            uint32_t &out_window) const {
-    std::array<uint8_t, 42> sender{};
-    std::memcpy(sender.data(), sender_nfa, 42);
+    // Security review 2026-11-12 (HIGH): the sender label no longer takes
+    // part in the walk at all - the chain is keyed by the SIGNED
+    // transitions (old_root, from_window), and the walk is driven purely by
+    // the caller's OWN anchor, so a foreign or relabeled certificate can
+    // never attach to another account's lineage.
+    (void)sender_nfa;
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = cert_by_sender_.find(sender);
-    if (it == cert_by_sender_.end())
-        return false; // no certified rotation at all
 
     // Walk the sequential chain from the anchor (window 0). Every record in
     // the store passed full cryptographic verification at admission, so the
-    // walk is a structural match: from_window == current window AND
-    // old_root == current root. Deterministic WOTS+ signing makes the valid
-    // certificate per (old_root, from, to) transition unique; if two
-    // DISTINCT candidates ever matched one transition (a hash-function
-    // break, in theory) the walk stops conservatively rather than picking.
+    // walk is a structural match on the transition key. The old ambiguity
+    // guard (two DISTINCT candidates for one transition -> conservative
+    // stop) is now structural: registration admits at most one record per
+    // (old_root, from_window) key, on both the wire and replay paths.
     std::array<uint8_t, 32> cur = anchor;
     uint32_t cur_window = 0;
     for (size_t depth = 0; depth < PQ_MAX_CERT_CHAIN_DEPTH; ++depth) {
-        const PqRolloverCert *match = nullptr;
-        bool ambiguous = false;
-        for (const auto &c : it->second) {
-            if (c.from_window != cur_window)
-                continue;
-            if (!vx::core::ct_equal(c.old_root.data(), cur.data(), 32))
-                continue;
-            if (match != nullptr &&
-                !vx::core::ct_equal(match->new_root.data(), c.new_root.data(), 32)) {
-                ambiguous = true;
-                break;
-            }
-            match = &c;
-        }
-        if (ambiguous || match == nullptr)
+        std::array<uint8_t, 36> key{};
+        std::memcpy(key.data(), cur.data(), 32);
+        std::memcpy(key.data() + 32, &cur_window, sizeof(cur_window));
+        const auto it = cert_by_transition_.find(key);
+        if (it == cert_by_transition_.end())
             break; // deepest unambiguous point
-        cur = match->new_root;
+        cur = it->second.new_root;
         ++cur_window;
     }
     if (cur_window == 0)
@@ -1159,7 +1164,7 @@ void PqWitnessRegistry::attach_durable_cert_log(const std::string &path) {
     uint8_t rec[8 + 42 + 4 + 4 + 32 + 32 + sizeof(PqSignatureWitness)];
     off_t good_offset = 0;
     for (;;) {
-        if (cert_by_sender_.size() >= kMaxCertSenders)
+        if (cert_by_transition_.size() >= kMaxCertsTotal)
             break; // cap the RAM too
         ssize_t got = 0;
         while (got < static_cast<ssize_t>(sizeof(rec))) {
@@ -1193,17 +1198,22 @@ void PqWitnessRegistry::attach_durable_cert_log(const std::string &path) {
             break; // policy -> stop
         if (!pq_verify_rollover(c.old_root, c.from_window, c.to_window, c.new_root, c.witness))
             break; // crypto -> stop
-        auto &chain = cert_by_sender_[c.sender];
-        bool dup = false;
-        for (const auto &e : chain)
-            if (rollover_cert_content_equal(e, c)) {
-                dup = true;
-                break;
-            }
-        if (!dup && chain.size() < kMaxCertsPerSender) {
-            chain.push_back(c);
-            index_cert_locked(c);
-        }
+        // Same signed-transition keying as the live path (security review
+        // 2026-11-12): one record per (old_root, from_window). A byte-
+        // identical record is a replay dup (skip). A DISTINCT record for a
+        // taken transition is a relabel artifact of OLD sidecars (the old
+        // content-equality dedup included the sender label, so relabeled
+        // re-stores landed as separate records) or corruption — either way
+        // the already-stored record is the verified one and pq_sign_message
+        // is fully deterministic, so SKIP and keep replaying (review P2-1:
+        // a break here bricked upgraded nodes' sidecars at the first old
+        // relabel pair, on every restart). Each record was cryptographically
+        // verified above before reaching this point.
+        const auto key = cert_transition_key(c);
+        if (cert_by_transition_.count(key) != 0)
+            continue; // dup or relabel artifact: the stored record stays
+        cert_by_transition_.emplace(key, c);
+        index_cert_locked(c);
     }
     // O_APPEND writes at the end; no explicit seek needed.
 }

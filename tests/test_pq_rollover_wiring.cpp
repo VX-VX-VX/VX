@@ -147,6 +147,37 @@ int main() {
         std::cout << "  [1] chain walk 0->1->2 deterministic, anchor-relative OK\n";
     }
 
+    // ── 1b. Relabel griefing is dead (security review 2026-11-12, HIGH) ────
+    // The registry is keyed by the SIGNED transition (old_root, from_window),
+    // not by the attacker-choosable sender label: a relabeled copy of a
+    // genuine certificate is refused (one record per transition), and the
+    // VICTIM's own walk from its own anchor still hops through the stored
+    // record — the walk never reads sender labels.
+    {
+        const auto master = pseudo_bytes("VX_WIRING_RELABEL_V1", 4);
+        const auto pub_seed = pub_seed_from_sk(master);
+        const auto attacker = make_sender("VX_WIRING_RELABEL_ATKR_V1");
+        const auto victim = make_sender("VX_WIRING_RELABEL_VCTM_V1");
+        const auto r0 = xmss_root_tree(master, pub_seed, 0);
+        const auto r1 = xmss_root_tree(master, pub_seed, 1);
+
+        // The attacker registers its own validly signed transition but
+        // labels it with the VICTIM's address (the old per-sender quota
+        // made this a durable rollover refusal for the victim).
+        assert(register_chain_hop(master, pub_seed, victim, 0));
+        // A relabeled copy of the same transition: refused, not stored twice.
+        assert(!register_chain_hop(master, pub_seed, attacker, 0));
+
+        std::array<uint8_t, 32> out{};
+        uint32_t win = 0;
+        // The victim's walk from the victim's own anchor works through the
+        // stored record regardless of the label it carries.
+        assert(PqWitnessRegistry::instance().advance_root_chain(victim.data(), r0, out, win));
+        assert(win == 1);
+        assert(roots_equal(out, r1));
+        std::cout << "  [1b] relabeled cert refused; victim walk label-blind OK\n";
+    }
+
     // ── 2. Sequential policy: to != from + 1 refuses ───────────────────────
     {
         const auto master = pseudo_bytes("VX_WIRING_SEQ_V1", 3);

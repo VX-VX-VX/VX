@@ -389,13 +389,19 @@ public:
     // occupy a slot and censor the honest witness.
     static constexpr size_t kMaxWitnessesPerDigest = 8;
     static constexpr size_t kMaxDigestEntries = 50000;
-    // Rollover certificates: same cache discipline. A sender's certified
-    // chain is bounded by PQ_MAX_CERT_CHAIN_DEPTH anyway; the extra slack
-    // tolerates out-of-order relay, and the sender cap bounds the map RAM
-    // under relay flooding (only cryptographically valid records get in,
-    // but unverified-then-evicted churn is still bounded this way).
-    static constexpr size_t kMaxCertsPerSender = 32;
-    static constexpr size_t kMaxCertSenders = 50000;
+    // Rollover certificates: same cache discipline. Security review
+    // (2026-11-12, HIGH): the registry used to be keyed by the
+    // attacker-choosable cert.sender label, so an attacker could spend REAL
+    // signatures of its OWN key trees to fill a VICTIM's per-sender quota
+    // (32 certs) and durably refuse the victim's own rollover (the sender
+    // label is deliberately not part of the signed binding). Certificates
+    // are now keyed by the SIGNED transition (old_root, from_window):
+    // occupying a slot requires a signature from the owner of that exact
+    // tree, a chain walk starts at the account's OWN anchor, so a foreign
+    // transition can never attach to — or starve — another account's
+    // lineage. The total cap bounds the map RAM under relay flooding (only
+    // cryptographically valid records get in, but churn is still bounded).
+    static constexpr size_t kMaxCertsTotal = 50000;
 
     // Binds a freshly signed witness to its message digest and sender.
     // Verifies the FULL WOTS+/XMSS + anchor chain against the tx first;
@@ -515,8 +521,11 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<std::array<uint8_t, 32>, std::vector<Entry>, PqArrayHash> by_digest_;
     std::unordered_map<std::array<uint8_t, 42>, std::array<uint8_t, 32>, PqArrayHash> sender_roots_;
-    std::unordered_map<std::array<uint8_t, 42>, std::vector<PqRolloverCert>, PqArrayHash>
-        cert_by_sender_;
+    // SIGNED-transition keying (security review 2026-11-12): one record per
+    // (old_root, from_window) — deterministic WOTS+ signing makes a second,
+    // distinct certificate for one transition impossible, so registration
+    // refuses instead of storing a candidate set.
+    std::unordered_map<std::array<uint8_t, 36>, PqRolloverCert, PqArrayHash> cert_by_transition_;
     // BACKLOG 1.5 P0 GATE: id -> certificate (both wire-accepted and
     // replayed), plus the insertion order capped at kCertInventoryWindow
     // for the connect-time inventory announcement.
