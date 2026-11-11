@@ -895,6 +895,8 @@ HttpResponse HttpServer::dispatch(const HttpRequest& req) {
     if (req.method == "POST" && req.path == "/api/security/chaos_fuzz") return handle_security_chaos_fuzz(req);
     if (req.method == "POST" && req.path == "/api/crypto/pq_sign") return handle_crypto_pq_sign(req);
     if (req.method == "POST" && req.path == "/api/crypto/pq_verify") return handle_crypto_pq_verify(req);
+    if (req.method == "POST" && req.path == "/api/wallet/rollover")
+        return handle_wallet_rollover(req);
 
     return HttpResponse::error(404, "not found");
 }
@@ -920,24 +922,28 @@ HttpResponse HttpServer::route(const HttpRequest& req) {
 // their own intake gate, not by this token.
 bool HttpServer::is_mutating_endpoint(const HttpRequest& req) noexcept {
     if (req.method != "POST") return false;
-    return req.path == "/api/transfer"              // appends blocks, mutates ledger, gossips
-        || req.path == "/api/vault/action"          // vault capability commit/consume
-        || req.path == "/api/consensus/finalize_gqc"// moves finality checkpoints
-        || req.path == "/api/crypto/pq_sign"        // burns a durable one-time PQ leaf
-        // Zero-trust review P2-3: expensive or state-touching endpoints that
-        // an unauthenticated caller could hammer. They sit behind the same
-        // fail-closed token gate as the ledger mutators.
-        || req.path == "/api/security/chaos_fuzz"        // CPU-bound fuzz rounds
-        || req.path == "/api/swarm/simulate_split_reorg" // spawns a fork simulator
-        || req.path == "/api/vm/htlc_swap"               // settles an HTLC swap
-        || req.path == "/api/vault/ephemeral_sign"       // signing oracle
-        // BACKLOG 0.14 wiring (stage_D): the mempool admission seam mutates
-        // mempool state (submit) and mines+applies a full block (seal) -
-        // both must sit behind the same fail-closed token gate as
-        // /api/transfer. The stage_D admission tests authenticate with a
-        // configured token (see AdmissionChain).
-        || req.path == "/api/mempool/submit"        // reserves mempool capacity
-        || req.path == "/api/mempool/seal";         // mines + applies a block
+    return req.path == "/api/transfer"                  // appends blocks, mutates ledger, gossips
+           || req.path == "/api/vault/action"           // vault capability commit/consume
+           || req.path == "/api/consensus/finalize_gqc" // moves finality checkpoints
+           || req.path == "/api/crypto/pq_sign"         // burns a durable one-time PQ leaf
+           // Zero-trust review P2-3: expensive or state-touching endpoints that
+           // an unauthenticated caller could hammer. They sit behind the same
+           // fail-closed token gate as the ledger mutators.
+           || req.path == "/api/security/chaos_fuzz"        // CPU-bound fuzz rounds
+           || req.path == "/api/swarm/simulate_split_reorg" // spawns a fork simulator
+           || req.path == "/api/vm/htlc_swap"               // settles an HTLC swap
+           || req.path == "/api/vault/ephemeral_sign"       // signing oracle
+           // BACKLOG 0.14 wiring (stage_D): the mempool admission seam mutates
+           // mempool state (submit) and mines+applies a full block (seal) -
+           // both must sit behind the same fail-closed token gate as
+           // /api/transfer. The stage_D admission tests authenticate with a
+           // configured token (see AdmissionChain).
+           || req.path == "/api/mempool/submit" // reserves mempool capacity
+           || req.path == "/api/mempool/seal"   // mines + applies a block
+           // Wallet policy (owner sign-off 2026-11-11): burns the certificate
+           // leaf (an irreversible key-lifecycle event) and registers a
+           // rollover certificate — same fail-closed token gate.
+           || req.path == "/api/wallet/rollover";
 }
 
 // Security-review P1-2/P2-1: endpoints that never mutate persistent state
@@ -3209,9 +3215,43 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
     pq::PqSignTimings t{};
     pq::PqSignatureWitness this_witness{};
     if (!pq::pq_sign_transaction(tx, master_sk, &t, pq_leaf_ledger_.get(), &this_witness)) {
+        // The refusal reasons are deliberately not disambiguated into one
+        // message: this call can fail on leaf exhaustion OR on the window
+        // guard (retired window / window above the certified chain —
+        // wallet policy, security review P3-2). The wallet should read the
+        // rollover advice (SSE) rather than retry.
         return HttpResponse::error(
-            409, "pq leaf exhausted for this key (16 one-time leaves consumed)");
+            409, "pq sign refused: leaf exhausted for this key (16 one-time leaves), "
+                 "or the nonce names a window that is retired/uncertified for this sender "
+                 "(rollover required — see SSE rollover_advised)");
     }
+
+    // Wallet policy (owner sign-off 2026-11-11): SOFT rollover advice at
+    // 12/15 burned transaction leaves — a one-shot SSE push per key root
+    // per process lifetime, never an automatic rollover. The wallet client
+    // decides; POST /api/wallet/rollover executes the certified rotation.
+    if (pq_leaf_ledger_) {
+        const size_t burned = pq_leaf_ledger_->used_count(this_witness.pq_pubkey_root);
+        if (burned >= 12) {
+            bool fire = false;
+            {
+                std::lock_guard<std::mutex> lock(rollover_advice_mutex_);
+                fire = rollover_advised_roots_.insert(this_witness.pq_pubkey_root).second;
+            }
+            if (fire) {
+                std::ostringstream adv;
+                adv << "{\"key_root\":\"" << hex_bytes(this_witness.pq_pubkey_root.data(), 32)
+                    << "\",\"window\":" << this_witness.subtree_index
+                    << ",\"leaves_used\":" << burned
+                    << ",\"tx_leaves_total\":" << (pq::XMSS_LEAVES - 1)
+                    << ",\"advice\":\"rollover_advised\"}";
+                // sse_mutex_ only (never state/seal) - the same lock
+                // discipline as every other SSE push on this server.
+                broadcast_sse_event("rollover_advised", adv.str());
+            }
+        }
+    }
+
     const auto wall0 = std::chrono::steady_clock::now();
     const bool verified = bc::verify_transaction_proof(tx);
     const auto wall1 = std::chrono::steady_clock::now();
@@ -3280,6 +3320,176 @@ HttpResponse HttpServer::handle_crypto_pq_sign(const HttpRequest& req) {
             << ",\"amount_atomics\":" << amount;
     }
     oss << "}";
+    return HttpResponse::json(200, oss.str());
+}
+
+// ── POST /api/wallet/rollover (wallet policy A, owner sign-off 2026-11-11) ───
+// Produces ONE rollover certificate for the key the caller posts:
+//   1. seed_hex (64 hex chars, REQUIRED — a key-lifecycle operation never
+//      falls back to demo material) derives master_sk -> pub_seed -> the
+//      window-0 anchor root;
+//   2. the rotated address is the optional "sender" field (42-byte payload,
+//      ledger-bound accounts) or, absent it, the self-certifying PQA
+//      address derived from the anchor root;
+//   3. the CURRENT certified window is walked from the anchor through the
+//      registry (advance_root_chain — the same walk the verifier runs);
+//   4. the certificate (from -> from+1) is signed by leaf 15 of the FROM
+//      window, which pq_sign_rollover burns in the durable leaf ledger
+//      BEFORE signing (fail-closed: a burned certificate leaf can never
+//      sign again, so the same call twice is refused, not duplicated);
+//   5. the certificate is registered in the witness registry (full crypto
+//      verification, deduped) and the CERT_INV relay cue is broadcast so
+//      peers backfill it via GET_CERTS — the cert reaches the network
+//      BEFORE the first window-1 spend, per the owner policy.
+// Soft policy: nothing rotates automatically anywhere in the node — the
+// SSE stream advises at 12/15 burned leaves, the owner decides to call.
+HttpResponse HttpServer::handle_wallet_rollover(const HttpRequest &req) {
+    namespace pq = vx::crypto::pq;
+    namespace bc = vx::blockchain;
+
+    // Strict parse: every char must be a hex digit — a key-lifecycle
+    // operation must not silently sign with a half-parsed key.
+    std::array<uint8_t, 32> master_sk{};
+    std::string seed_hex;
+    std::string pat = "\"seed_hex\"";
+    size_t p = req.body.find(pat);
+    if (p != std::string::npos) {
+        p += pat.size();
+        while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t'))
+            ++p;
+        if (p < req.body.size() && req.body[p] == ':') {
+            ++p;
+            while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t'))
+                ++p;
+            if (p < req.body.size() && req.body[p] == '"') {
+                ++p;
+                const auto end = req.body.find('"', p);
+                if (end != std::string::npos)
+                    seed_hex = req.body.substr(p, end - p);
+            }
+        }
+    }
+    if (seed_hex.size() >= 2 && seed_hex[0] == '0' && seed_hex[1] == 'x')
+        seed_hex = seed_hex.substr(2);
+    if (seed_hex.size() != 64) {
+        return HttpResponse::error(
+            400, "seed_hex (exactly 64 hex chars) is required for a key-lifecycle operation");
+    }
+    for (char c : seed_hex) {
+        // isxdigit, not strchr: strchr(haystack, '\0') matches the
+        // terminator, so an embedded NUL byte would slip a non-hex seed
+        // through a strchr-based whitelist.
+        if (!std::isxdigit(static_cast<unsigned char>(c)))
+            return HttpResponse::error(400, "seed_hex contains a non-hex character");
+    }
+    for (int i = 0; i < 32; ++i) {
+        master_sk[i] =
+            static_cast<uint8_t>(std::strtoul(seed_hex.substr(i * 2, 2).c_str(), nullptr, 16));
+    }
+
+    const std::array<uint8_t, 32> pub_seed = pq::pub_seed_from_sk(master_sk);
+    const std::array<uint8_t, 32> anchor = pq::xmss_root_tree(master_sk, pub_seed, 0);
+
+    // The rotated address: explicit "sender" (42-byte payload, with or
+    // without the NFA_V6_ display prefix) or the self-certifying PQA
+    // address derived from the anchor root.
+    std::array<uint8_t, 42> sender{};
+    {
+        std::string pat = "\"sender\"";
+        size_t p = req.body.find(pat);
+        std::string field;
+        if (p != std::string::npos) {
+            p += pat.size();
+            while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t'))
+                ++p;
+            if (p < req.body.size() && req.body[p] == ':') {
+                ++p;
+                while (p < req.body.size() && (req.body[p] == ' ' || req.body[p] == '\t'))
+                    ++p;
+                if (p < req.body.size() && req.body[p] == '"') {
+                    ++p;
+                    const auto end = req.body.find('"', p);
+                    if (end != std::string::npos)
+                        field = req.body.substr(p, end - p);
+                }
+            }
+        }
+        if (field.empty()) {
+            bc::derive_pq_address(anchor.data(), sender.data());
+        } else {
+            const std::string prefix = "NFA_V6_";
+            if (field.size() >= prefix.size() && field.compare(0, prefix.size(), prefix) == 0)
+                field = field.substr(prefix.size());
+            // Strict: no tail-slicing an oversized field — a key-lifecycle
+            // address must be exactly a 42-byte payload (security review
+            // P3-4).
+            if (field.size() != 42)
+                return HttpResponse::error(400, "sender must be a 42-byte address payload");
+            std::memcpy(sender.data(), field.data(), 42);
+        }
+    }
+
+    // The current certified window for this sender: the same deterministic
+    // walk the ledger verifier and the block producer run. No certificate
+    // registered => window 0.
+    std::array<uint8_t, 32> cur_root = anchor;
+    uint32_t cur_window = 0;
+    pq::PqWitnessRegistry::instance().advance_root_chain(sender.data(), anchor, cur_root,
+                                                         cur_window);
+    if (cur_window >= pq::PQ_MAX_SUBTREE_INDEX)
+        return HttpResponse::error(409, "leaf namespace exhausted (PQ_MAX_SUBTREE_INDEX)");
+    const uint32_t to_window = cur_window + 1;
+    const std::array<uint8_t, 32> new_root = pq::xmss_root_tree(master_sk, pub_seed, to_window);
+
+    // Report the OLD window's burn state BEFORE the certificate signs:
+    // pq_sign_rollover is about to burn leaf 15 under the old root, and a
+    // count taken afterwards would fold the certificate leaf into the
+    // transaction-leaf figure (security review P3-3).
+    const size_t old_window_leaves = pq_leaf_ledger_ ? pq_leaf_ledger_->used_count(cur_root) : 0;
+
+    // Sign + burn. pq_sign_rollover reserves leaf 15 under the OLD root and
+    // fsyncs BEFORE producing the signature; a reserve failure returns a
+    // witness that cannot verify — refused here, nothing registered.
+    pq::PqRolloverCert cert{};
+    std::memcpy(cert.sender.data(), sender.data(), 42);
+    cert.from_window = cur_window;
+    cert.to_window = to_window;
+    cert.old_root = cur_root;
+    cert.new_root = new_root;
+    cert.witness = pq::pq_sign_rollover(master_sk, cur_window, to_window, pq_leaf_ledger_.get());
+    if (!pq::pq_verify_rollover(cur_root, cur_window, to_window, new_root, cert.witness)) {
+        return HttpResponse::error(409, "rollover refused: the certificate leaf is already burned "
+                                        "or the durable leaf log is untrusted");
+    }
+
+    bool fresh = false;
+    if (!pq::PqWitnessRegistry::instance().register_rollover_cert(cert, &fresh))
+        return HttpResponse::error(409, "rollover certificate refused by the witness registry");
+
+    bool relayed = false;
+    if (swarm_node_) {
+        // FULL-cert broadcast (wire ROLLOVER_CERT): every direct peer
+        // verifies and stores the record on arrival — the certificate is
+        // on the network before any window-1 spend, with no pull window.
+        // Peers that still miss it are covered by the CERT_INV /
+        // GET_CERTS backfill their fresh-store relay cue fans out.
+        swarm_node_->broadcast_rollover_cert(cert);
+        relayed = true;
+    }
+
+    std::ostringstream oss;
+    oss << "{\"ok\":true,"
+        << "\"from_window\":" << cur_window << ","
+        << "\"to_window\":" << to_window << ","
+        << "\"old_root\":\"" << hex_bytes(cur_root.data(), 32) << "\","
+        << "\"new_root\":\"" << hex_bytes(new_root.data(), 32) << "\","
+        << "\"cert_id\":\"" << hex_bytes(pq::rollover_cert_id(cert).data(), 32) << "\","
+        << "\"fresh\":" << (fresh ? "true" : "false") << ","
+        << "\"relayed\":" << (relayed ? "true" : "false") << ","
+        << "\"old_window_leaves_used\":" << old_window_leaves << ","
+        << "\"tx_leaves_total\":" << (pq::XMSS_LEAVES - 1) << ","
+        << "\"note\":\"from this window on, sign transactions with nonce = (window << 4) | leaf\""
+        << "}";
     return HttpResponse::json(200, oss.str());
 }
 

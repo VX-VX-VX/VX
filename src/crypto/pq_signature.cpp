@@ -594,16 +594,29 @@ bool pq_sign_transaction(Transaction &tx, const std::array<uint8_t, 32> &master_
     const uint32_t leaf_idx = nonce & 0xF;
     const uint32_t subtree_index = nonce >> XMSS_H;
 
-    // Window guard: the crypto layer now supports coherent rollover trees
-    // (v0.0.13, BACKLOG 1.5) — but the consensus-layer acceptance policy for
-    // a rotated root (certification-chain verification against the
-    // account's published window-0 root) is NOT wired into any rule yet.
-    // Until it is, a transaction whose nonce names a window above 0 would
-    // emit a witness under a root no consensus rule can attribute to this
-    // account — still fail-closed. Refuse before reserving anything
-    // (external review finding; see VERIFICATION_EVIDENCE changelog).
-    if (subtree_index != 0)
+    // Window guard — wallet policy (owner sign-off 2026-11-11): a signature
+    // is produced ONLY inside the window the sender's certified rollover
+    // chain currently walks to, the exact selection the ledger verifier
+    // (LedgerState apply) and the block producer (consensus_witness_root)
+    // enforce on the other side. No certificate registered => the chain
+    // walks nowhere and window 0 (the frozen pre-rollover behavior) is the
+    // only allowed window; after a certified rotation the OLD window is
+    // RETIRED — its one-time leaves are fully spent, so signing there would
+    // reuse key material (the Winternitz barrier is per-leaf). Fail-closed
+    // before anything is reserved. (The guard previously refused EVERY
+    // window above 0 — written before the acceptance policy was wired into
+    // the verifier, BACKLOG 1.5 / wallet policy A.)
+    std::array<uint8_t, 32> walked_root{};
+    uint32_t walked_window = 0;
+    PqWitnessRegistry::instance().advance_root_chain(tx.sender_nfa, root, walked_root,
+                                                     walked_window);
+    if (subtree_index != walked_window)
         return false;
+    // The one-time-leaf reservation is keyed by the SIGNING window's root —
+    // the same root the witness publishes and the verifier pins — so every
+    // window carries its own 16-leaf history. For window 0 xmss_root_tree
+    // is byte-identical with the frozen xmss_root (asserted in
+    // test_pq_rollover), so existing durable leaf logs stay valid.
 
     // 4a. One-time-leaf lifecycle: reserve before any signing work. `root`
     //     (computed above) is this key's XMSS root — the ledger is keyed by
@@ -618,8 +631,10 @@ bool pq_sign_transaction(Transaction &tx, const std::array<uint8_t, 32> &master_
     uint32_t use_leaf = leaf_idx;
     if (leaf_idx == PqLeafLedger::kReservedCertLeaf)
         return false;
+    const std::array<uint8_t, 32> sign_root =
+        subtree_index == 0 ? root : xmss_root_tree(sk, pub_seed, subtree_index);
     if (leaf_ledger) {
-        const int assigned = leaf_ledger->reserve_for_tx(root, leaf_idx);
+        const int assigned = leaf_ledger->reserve_for_tx(sign_root, leaf_idx);
         if (assigned < 0)
             return false; // exhausted or log untrusted
         use_leaf = static_cast<uint32_t>(assigned);

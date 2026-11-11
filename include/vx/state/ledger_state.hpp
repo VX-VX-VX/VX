@@ -215,6 +215,25 @@ public:
                             tx, bound, &w);
                     bool accepted = direct;
                     if (direct) {
+                        // Retirement (wallet policy, owner sign-off
+                        // 2026-11-11): a certified chain that walks PAST the
+                        // bound root retires it — the old window's one-time
+                        // leaves are fully spent, so a window-0 witness
+                        // stops being accepted the moment a rotation is
+                        // certified. Nodes that do not hold the certificate
+                        // yet pull it via GET_CERTS before validating the
+                        // dependent block (P0 GATE backfill), so the rule
+                        // converges instead of forking.
+                        std::array<uint8_t, 32> retired_root{};
+                        uint32_t retired_window = 0;
+                        if (vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(
+                                sender.data(), bound, retired_root, retired_window) &&
+                            retired_window > 0) {
+                            res.error = "tx " + std::to_string(i) +
+                                        ": PQ witness window is retired by a certified"
+                                        " rollover chain";
+                            return res;
+                        }
                         canonical_root = bound;
                     } else {
                         std::array<uint8_t, 32> walked{};

@@ -315,8 +315,21 @@ bool consensus_witness_root(const Transaction &tx, BoundRootOf bound_root_of,
     //    (BACKLOG 1.5), exactly the selection the ledger's verifier runs;
     //    the producer must not bind a root its own node would refuse.
     if (oracle && oracle(sender, out_root)) {
-        if (vx::crypto::pq::PqWitnessRegistry::instance().lookup_verifying_with_root(tx, out_root))
+        if (vx::crypto::pq::PqWitnessRegistry::instance().lookup_verifying_with_root(tx,
+                                                                                     out_root)) {
+            // Retirement (wallet policy, owner sign-off 2026-11-11): a
+            // window-0 witness is canonical only while NO certified
+            // rotation retires the bound root — the producer must not bind
+            // a root its own ledger verifier refuses (LedgerState apply
+            // runs the same check).
+            std::array<uint8_t, 32> retired_root{};
+            uint32_t retired_window = 0;
+            if (vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(
+                    sender.data(), out_root, retired_root, retired_window) &&
+                retired_window > 0)
+                return false;
             return true;
+        }
         std::array<uint8_t, 32> walked{};
         uint32_t walked_window = 0;
         if (vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(
@@ -332,6 +345,16 @@ bool consensus_witness_root(const Transaction &tx, BoundRootOf bound_root_of,
     //    computes identically at boot (genesis receiver, demo economy).
     for (const auto &b : pq_seed_bindings()) {
         if (b.addr == sender) {
+            // Same retirement rule as the ledger-bound case above (security
+            // review P3-1): unreachable on live nodes (the ledger preloads
+            // seed bindings into its bound-root table, so seed-table
+            // senders hit case 1), kept symmetric for non-ledger oracles.
+            std::array<uint8_t, 32> retired_root{};
+            uint32_t retired_window = 0;
+            if (vx::crypto::pq::PqWitnessRegistry::instance().advance_root_chain(
+                    sender.data(), b.root, retired_root, retired_window) &&
+                retired_window > 0)
+                return false;
             out_root = b.root;
             return vx::crypto::pq::PqWitnessRegistry::instance().lookup_verifying_with_root(
                 tx, out_root);

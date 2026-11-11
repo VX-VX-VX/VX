@@ -960,15 +960,16 @@ Remaining (honest gaps, not hidden):
 - [ ] P3: live-peer sidecar-scan fallback - serve cert ids older than the
   1024-entry inventory window from the durable VXPQRT1 sidecar on demand
   (bounded scan), so deep-history backfill does not depend on restarts.
-- [ ] Wallet policy: when to roll over (window exhaustion), certificate
-  publication/relay (`broadcast_rollover_cert` exists at the wire
-  layer; the RPC/wallet trigger does not), and the post-rollover leaf
-  accounting - `pq_sign_transaction` still refuses windows above 0
-  because the durable leaf log records one byte per key root (leaf
-  index only), which cannot address window-1 leaves of the same key.
-  Widening that record format is a store-format change and goes
-  through the migration protocol; until then a rolled-over account
-  spends via explicit window/leaf signing (the e2e test path).
+- [x] Wallet policy — CLOSED (2026-11-11, see 1.5 wallet policy): SSE
+  "rollover_advised" at 12/15 burned leaves + auth-gated
+  POST /api/wallet/rollover (sign -> burn cert leaf -> register ->
+  full-cert broadcast); `broadcast_rollover_cert` now has its RPC/wallet
+  trigger. The post-rollover leaf accounting needed NO format change:
+  reservations are keyed by the signing window's root (distinct per
+  window), so `pq_sign_transaction` signs the walked window
+  (nonce = (window << 4) | leaf) against the same 33-byte durable log.
+  The leaf-log widening entry below is obsoleted by this keying and is
+  NOT shipped.
 - [ ] P3 (review 2026-11-07), format-bump candidates - NOT exploitable
   today (the walk's anchor linkage and `derive_pq_address`
   determinism make a transferred certificate inert; store pollution
@@ -1896,10 +1897,57 @@ amends the list as needed.
   per-peer GET_CERTS rate limit beyond payload bounds; live-peer deep
   history (>1024 certs) needs the sidecar-scan fallback (P3, tracked
   above).
-- [ ] **1.5 wallet policy**: rollover trigger on window exhaustion,
-  publication/relay trigger from RPC/wallet, and the leaf-log record
-  widening for window-1 leaves (a store-format change through the
-  migration protocol).
+- [x] **1.5 wallet policy** — CLOSED (2026-11-11, owner sign-off "fastest
+  to ship AND most secure"): (A) soft trigger — one-shot SSE
+  "rollover_advised" push at >= 12/15 burned transaction leaves per key
+  root, NO automatic rollover anywhere in the node; the owner-triggered
+  POST /api/wallet/rollover (auth-gated mutating endpoint) walks the
+  certified chain for the account, signs the (from -> from+1)
+  certificate with leaf 15 burned fail-closed in the durable leaf ledger
+  BEFORE signing, registers it and broadcasts the FULL record
+  (ROLLOVER_CERT) so the cert is on the network before the first
+  window-1 spend. (B) verifier chain walk — was already wired (LedgerState
+  apply + consensus_witness_root); now pinned by tests 15/16 in
+  test_pq_rollover_wiring. Sign-side window policy: pq_sign_transaction
+  signs ONLY the walked window (nonce = (window << 4) | leaf); a
+  certified rotation RETIRES the old window on all three sides (signer,
+  ledger verifier, block producer). (C) leaf-log widening — OBSOLETED,
+  not shipped: the premise ("the 33-byte record cannot address window-1
+  leaves") described anchor-root keying; reservations are keyed by the
+  SIGNING window's root, and distinct windows have distinct roots, so
+  the headerless 33-byte format already addresses every leaf of every
+  window — dropping a store-format migration removes its risk instead of
+  adding it. Residual: PQA (self-certifying) addresses commit the
+  window-0 root, so a rolled window still needs re-anchoring on a fresh
+  address (unchanged, by construction). Retirement convergence is NOT
+  self-healing (security review P2-1, 2026-11-11): a window-0 tx signed
+  BEFORE the rollover and submitted AFTER the cert exists is refused by
+  cert-holding nodes while a cert-less node can seal and apply it at the
+  same height — cert-holders then see MISSING_WITNESS forever for that
+  frame (a retirement refusal is not parkable witness-lag) and GET_CERTS
+  backfill spreads the refusal, it does not heal the already-applied
+  block. Not attacker-triggerable (producing the witness needs the
+  owner's key, and the owner's own signer refuses retired windows) —
+  eclipse-assisted operator error at worst. Follow-up: classify
+  retirement-refused frames as attributable refusals rather than parkable
+  witness-lag, and track cert coverage in fork choice when reorg/
+  fork-choice work lands.
+- [ ] P3 (security review 2026-11-11): certificate-slot griefing —
+  register_rollover_cert caps 32 certs per sender; junk certificates
+  under a victim's sender (attacker's own lineage — inert for consensus)
+  durably fill those slots so the VICTIM's own rollover registration
+  refuses with 409 forever. Reachable already via the ROLLOVER_CERT wire
+  path (no auth); the wallet RPC adds a convenient trigger, not a new
+  capability. Fix candidates: prune stored certs whose old_root does not
+  chain from the sender's known anchor, or key the per-sender cap by
+  (sender, old_root).
+- [ ] P3: RingPipelineThroughputNoAllocs floor is TSan-lane flaky — the
+  500k ops/s throughput assertion lands ~9% short under ThreadSanitizer
+  instrumentation on the dev machine (452-458k observed; reproduced on
+  clean HEAD, pre-existing — NOT a regression of the wallet-policy
+  diff). Assert and SAN lanes pass the same test. Options: a TSan-
+  aware floor (env-multiplied) or a pipeline warm-up, pinned to the
+  next test-infra pass.
 - [x] **2.11 third checkbox: retention window + withhold ban/score** —
   CLOSED (2026-11-07): every newly promoted peer gets the witnesses of
   the last 16 stored blocks re-served (serve_witness_retention ->

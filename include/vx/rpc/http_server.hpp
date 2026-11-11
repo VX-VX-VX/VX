@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <functional>
@@ -315,6 +316,12 @@ private:
   // ── Post-Quantum WOTS+/XMSS ───────────────────────
     HttpResponse handle_crypto_pq_sign(const HttpRequest& req);
     HttpResponse handle_crypto_pq_verify(const HttpRequest& req);
+    // Wallet policy (owner sign-off 2026-11-11): one owner-triggered
+    // rollover certificate per call — signs the binding with leaf 15 of the
+    // FROM window (burned fail-closed BEFORE signing), registers the cert
+    // and pushes the CERT_INV relay cue. Soft policy: nothing rotates
+    // automatically anywhere in the node.
+    HttpResponse handle_wallet_rollover(const HttpRequest &req);
 
     // JSON helpers (zero-dependency)
     static std::string json_escape(std::string_view s);
@@ -392,6 +399,15 @@ private:
  // a leaf that signed once is never handed out again, across restarts and
  // concurrent signer processes.
     std::unique_ptr<vx::crypto::pq::PqLeafLedger> pq_leaf_ledger_;
+
+    // Wallet policy (owner sign-off 2026-11-11): key roots that already got
+    // their one-shot "rollover_advised" SSE push (soft advice at 12/15 burned
+    // transaction leaves — never an automatic rollover). Per-process state:
+    // a restart re-arms the advice, which is honest (the wallet may have
+    // missed the event).
+    std::mutex rollover_advice_mutex_;
+    std::unordered_set<std::array<uint8_t, 32>, vx::crypto::pq::PqArrayHash>
+        rollover_advised_roots_;
 };
 
 } // namespace vx::rpc

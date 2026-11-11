@@ -133,9 +133,12 @@ void pq_leaf_cache_invalidate() noexcept;
 // certificate burns leaf 15 of the old window exactly like a transaction
 // leaf (reserve it in the PqLeafLedger under the old root). After a
 // rollover out of window t, that window is fully spent and MUST NOT sign
-// again — enforcing that policy at the wallet/consensus layer is the
-// remaining BACKLOG 1.5 item (together with the acceptance policy for a
-// rotated root, which today is NOT wired into any consensus rule).
+// again — that retirement policy IS wired on all three sides (wallet
+// policy, owner sign-off 2026-11-11): pq_sign_transaction signs only the
+// window the sender's certified chain walks to, and both the ledger
+// verifier (LedgerState apply) and the block producer
+// (consensus_witness_root) refuse a retired window-0 witness the moment a
+// rotation is certified.
 //
 // Leaf-namespace capacity: the top XMSS_H bits of global_leaf are the leaf
 // itself, so the valid tree_index domain is 0..PQ_MAX_SUBTREE_INDEX.

@@ -22,8 +22,9 @@
 //      certificate leaf is refused at USE time (pq_verify_transaction),
 //      so the wire registration path cannot smuggle it in either.
 //  10. WireTypeBoundary        — ROLLOVER_CERT (0x0A), CERT_INV (0x0B) and
-//      GET_CERTS (0x0C) all pass the wire plausibility gate; the first
-//      undefined type (0x0D) still fails closed.
+//      GET_CERTS (0x0C) all pass the wire plausibility gate; ADDRS (0x0D,
+//      peer discovery) does too, and the first undefined type (0x0E) still
+//      fails closed.
 //  11. CertIdDeterminism       — rollover_cert_id is a pure function of
 //      the transition tuple (sender, windows, roots): same tuple, same id;
 //      different tuple, different id.
@@ -38,6 +39,16 @@
 //      over the 2490 wire bytes, never sizeof-memcmp: two unspecified
 //      struct padding bytes must not flip a replayed certificate into a
 //      "fresh" re-store + re-broadcast (compiler-dependent otherwise).
+//  15. SignSideWindowPolicy    — wallet policy (owner sign-off 2026-11-11):
+//      pq_sign_transaction signs ONLY the window the certified chain walks
+//      to — a window above it is refused before any certificate exists,
+//      the OLD window is retired once the chain exists, the walked window
+//      signs and pins its own root, and its leaf reservation is keyed by
+//      the SIGNING window's root.
+//  16. ProducerWalksCertifiedChain — consensus_witness_root (the
+//      producer-side twin of the ledger verifier) accepts a window-1
+//      spend through the walked chain, refuses it without a certificate,
+//      and retires the window-0 signature once the chain exists.
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/net/swarm_node.hpp"
@@ -336,7 +347,7 @@ int main() {
     }
 
     // ── 9. Wire-type boundary: ROLLOVER_CERT/CERT_INV/GET_CERTS plausible,
-    //        the first undefined type (0x0D) still fails closed ─────────────
+    //        the first undefined type still fails closed ─────────────────────
     {
         vx::net::WireHeader h{};
         h.magic = vx::net::VX60_MAGIC;
@@ -348,9 +359,13 @@ int main() {
         assert(vx::net::wire_header_plausible(h));
         h.msg_type = static_cast<uint8_t>(vx::net::WireMsgType::GET_CERTS);
         assert(vx::net::wire_header_plausible(h));
-        h.msg_type = 0x0D; // first undefined type: still fails closed
+        // 0x0D became ADDRS (peer discovery, PEX commit); the fail-closed
+        // boundary is preserved one notch further out: 0x0E.
+        h.msg_type = static_cast<uint8_t>(vx::net::WireMsgType::ADDRS);
+        assert(vx::net::wire_header_plausible(h));
+        h.msg_type = 0x0E; // first undefined type: still fails closed
         assert(!vx::net::wire_header_plausible(h));
-        std::cout << "  [9] wire-type boundary 0x0A..0x0C accepted, 0x0D refused OK\n";
+        std::cout << "  [9] wire-type boundary 0x0A..0x0D accepted, 0x0E refused OK\n";
     }
 
     // ── 10. Cert id: deterministic over the tuple, distinct across tuples ──
@@ -498,6 +513,99 @@ int main() {
         const auto id = rollover_cert_id(c);
         assert(PqWitnessRegistry::instance().have_cert_id(id));
         std::cout << "  [13] dedup is padding-blind (content equality) OK\n";
+    }
+
+    // ── 15. Sign-side window policy: certified chain or nothing ────────────
+    // Wallet policy (owner sign-off 2026-11-11): pq_sign_transaction signs
+    // ONLY the window the sender's certified rollover chain walks to. The
+    // guard previously refused every window above 0 unconditionally — it
+    // now mirrors the wired verifier (retirement included).
+    {
+        const auto master = pseudo_bytes("VX_WALLET_POLICY_SIGN_V1", 7);
+        const auto pub_seed = pub_seed_from_sk(master);
+        std::array<uint8_t, 42> sender{};
+        vx::blockchain::derive_pq_address(xmss_root_tree(master, pub_seed, 0).data(),
+                                          sender.data());
+
+        vx::blockchain::Transaction tx{};
+        std::memcpy(tx.sender_nfa, sender.data(), 42);
+        std::memcpy(tx.receiver_nfa, sender.data(), 42);
+        vx::blockchain::tx_set_amount(tx, 1000);
+        vx::blockchain::tx_set_fee(tx, 1);
+
+        PqLeafLedger ledger(""); // memory-only history
+
+        // No certificate: a window-1 spend (nonce = (1<<4)|0) is refused.
+        vx::blockchain::tx_set_nonce(tx, 16);
+        assert(!pq_sign_transaction(tx, master, nullptr, &ledger));
+
+        // Window-0 signing still works (the frozen pre-rollover behavior).
+        vx::blockchain::tx_set_nonce(tx, 1);
+        assert(pq_sign_transaction(tx, master, nullptr, &ledger));
+
+        // Certified rotation 0 -> 1: window 0 is RETIRED...
+        assert(register_chain_hop(master, pub_seed, sender, 0));
+        vx::blockchain::tx_set_nonce(tx, 2);
+        assert(!pq_sign_transaction(tx, master, nullptr, &ledger));
+
+        // ...and the walked window signs, pinning its own root, with the
+        // leaf reservation keyed under the SIGNING window's root.
+        vx::blockchain::tx_set_nonce(tx, 16);
+        PqSignatureWitness w{};
+        assert(pq_sign_transaction(tx, master, nullptr, &ledger, &w));
+        assert(w.subtree_index == 1);
+        assert(roots_equal(w.pq_pubkey_root, xmss_root_tree(master, pub_seed, 1)));
+        assert(ledger.used_count(xmss_root_tree(master, pub_seed, 1)) == 1);
+        assert(vx::crypto::pq::pq_verify_transaction(tx, w));
+        std::cout << "  [15] sign-side window policy (cert or nothing, retirement) OK\n";
+    }
+
+    // ── 16. Producer-side acceptance: the chain authorizes window 1 and
+    //        retires window 0 ───────────────────────────────────────────────
+    // consensus_witness_root is the producer-side twin of the ledger
+    // verifier (block.cpp): the producer must not bind a root its own
+    // verifier refuses.
+    {
+        const auto master = pseudo_bytes("VX_WALLET_POLICY_PROD_V1", 9);
+        const auto pub_seed = pub_seed_from_sk(master);
+        std::array<uint8_t, 42> sender{};
+        vx::blockchain::derive_pq_address(xmss_root_tree(master, pub_seed, 0).data(),
+                                          sender.data());
+
+        const vx::blockchain::BoundRootOf bound = [&](const std::array<uint8_t, 42> &addr,
+                                                      std::array<uint8_t, 32> &out) {
+            if (addr != sender)
+                return false;
+            out = xmss_root_tree(master, pub_seed, 0);
+            return true;
+        };
+
+        vx::blockchain::Transaction tx{};
+        std::memcpy(tx.sender_nfa, sender.data(), 42);
+        std::memcpy(tx.receiver_nfa, sender.data(), 42);
+        vx::blockchain::tx_set_amount(tx, 1000);
+        vx::blockchain::tx_set_fee(tx, 1);
+
+        // No certificate: a window-0 signature is canonical.
+        vx::blockchain::tx_set_nonce(tx, 3);
+        PqSignatureWitness w0{};
+        assert(pq_sign_transaction(tx, master, nullptr, nullptr, &w0));
+        std::array<uint8_t, 32> out_root{};
+        assert(vx::blockchain::consensus_witness_root(tx, bound, out_root));
+        assert(roots_equal(out_root, xmss_root_tree(master, pub_seed, 0)));
+
+        // Certified rotation: the window-0 signature is retired on the
+        // producer side too...
+        assert(register_chain_hop(master, pub_seed, sender, 0));
+        assert(!vx::blockchain::consensus_witness_root(tx, bound, out_root));
+
+        // ...and the window-1 signature becomes the canonical binding.
+        vx::blockchain::tx_set_nonce(tx, 16);
+        PqSignatureWitness w1{};
+        assert(pq_sign_transaction(tx, master, nullptr, nullptr, &w1));
+        assert(vx::blockchain::consensus_witness_root(tx, bound, out_root));
+        assert(roots_equal(out_root, xmss_root_tree(master, pub_seed, 1)));
+        std::cout << "  [16] producer walks the certified chain (retirement incl.) OK\n";
     }
 
     std::cout << "test_pq_rollover_wiring: ALL SECTIONS PASSED\n";
