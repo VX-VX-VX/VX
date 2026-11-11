@@ -566,29 +566,35 @@ Section 9.4), keyed by the transaction's canonical digest.
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 472 | header (below) |
-| 472 | 580 × 112 = 64 960 | transaction slots (index 0 = coinbase) |
-| 65432 | 32 | padding to the tail |
+| 0 | 504 | header (below) |
+| 504 | 579 × 112 = 64 848 | transaction slots (index 0 = coinbase) |
+| 65352 | 80 | body padding |
 | 65464 | 32 | `gqc_signature_agg` — finality stamp (Section 10.3) |
 
-Header (472 bytes, packed, no alignment holes):
+Header (504 bytes, packed, no alignment holes):
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 4 | magic `"VXC6"` |
+| 0 | 4 | magic `"VXC7"` |
 | 4 | 8 | `block_height` (u64 LE) |
 | 12 | 32 | `prev_block_hash` |
 | 44 | 32 | `merkle_root` over the sealed transactions |
 | 76 | 8 | `timestamp` (u64 LE, unix seconds) |
 | 84 | 384 | `attractor_coords` = X ‖ Y ‖ Z of the block's attractor run (128 B LE each) |
 | 468 | 4 | `tx_count` (u32 LE) |
+| 472 | 32 | `witness_merkle_root` — the proposer's commitment to the block's canonical out-of-band PQ witness set (VXC7, 2026-11-07; VXC6 frames are refused at intake by name) |
 
 ### 8.3 Hashing
 
 ```
-block hash (tip hash) = Sponge256(header[0..472))
+block hash (tip hash) = Sponge256(header[0..504) ‖ tail[65432..65536))
 ```
 
+The tip hash is a **full-frame consensus commitment**: the header —
+including `witness_merkle_root` — AND the 104-byte tail, which carries
+`vm_state_root`, `vm_gas_used`, `pogw_nonce` and `vm_bytecode`, all
+consensus-critical and none covered by the header alone (external review
+round 5: a mutated `pogw_nonce` used to leave the block hash unchanged).
 The proof-of-work covers the **entire** 65 536-byte frame (Section 10.1),
 so header, transactions and the nonce field are all inside the hashed
 surface.

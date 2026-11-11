@@ -328,6 +328,14 @@ int main(int argc, char* argv[]) {
     std::cout << "Core execution completed successfully.\n";
 
     if (serve_mode) {
+        // Security review 2026-11-08 (P1): the tree never disposed SIGPIPE
+        // (only SIGINT was handled), so any send/write on a peer-reset
+        // socket outside the MSG_NOSIGNAL sites - the sendfile block relay,
+        // any future flag-less send - had the default action: the whole
+        // node process dies, remotely triggerable. Ignore the signal
+        // process-wide; every write path already treats EPIPE as an error
+        // return, which is the correct per-connection behavior.
+        ::std::signal(SIGPIPE, SIG_IGN);
         std::cout << "[NODE] Starting POSIX HTTP/JSON RPC server on port " << port << "...\n";
         std::cout << "[NODE] VX60 P2P wire port: " << p2p_port
                   << " | data-dir: " << data_dir

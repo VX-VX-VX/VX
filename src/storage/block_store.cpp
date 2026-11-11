@@ -3,6 +3,7 @@
 #include "vx/net/swarm_node.hpp" // compute_wire_crc32c (GQC record integrity)
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -261,6 +262,21 @@ BlockStore::BlockStore(const std::string &path, const std::string &genesis_path,
         throw std::runtime_error("BlockStore: cannot open '" + path + "': " + std::strerror(errno));
     }
 
+    // BACKLOG 2.6 residual (closed 2026-11-08): two instances on one ledger
+    // race the WAL INTENT window - each instance's recovery would
+    // heal/truncate the OTHER's in-flight append, and both would append at
+    // the same height. The kernel lock makes the second instance fail
+    // closed at startup (same discipline as the VXPQRT1 cert sidecar's
+    // flock). Released by close() on every path - the lock lives exactly as
+    // long as the descriptor.
+    if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+        const int lerrno = errno;
+        ::close(fd_);
+        fd_ = -1;
+        throw std::runtime_error("BlockStore: '" + path +
+                                 "' is held by another instance (flock): " + std::strerror(lerrno));
+    }
+
     // WAL marker sidecar (crash-consistent append): opened before recovery so
     // the heal path can clear the resolved record. The directory is fsynced
     // once here so a freshly created sidecar's directory entry is durable -
@@ -272,8 +288,6 @@ BlockStore::BlockStore(const std::string &path, const std::string &genesis_path,
         const int werrno = errno;
         ::close(fd_);
         fd_ = -1;
-        ::close(wal_fd_);
-        wal_fd_ = -1;
         throw std::runtime_error("BlockStore: cannot open '" + path +
                                  ".walmark': " + std::strerror(werrno));
     }
@@ -315,12 +329,27 @@ BlockStore::BlockStore(const std::string &path, const std::string &genesis_path,
             try {
                 blockchain::write_genesis_file(genesis_path);
             } catch (const std::exception &e) {
+                ::close(wal_fd_);
+                wal_fd_ = -1;
                 ::close(fd_);
                 fd_ = -1;
                 throw std::runtime_error(std::string("BlockStore: cannot regenerate '") +
                                          genesis_path + "': " + e.what());
+            } catch (...) {
+                // Security review 2026-11-08 (P3): a non-std exception must
+                // not escape with both descriptors still open - every other
+                // ctor path closes them (the WAL recovery path already
+                // guards with catch (...)).
+                ::close(wal_fd_);
+                wal_fd_ = -1;
+                ::close(fd_);
+                fd_ = -1;
+                throw std::runtime_error("BlockStore: cannot regenerate '" + genesis_path +
+                                         "' (non-standard exception)");
             }
             if (!load_frame(genesis_path, genesis)) {
+                ::close(wal_fd_);
+                wal_fd_ = -1;
                 ::close(fd_);
                 fd_ = -1;
                 throw std::runtime_error("BlockStore: regenerated '" + genesis_path +
@@ -329,12 +358,16 @@ BlockStore::BlockStore(const std::string &path, const std::string &genesis_path,
         }
         BlockView gv{std::span<const uint8_t, BLOCK_SIZE_BYTES>(genesis)};
         if (!gv.valid_magic() || gv.header().block_height != 0) {
+            ::close(wal_fd_);
+            wal_fd_ = -1;
             ::close(fd_);
             fd_ = -1;
             throw std::runtime_error("BlockStore: genesis.bin is not a valid height-0 VXC7 frame");
         }
         ssize_t wrote = ::pwrite(fd_, genesis.data(), BLOCK_SIZE_BYTES, 0);
         if (wrote != static_cast<ssize_t>(BLOCK_SIZE_BYTES)) {
+            ::close(wal_fd_);
+            wal_fd_ = -1;
             ::close(fd_);
             fd_ = -1;
             throw std::runtime_error("BlockStore: failed to seed genesis: " +
@@ -365,6 +398,14 @@ BlockStore::BlockStore(const std::string &path, const std::string &genesis_path,
     }
 
     if (!validate_region(static_cast<const uint8_t *>(mapped_), 0, count_)) {
+        // The mmap keeps the open file description (and with it the flock)
+        // alive even after close() - a throw without munmap would leave a
+        // phantom lock the whole process cannot reopen through (caught by
+        // VxCrashTortureTest.Level1StoreTailTruncation zero-frame trials,
+        // which open -> refuse -> truncate -> reopen in one process).
+        ::munmap(mapped_, mapped_bytes_);
+        mapped_ = nullptr;
+        mapped_bytes_ = 0;
         ::close(fd_);
         fd_ = -1;
         ::close(wal_fd_);

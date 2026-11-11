@@ -379,3 +379,80 @@ TEST(VortexWalMarkerTest, RollbackClearsMarker) {
     push_block(*store);
     ASSERT_EQ(store->chain_height(), 3u);
 }
+
+// 10. BACKLOG 2.6 residual: a SECOND instance on the same ledger file must
+//     fail closed at startup. Two instances would race the WAL INTENT
+//     window - each instance's recovery would heal/truncate the other's
+//     in-flight append, and both could append at the same height. The
+//     kernel flock makes the intruder refuse; the lock lives exactly as
+//     long as the first instance's descriptor.
+TEST(VortexWalMarkerTest, SecondInstanceFailsClosedOnFlock) {
+    Harness h("flock");
+    auto store = h.open();
+    push_block(*store);
+    ASSERT_EQ(store->chain_height(), 2u);
+
+    bool threw = false;
+    try {
+        vx::storage::BlockStore intruder(h.ledger, "genesis.bin", 8);
+    } catch (const std::exception &e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("held by another instance"), std::string::npos)
+            << "unexpected refusal: " << e.what();
+    }
+    ASSERT_TRUE(threw) << "a second instance must not open a locked ledger";
+
+    // The lawful instance is unaffected and keeps appending.
+    push_block(*store);
+    ASSERT_EQ(store->chain_height(), 3u);
+
+    // Sequential reopen (first instance closed) succeeds and continues.
+    store.reset();
+    auto reopened = h.open();
+    ASSERT_EQ(reopened->chain_height(), 3u);
+    push_block(*reopened);
+    ASSERT_EQ(reopened->chain_height(), 4u);
+}
+
+// 11. A REFUSED open must release the lock. The mmap keeps the open file
+//     description (and with it the flock) alive even after close(), so
+//     every ctor throw path that runs after ensure_mapping must munmap -
+//     otherwise one failed open poisons every later reopen in the same
+//     process (this bit VxCrashTortureTest.Level1StoreTailTruncation's
+//     zero-frame trials, which open -> refuse -> truncate -> reopen).
+TEST(VortexWalMarkerTest, RefusedOpenReleasesFlock) {
+    Harness h("relock");
+    {
+        auto store = h.open();
+        push_block(*store);
+        ASSERT_EQ(store->chain_height(), 2u);
+    }
+    // Append a zero frame: the ctor refuses at validate_region - the throw
+    // path that follows ensure_mapping.
+    {
+        std::ofstream f(h.ledger, std::ios::binary | std::ios::app);
+        const std::vector<char> zeros(BLOCK_SIZE_BYTES, '\0');
+        f.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+        ASSERT_TRUE(f.good());
+    }
+    bool threw = false;
+    try {
+        auto bad = h.open();
+    } catch (const std::exception &e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("bad magic"), std::string::npos) << e.what();
+    }
+    ASSERT_TRUE(threw);
+
+    // The refused open must have left NO lock behind: drop the zero frame
+    // and reopen - this open MUST succeed (the regression: it used to hit
+    // "held by another instance" with no instance alive).
+    std::error_code ec;
+    const uintmax_t sz = std::filesystem::file_size(h.ledger, ec);
+    ASSERT_FALSE(ec);
+    std::filesystem::resize_file(h.ledger, sz - BLOCK_SIZE_BYTES);
+    auto store = h.open();
+    ASSERT_EQ(store->chain_height(), 2u) << "the refused open poisoned the reopen";
+    push_block(*store);
+    ASSERT_EQ(store->chain_height(), 3u);
+}

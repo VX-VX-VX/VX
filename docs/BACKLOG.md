@@ -1909,12 +1909,95 @@ amends the list as needed.
   bans are keyed on the connection label (ip:port); a reconnect on a
   fresh port starts clean until a richer handshake carries a durable
   node identity.
-- [ ] **2.6 WAL flock residual**: the two-instance INTENT-window race
-  hardening (below-threshold review residual; cheap, do it before
-  beta rather than after).
-- [ ] **2.11 refinement: SSE drop shutdown(fd, SHUT_RDWR)** (owner
-  II.2): the SSE slow-consumer drop currently relies on close()
-  semantics; the refinement is a small, contained change.
+- [x] **2.6 WAL flock residual** — CLOSED (2026-11-08): the BlockStore
+  ctor takes an exclusive non-blocking `flock` on the ledger descriptor
+  before any recovery runs - a second instance on the same ledger file
+  fails closed at startup ("held by another instance") instead of racing
+  the WAL INTENT window (each instance's recovery would heal/truncate
+  the other's in-flight append). The lock lives exactly as long as the
+  descriptor (released by close on every path, including the ctor error
+  paths). Pinned by `VortexWalMarkerTest.SecondInstanceFailsClosedOnFlock`
+  (intruder refuses with the named diagnostic, the lawful instance keeps
+  appending, sequential reopen succeeds). Caught by the project's own
+  gates during development: the full-lane rerun failed
+  `VxCrashTortureTest.Level1StoreTailTruncation` - the ctor's
+  validate_region throw path ran after `ensure_mapping` WITHOUT munmap,
+  and a memory mapping keeps the open file description (and with it the
+  flock) alive even after close(), so a refused open left a phantom lock
+  the whole process could not reopen through (kernel-verified with a
+  minimal repro: open -> flock -> mmap -> close -> flock-by-new-descriptor
+  = EAGAIN). Fixed: the post-mapping throw path munmaps before closing;
+  the genesis-seed throw paths now close the WAL descriptor too; new pin
+  `VortexWalMarkerTest.RefusedOpenReleasesFlock` (refuse at bad-magic ->
+  truncate -> reopen succeeds).
+- [x] **2.11 refinement: SSE drop shutdown(fd, SHUT_RDWR)** — CLOSED
+  (2026-11-08, owner II.2): a dropped SSE client's connection thread used
+  to keep polling a subscription nothing was pushed to (the drop relied
+  on the client eventually noticing). The drop path now calls
+  ::shutdown(fd, SHUT_RDWR) - NOT close: the connection thread owns the
+  fd and detects the disconnect in its poll loop - so both ends terminate
+  deterministically; membership is re-checked under sse_mutex_
+  immediately before each shutdown (see the review P2 below). Exercised
+  by `VortexSseDropTest.DroppedClientBranchKeepsPushAlive`: a subscriber
+  that dies with a hard RST (SO_LINGER {1,0}) is reclaimed without
+  wedging or SIGPIPE, the server survives, and a fresh subscriber still
+  receives the hello and a live push event.
+  Honest limits (recorded in the test header): (a) the refinement's own
+  observable - the FIN the dropped client receives - is not pinned by
+  the suite; proving it requires real TCP backpressure, which on loopback
+  fights send-buffer autotuning and would make the test
+  timing-dependent; (b) branch reach is a race - after the RST the
+  server-side connection thread usually observes it in poll first and
+  reclaims the fd itself (the correct outcome - broadcast then finds
+  nothing to drop); the branch runs only when the broadcast send loses
+  that race. Residual (inherent to fd-number identity, bounded): if the
+  exiting thread's erase + close + a new SSE accept + its push-back all
+  complete inside the drop loop, the new connection holding the same
+  number is shut down - it reconnects via EventSource retry; no state
+  corruption.
+  The new suite also caught a REAL pre-existing defect before commit:
+  HttpServer::stop() closed the listening socket while the accept loop
+  was blocked in accept() - close() does not wake a blocked accepter on
+  Linux, so stop() hung forever on the accept-thread join. stop() now
+  ::shutdown()s the listening socket first, then closes.
+  Security review of the same diff (adversarial, zero-trust, run BEFORE
+  commit) - all fixed in this commit:
+  - P1 (pre-existing, remote process kill): send_response used a
+    flags=0 ::send and the tree never disposed SIGPIPE - a client that
+    sent a complete request and RST before the response send got EPIPE ->
+    default-action SIGPIPE -> the whole node died, remotely triggerable
+    on any endpoint. Fixed both ends: MSG_NOSIGNAL on send_response and
+    process-wide SIG_IGN(SIGPIPE) in main.cpp (covers the flag-less
+    paths such as the sendfile block relay; every write path already
+    treats EPIPE as an error return).
+  - P1 (the diff's own): test_sse_drop was registered in the
+    -UNDEBUG foreach before its add_executable - CMake configure would
+    fail. Reordered (caught by the review, not by a build).
+  - P2: the SSE shutdown could land on an fd number the connection
+    thread had already closed and the accept loop recycled (a plain-HTTP
+    victim's response would be truncated - and with the flags=0 send
+    above, was remotely process-fatal). Membership is now re-checked
+    under sse_mutex_ immediately before each shutdown.
+  - P3 closed: a non-std exception from write_genesis_file leaked both
+    ctor descriptors (catch (...) added); the close(wal_fd_) on the
+    wal_fd_ < 0 path dropped.
+  - TSan round (found by the TSan lane rerun on the same tree, 40/41
+    before the fix): two data races in the stop path - (a) server_fd_
+    was a plain int read by the accept loop on every iteration while
+    stop() wrote it (now std::atomic<int>); (b) stop() closed SSE fds
+    owned by detached threads and returned while detached threads could
+    still touch members that die with the object. Fix: stop() only
+    ::shutdown()s SSE fds (the owning thread keeps fd ownership), and
+    detached connection threads - SSE AND plain HTTP, both touch
+    object-lifetime state - are counted by the accept loop BEFORE
+    detach() (a thread not yet scheduled is still accounted) and
+    drained by stop() with a bounded 2 s wait; handlers decrement on
+    every exit path through an RAII guard, spawn failure un-registers.
+    The first draft incremented the counter inside the handler, leaving
+    a window where stop() could drain a zero count while a detached
+    thread had not started yet - caught by self-review, registration
+    moved into the accept loop where the joinable accept thread orders
+    it before stop(). Final: assert/SAN/TSan all 41/41 on one tree.
 - Owner-decision items (NOT beta blockers, tracked in the Q2-Q4
   directive): the 2.12(e) Guard decision, ord_P(7) ECM analysis, the
   CRT-collision formal proof. These gate the NEXT major release, not

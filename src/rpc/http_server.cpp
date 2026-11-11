@@ -139,6 +139,12 @@ void HttpServer::start() {
     while (running_.load()) {
         int client = ::accept(server_fd_, nullptr, nullptr);
         if (client < 0) continue;
+        // A client accepted while stop() was flipping running_: do not
+        // spawn a thread that would register into a draining object.
+        if (!running_.load()) {
+            ::close(client);
+            break;
+        }
         // Set non-blocking for SSE clients
         // Check if it's an SSE request by peeking
         char peek_buf[1024];
@@ -147,13 +153,31 @@ void HttpServer::start() {
             peek_buf[n] = '\0';
             std::string peek(peek_buf);
             if (peek.find("GET /api/events") != std::string::npos || peek.find("GET /events") != std::string::npos) {
-                // SSE client - handle in dedicated thread
-                std::thread([this, client]() { handle_sse_client(client); }).detach();
+                // SSE client - handle in dedicated thread. The counter is
+                // incremented HERE, before detach: a detached thread that
+                // has not been scheduled yet is still accounted for, so
+                // stop()'s drain never sees a false-zero count (the entry
+                // increment inside the handler would race the drain).
+                conn_threads_alive_.fetch_add(1, std::memory_order_release);
+                try {
+                    std::thread([this, client]() { handle_sse_client(client); }).detach();
+                } catch (...) {
+                    // Spawn failed: no thread exists to decrement, undo the
+                    // registration and drop the connection.
+                    conn_threads_alive_.fetch_sub(1, std::memory_order_release);
+                    ::close(client);
+                }
                 continue;
             }
         }
-        // Regular HTTP client
-        std::thread([this, client]() { handle_client(client); }).detach();
+        // Regular HTTP client (same registration discipline as SSE above).
+        conn_threads_alive_.fetch_add(1, std::memory_order_release);
+        try {
+            std::thread([this, client]() { handle_client(client); }).detach();
+        } catch (...) {
+            conn_threads_alive_.fetch_sub(1, std::memory_order_release);
+            ::close(client);
+        }
     }
 }
 
@@ -166,16 +190,39 @@ void HttpServer::stop() {
     // race-free. (Idempotent: PoGWMiner::stop() guards on its own flag.)
     if (miner_) miner_->stop();
     if (running_.exchange(false)) {
-        if (server_fd_ >= 0) { ::close(server_fd_); server_fd_ = -1; }
+        if (server_fd_ >= 0) {
+            // Found by VortexSseDropTest (2026-11-08): close() alone does
+            // NOT wake a thread blocked in accept() on Linux - stop() then
+            // hung forever on the accept-thread join with the loop stuck
+            // in accept on a freed fd. shutdown() on the LISTENING socket
+            // is what wakes the accepter (it returns with an error, the
+            // loop re-checks running_ and exits); close after it.
+            ::shutdown(server_fd_, SHUT_RDWR);
+            ::close(server_fd_);
+            server_fd_ = -1;
+        }
     }
     sse_running_.store(false);
-    // Clean up SSE clients
+    // Signal (never free) every live SSE connection: the detached threads
+    // own their fds and close them on exit - a close from THIS thread
+    // races the owner's poll/recv on the same descriptor (TSan 2026-11-08).
+    // The poll loops see POLLHUP immediately.
     {
         std::lock_guard<std::mutex> lock(sse_mutex_);
         for (int fd : sse_clients_) {
-            ::close(fd);
+            ::shutdown(fd, SHUT_RDWR);
         }
         sse_clients_.clear();
+    }
+    // Detached connection threads (SSE AND plain HTTP) touch sse_mutex_/
+    // sse_clients_/sse_running_/state_mutex_/ledger_ - members that die
+    // with this object. Wait for the registered count to drain (bounded -
+    // a thread that observed the shutdown or its poll timeout exits within
+    // ~1s) so nothing outlives the object; this also closes the review P3
+    // teardown window. The count already includes threads spawned before
+    // detach got to run them (registered in the accept loop).
+    for (int i = 0; i < 2000 && conn_threads_alive_.load(std::memory_order_acquire) > 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     if (sse_broadcast_thread_.joinable()) {
         sse_broadcast_thread_.join();
@@ -231,6 +278,18 @@ vx::blockchain::BoundRootOf ledger_bound_root_of(vx::state::LedgerState &ledger)
         return ledger.pq_root_of(a, out);
     };
 }
+
+// Teardown accounting (TSan 2026-11-08): every detached connection thread
+// holds one of these for its whole lifetime. The matching INCREMENT was
+// done by the accept loop before detach(), so stop()'s drain wait sees a
+// count that already includes not-yet-started threads; this guard makes
+// the decrement unconditional on every exit path (early returns included).
+struct ConnThreadGuard {
+    std::atomic<int> &counter;
+    ~ConnThreadGuard() {
+        counter.fetch_sub(1, std::memory_order_release);
+    }
+};
 } // namespace
 
 HttpServer::RemoteApply HttpServer::try_apply_remote_frame(const uint8_t *bytes,
@@ -596,7 +655,14 @@ void HttpServer::send_response(int client_fd, const HttpResponse& res) {
     for (auto& h : res.headers) oss << h.first << ": " << h.second << "\r\n";
     oss << "Content-Length: " << res.body.size() << "\r\n\r\n";
     std::string out = oss.str() + res.body;
-    ::send(client_fd, out.data(), out.size(), 0);
+    // Security review 2026-11-08 (P1, pre-existing): flags=0 send + no
+    // SIGPIPE disposition anywhere in the tree meant a client that sent a
+    // complete request and then RST (SO_LINGER {1,0} close) before this
+    // send got EPIPE -> default-action SIGPIPE -> the WHOLE node process
+    // died, remotely triggerable on any RPC endpoint. MSG_NOSIGNAL aligns
+    // this send with every other send in the file; the process-wide
+    // SIG_IGN in main.cpp covers the flag-less paths (sendfile).
+    ::send(client_fd, out.data(), out.size(), MSG_NOSIGNAL);
 }
 
 bool HttpServer::send_sse_data(int client_fd, const std::string& event,
@@ -634,15 +700,44 @@ void HttpServer::broadcast_sse_event(const std::string& event,
         if (!send_sse_data(fd, event, data)) dropped.push_back(fd);
     }
     if (!dropped.empty()) {
+        // BACKLOG 2.11 refinement (owner II.2, 2026-11-08): a dropped SSE
+        // client's connection thread keeps polling a subscription nothing
+        // is pushed to - the drop used to rely on the client eventually
+        // noticing. shutdown() (NOT close: this thread must not free the
+        // fd, the connection thread owns it and detects the disconnect in
+        // its poll loop) makes both ends terminate deterministically: the
+        // peer sees FIN, our poll loop sees readable EOF/POLLHUP, the
+        // thread exits and closes the fd it owns.
+        // Security review 2026-11-08 (P2): the shutdown must not land on an
+        // fd number that the connection thread has already closed and the
+        // accept loop recycled - the plain-HTTP victim could take EPIPE on
+        // its own response send (with the SIGPIPE fix in main/send_response
+        // that is no longer process-fatal, but it still truncates an
+        // unrelated live response). Membership is therefore re-checked
+        // under sse_mutex_ IMMEDIATELY before each shutdown: a connection
+        // thread removes itself under this same mutex before closing its
+        // fd, so a client that already exited is skipped. Residual (inher-
+        // ent to fd-number identity, bounded): if the exiting thread's
+        // erase + close + a new SSE accept + its push-back all complete
+        // INSIDE this loop, the new connection holding the same number is
+        // shut down - it reconnects via EventSource retry; no state
+        // corruption. shutdown() itself raises no signals.
         std::lock_guard<std::mutex> lock(sse_mutex_);
         for (int fd : dropped) {
             const auto it = std::find(sse_clients_.begin(), sse_clients_.end(), fd);
-            if (it != sse_clients_.end()) sse_clients_.erase(it);
+            if (it != sse_clients_.end()) {
+                ::shutdown(fd, SHUT_RDWR);
+                sse_clients_.erase(it);
+            }
         }
     }
 }
 
 void HttpServer::handle_sse_client(int client_fd) {
+    // Teardown accounting: the INCREMENT ran in the accept loop before
+    // detach (so not-yet-started threads are counted); this guard decrements
+    // on the single exit below. stop()'s drain wait reads this handoff.
+    ConnThreadGuard conn_guard{conn_threads_alive_};
     // Audit 2026-11-05 (P1 race fix): the socket MUST be non-blocking BEFORE
     // this fd becomes visible in sse_clients_. Previously the push happened
     // here and O_NONBLOCK was set only below — a block sealed in between
@@ -711,6 +806,12 @@ void HttpServer::handle_sse_client(int client_fd) {
 }
 
 void HttpServer::handle_client(int client_fd) {
+    // Teardown accounting: same discipline as the SSE handler — registered
+    // by the accept loop, decremented here on every exit path by the guard.
+    // A plain-HTTP thread also touches members that die with the object
+    // (route() -> handlers -> state_mutex_/ledger_), so stop()'s drain must
+    // cover it too, not only the SSE threads.
+    ConnThreadGuard conn_guard{conn_threads_alive_};
     bool ok;
     auto req = parse_request(client_fd, ok);
     if (!ok) { ::close(client_fd); return; }

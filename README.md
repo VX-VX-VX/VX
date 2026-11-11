@@ -12,7 +12,7 @@
 ![language](https://img.shields.io/badge/C%2B%2B-26-blue)
 [![CI](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml/badge.svg)](https://github.com/VX-VX-VX/VX/actions/workflows/ci.yml)
 ![license](https://img.shields.io/badge/license-AGPLv3%20%2B%20clause-lightgrey)
-![tests](https://img.shields.io/badge/ctest-16%2F16-brightgreen)
+![tests](https://img.shields.io/badge/ctest-41%2F41-brightgreen)
 
 **VX** is an experimental Layer-1 blockchain with a fixed 64 KiB block frame,
 a deterministic 3072-bit chaotic attractor at its consensus core, and a
@@ -193,21 +193,26 @@ Every block — genesis included — is exactly 65 536 bytes:
 ```text
 offset        size    field
 ─────────────────────────────────────────────
-0x000         472 B   BlockHeader (packed, no padding)
-                            · magic "VXC6" (0x58564336)
+0x000         504 B   BlockHeader (packed, no padding)
+                            · magic "VXC7" (0x58564337)
                             · block_height (8 B)
                             · timestamp (8 B)
                             · prev_block_hash (32 B)
                             · merkle_root (32 B)
                             · attractor_coords X ‖ Y ‖ Z (384 B)
-                            · …
-0x1D8         112 B   Transaction #0
-…             …       up to 580 transactions (112 B each, invariant)
+                            · witness_merkle_root (32 B) — the proposer's
+                              commitment to the block's canonical
+                              out-of-band PQ witness set (VXC7)
+0x1F8         112 B   Transaction #0
+…             …       up to 579 transactions (112 B each, invariant)
 tail          104 B   padding (GQC aggregate signature is stamped
                       at offset 65 464…65 495)
 ─────────────────────────────────────────────
 total         65 536 B  exactly, always
 ```
+
+VXC6 frames (472 B header, 580 tx, no witness commitment) are refused at
+intake by name — the format bump is versioned, never a silent swap.
 
 A `BlockView` wraps the raw frame as `std::span<const uint8_t, 65536>` —
 fields are read in place from the mapping, so parsing is pointer arithmetic,
@@ -258,6 +263,12 @@ over GF(2⁸) shared with the Galois trie).
   own — stem-and-fluff propagation for transaction origin privacy.
 - **Hamiltonian MEV shield:** ordering pressure in the mempool is modeled as
   an energy term and damped before block assembly.
+- **Witness & certificate delivery:** blocks commit their canonical PQ
+  witness set in the header (VXC7); witnesses travel out-of-band and a node
+  that connects mid-stream gets the last 16 blocks' witnesses re-served.
+  Rollover certificates propagate with a fresh-flag relay, and a peer can
+  pull missing ones by id over CERT_INV / GET_CERTS — full records only,
+  every byte re-verified on intake.
 
 ### Vault memory — keys that are born, used and die
 
@@ -325,7 +336,7 @@ cmake -S . -B build_vault -DCMAKE_BUILD_TYPE=Release -DVX_BUILD_VAULT=ON
 | `mlock` failure | warning, zeroization still guaranteed | **hard error** — the arena refuses to run unlocked |
 | Hardware binding | synthetic fallback vectors | DMI `product_uuid` + `machine-id` anchor chain |
 | Cache-line burn | enabled when the CPU supports it | enabled and *asserted* |
-| Test suite | 16/16 | 16/16 (locked-arena tests skip only where the environment forbids `mlock`) |
+| Test suite | 41/41 | 41/41 (locked-arena tests skip only where the environment forbids `mlock`) |
 
 Both editions build from the same source tree; the edition is a compile-time
 definition (`VX_SOVEREIGN_ARCHITECT=1`), not a fork.
@@ -484,7 +495,7 @@ Block #0 (deterministic, in-process):
   height        0
   timestamp     1 761 000 000
   coinbase      GENESIS0… → NFA_V6_… (attractor address), 2 540 000 VX
-  frame         65 536 B, magic "VXC6"
+  frame         65 536 B, magic "VXC7"
 ```
 
 **Never use the published seed for live keys.** It exists so anyone can
@@ -495,7 +506,7 @@ point is that it is *public*.
 
 ## Test suite
 
-37 ctest entries; all pass in **both** build editions:
+41 ctest entries; all pass in **both** build editions:
 
 | Target | Coverage |
 |---|---|
@@ -528,9 +539,16 @@ crash/recovery torture, the reorg carousel, ASERT retarget, RPC
 auth, C5 key import (fail-closed, constant-time), apply-path
 integrity, mempool admission, the VortexSponge1024 digest contract, and
 the VX2 generation-2 address format (own 135-bit BCH checksum, 6-symbol
-substitution guarantee - docs/ADDRESS_FORMATS_V2.md), and the rollover
+substitution guarantee - docs/ADDRESS_FORMATS_V2.md), the rollover
 certificate consensus wiring (`VortexPqRolloverWiringTest` - the
-sequential-chain acceptance policy, BACKLOG 1.5).
+sequential-chain acceptance policy, BACKLOG 1.5), the VXC7
+witness-merkle header commitment and the witness-set delivery protocol
+(`VortexWitnessMerkleTest`, `VortexWitnessDeliveryTest` - canonical
+selection, park/retry, retention, withhold attribution), the
+crash-consistent WAL intent marker (`VortexWalMarkerTest`) with the
+single-writer ledger flock, the CERT_INV/GET_CERTS cert backfill
+protocol over VX60, and the SSE push drop policy
+(`VortexSseDropTest`).
 
 ---
 
@@ -540,7 +558,7 @@ sequential-chain acceptance policy, BACKLOG 1.5).
 include/vx/          public headers (blockchain, consensus, crypto, core,
                      math, net, rpc, state, storage, vm, wif)
 src/                 implementation, one directory per subsystem
-tests/               37 targets: 36 test suites (37 ctest entries,
+tests/               42 targets: 41 test suites (41 ctest entries,
                      GoogleTest + plain runners) + 1 manual benchmark
                      (bench_pq)
 web/                 React + TypeScript PWA console (+ Electron wrapper)

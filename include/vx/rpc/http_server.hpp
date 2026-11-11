@@ -346,7 +346,18 @@ private:
     std::mutex state_mutex_;
     std::mutex sse_mutex_;
     uint16_t port_;
-    int server_fd_ = -1;
+    // Atomic because the accept loop in start() reads it on another thread
+    // on EVERY iteration while stop() writes it (shutdown/close/-1) - a
+    // plain int is a data race there (TSan, 2026-11-08).
+    std::atomic<int> server_fd_{-1};
+    // Detached connection threads (SSE and plain HTTP) are counted here.
+    // The INCREMENT happens in the accept loop BEFORE std::thread::detach()
+    // — a detached thread that has not started running yet is still counted,
+    // so stop()'s drain cannot observe an artificially empty counter and
+    // destroy the object under a thread that is about to touch it. Each
+    // handler decrements on every exit path (RAII guard). stop() waits for
+    // the count to drain so no detached thread can touch a destroyed object.
+    std::atomic<int> conn_threads_alive_{0};
     std::atomic<bool> running_{false};
     std::vector<int> sse_clients_;
     std::thread sse_broadcast_thread_;
