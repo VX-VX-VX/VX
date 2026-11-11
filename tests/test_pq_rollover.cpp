@@ -299,6 +299,18 @@ int main() {
         assert(winners.size() == 15);
         // Rollback discipline: nothing in the API ever returns a reserved
         // leaf to the pool - the burned set only grows.
+        //
+        // Visibility note (found as a 3/10 SAN flake, 2026-11-11): each
+        // object's used_ view reflects the DISK STATE AT ITS OWN LAST
+        // reserve (flock + re-parse), so with an unlucky 8+8 thread split
+        // one object's last refresh can predate the other object's final
+        // burns - used_count is then legitimately < 15. A refused reserve
+        // (leaf 15 is cert-reserved for txs) still flocks + re-parses
+        // BEFORE refusing, so it refreshes each object to disk truth
+        // WITHOUT burning anything. After the two refreshes both views are
+        // converged and the asserts are deterministic.
+        (void)la.reserve_for_tx(r0, 15);
+        (void)lb.reserve_for_tx(r0, 15);
         assert(la.used_count(r0) == 15);
         assert(lb.used_count(r0) == 15);
         std::cout << "two-object flock race: 15 distinct leaves, rollback "
