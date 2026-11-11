@@ -2083,7 +2083,18 @@ amends the list as needed.
   authenticated caller a ~1 GB response built under state_mutex_ —
   unauthenticated callers are refused by the gate, which is the real
   fix; revisit the cap if a hostile token holder matters.
-  CLI utilities still owed an attacker walk before the flip.
+  **CLI walk: CLOSED (2026-11-12), no findings.** `vx_node` is the only
+  user-facing binary (the other 44 add_executable targets are
+  tests/fuzz/bench tooling). Full flag surface —
+  help/version/serve/port/p2p/peer/seed/data-dir — is config-only;
+  the positional `rounds` argument is a local CPU knob controlled by
+  the operator on their own machine (not remotely triggerable);
+  `--demo` is opt-in, off by default, uses only the canonical PUBLIC
+  demo constants (the already-tracked testnet caveat, BACKLOG 0.14/0.18:
+  mainnet requires an unpublished receiver before genesis freeze) and
+  prints addresses, never key material. Shipped scripts
+  (commit_utc/make_release/multi_node_test/opsec_scan) talk to
+  localhost only. The surface pass is fully closed.
   Related residuals discovered with peer discovery (2026-11-11):
   loopback acceptance in `add_addr_candidate` is a
   localhost-SSRF/probe primitive on a real network and must gain a
