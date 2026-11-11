@@ -8,12 +8,16 @@
 #include <gtest/gtest.h>
 
 #include "vx/rpc/http_server.hpp"
+#include "vx/blockchain/block.hpp"
 
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -106,7 +110,9 @@ TEST(VortexRpcAuthTest, NoTokenFailsClosed) {
     // Read-only endpoints stay open.
     EXPECT_EQ(env.server->route(request("GET", "/api/status", "")).status_code, 200);
     EXPECT_EQ(env.server->route(request("GET", "/api/accounts", "")).status_code, 200);
-    EXPECT_EQ(env.server->route(request("GET", "/api/blocks", "")).status_code, 200);
+    // Public binary surface pass: /api/blocks is now resource-heavy (O(chain)
+    // walk under state_mutex_) — it must gate like the other heavy classes.
+    EXPECT_EQ(env.server->route(request("GET", "/api/blocks", "")).status_code, 401);
     // Resource-heavy endpoints share the same fail-closed gate (P1-2): both
     // a state_mutex_-holding POST and CPU-bound GETs must 401 without a
     // token, unlike plain read-only GETs above.
@@ -125,7 +131,123 @@ TEST(VortexRpcAuthTest, NoTokenFailsClosed) {
     EXPECT_EQ(env.server->route(request("POST", "/api/zk/stealth_envelope", "{}")).status_code,
               401);
     EXPECT_EQ(env.server->route(request("POST", "/api/state/prove", "{}")).status_code, 401);
+    // Security review P3 (2026-11-12): a full 7-tier key derivation plus
+    // proof generation/verification per POST — same burn class as
+    // derive_matrix, gated the same way.
+    EXPECT_EQ(env.server->route(request("POST", "/api/zk/proof_of_life", "{}")).status_code, 401);
     EXPECT_EQ(env.server->route(request("GET", "/api/mempool/zk_stats", "")).status_code, 200);
+}
+
+// Public binary surface pass (2026-11-12): sensitive endpoints — key-material
+// oracles, hardware-fingerprint disclosures and CPU/recon burns — share the
+// fail-closed token gate. Unauthenticated: 401. With the token: the handler
+// runs (200).
+TEST(VortexRpcAuthTest, SensitiveEndpointsFailClosed) {
+    const auto env = make_server("sensitive", kToken, nullptr, nullptr);
+
+    // Without token: every sensitive class endpoint answers 401.
+    EXPECT_EQ(env.server->route(request("POST", "/api/crypto/lab", "{}")).status_code, 401);
+    EXPECT_EQ(env.server->route(request("GET", "/api/crypto/canonical", "")).status_code, 401);
+    EXPECT_EQ(env.server->route(request("POST", "/api/zk/derive_matrix", "{}")).status_code, 401);
+    EXPECT_EQ(env.server->route(request("POST", "/api/zk/recover_shamir", "{}")).status_code, 401);
+    EXPECT_EQ(env.server->route(request("GET", "/api/telemetry/rdtsc", "")).status_code, 401);
+    EXPECT_EQ(env.server->route(request("GET", "/api/vault/memory", "")).status_code, 401);
+
+    // With the token the gate passes and the real handler answers.
+    EXPECT_EQ(env.server->route(request("GET", "/api/crypto/canonical", "", kToken)).status_code,
+              200);
+    EXPECT_EQ(env.server->route(request("POST", "/api/zk/derive_matrix", "{}", kToken)).status_code,
+              200);
+    EXPECT_EQ(env.server->route(request("GET", "/api/vault/memory", "", kToken)).status_code, 200);
+}
+
+// Query-string bypass regression (2026-11-12): appending "?x=1" to a gated
+// path must never smuggle a request past the gate — the target is split on
+// '?' before any path comparison. A read-only endpoint with a query string
+// stays open.
+TEST(VortexRpcAuthTest, QueryStringCannotBypassGate) {
+    const auto env = make_server("qsbypass", kToken, nullptr, nullptr);
+
+    // Gated path + query string: still 401 without the token.
+    EXPECT_EQ(env.server->route(request("GET", "/api/blocks?last=10", "")).status_code, 401);
+    EXPECT_EQ(env.server->route(request("POST", "/api/transfer?x=1", "{}")).status_code, 401);
+    EXPECT_EQ(env.server->route(request("GET", "/api/crypto/canonical?v=2", "")).status_code, 401);
+
+    // Read-only path + query string: stays open.
+    EXPECT_EQ(env.server->route(request("GET", "/api/status?v=2", "")).status_code, 200);
+    EXPECT_EQ(env.server->route(request("GET", "/api/accounts?full=1", "")).status_code, 200);
+
+    // Empty and bare queries never flip a gated path open either.
+    EXPECT_EQ(env.server->route(request("GET", "/api/blocks?", "")).status_code, 401);
+}
+
+// Positive-path coverage of the bounded /api/blocks window (security
+// review P3-5, 2026-11-12) plus the single-block trailing-comma regression
+// (review P2-1): on a 2-block chain, ?height=0 once emitted "...},]"
+// (malformed JSON) because the comma condition compared against the chain
+// height instead of the window end.
+TEST(VortexRpcAuthTest, BlocksWindowSemantics) {
+    const auto env = make_server("blockswin", kToken, nullptr, nullptr);
+
+    // Grow the chain to 2 blocks: an empty frame (no transactions — no
+    // witness bindings needed) sealed straight into the store.
+    {
+        vx::blockchain::BlockBuilder b;
+        b.set_height(env.store->chain_height());
+        b.set_timestamp(static_cast<uint64_t>(std::time(nullptr)));
+        uint8_t tip[32];
+        env.store->tip_hash(tip);
+        b.set_prev_hash(tip);
+        const std::array<uint8_t, 384> coords{};
+        b.set_attractor_coords(coords.data());
+        b.finalize();
+        vx::blockchain::BlockFrame f;
+        std::memcpy(f.data(), b.bytes().data(), vx::blockchain::BLOCK_SIZE_BYTES);
+        ASSERT_TRUE(vx::blockchain::seal_pogw_nonce(f, env.store->required_pogw_bits()));
+        ASSERT_TRUE(env.store->append_block(f)) << env.store->last_error();
+    }
+    ASSERT_EQ(env.store->chain_height(), 2u);
+
+    const auto body_of = [&](const std::string &target) {
+        return env.server->route(request("GET", target, "", kToken)).body;
+    };
+
+    // Default window (256 >= chain): both blocks, well-formed separators.
+    const std::string full = body_of("/api/blocks");
+    EXPECT_NE(full.find("\"height\":0"), std::string::npos);
+    EXPECT_NE(full.find("\"height\":1"), std::string::npos);
+    EXPECT_EQ(full.find(",]"), std::string::npos) << full;
+    EXPECT_EQ(full.find(",}"), std::string::npos) << full;
+
+    // Single-block mode (the P2-1 regression): point lookups of BOTH
+    // heights parse cleanly — no trailing comma, only the asked block.
+    const std::string h0 = body_of("/api/blocks?height=0");
+    EXPECT_NE(h0.find("\"height\":0"), std::string::npos);
+    EXPECT_EQ(h0.find("\"height\":1"), std::string::npos);
+    EXPECT_EQ(h0.find(",]"), std::string::npos) << h0;
+    const std::string h1 = body_of("/api/blocks?height=1");
+    EXPECT_NE(h1.find("\"height\":1"), std::string::npos);
+    EXPECT_EQ(h1.find("\"height\":0"), std::string::npos);
+    EXPECT_EQ(h1.find(",]"), std::string::npos) << h1;
+
+    // Out of range: 404, never a fabricated block.
+    EXPECT_EQ(env.server->route(request("GET", "/api/blocks?height=2", "", kToken)).status_code,
+              404);
+    EXPECT_EQ(env.server->route(request("GET", "/api/blocks?height=12345", "", kToken)).status_code,
+              404);
+
+    // Tail window: last=1 answers only the tip; last=0 an empty array.
+    const std::string tail1 = body_of("/api/blocks?last=1");
+    EXPECT_EQ(tail1.find("\"height\":0"), std::string::npos);
+    EXPECT_NE(tail1.find("\"height\":1"), std::string::npos);
+    const std::string tail0 = body_of("/api/blocks?last=0");
+    EXPECT_NE(tail0.find("\"blocks\":[]"), std::string::npos);
+
+    // Parser rules: non-decimal and >19-digit values are ignored, falling
+    // back to the default window (both blocks present).
+    EXPECT_NE(body_of("/api/blocks?last=abc").find("\"height\":0"), std::string::npos);
+    EXPECT_NE(body_of("/api/blocks?last=99999999999999999999").find("\"height\":0"),
+              std::string::npos);
 }
 
 // Byte-level parser regressions (P2-2) driven through route_raw, which uses

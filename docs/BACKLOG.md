@@ -2051,8 +2051,41 @@ amends the list as needed.
   attacker - every RPC endpoint (including the fuzz/chaos/flood handlers,
   which are behind the auth gate but still compiled in) and every CLI
   utility - and remove or hard-gate anything that has no business in a
-  public build. Related residuals discovered with peer discovery
-  (2026-11-11): loopback acceptance in `add_addr_candidate` is a
+  public build. **RPC surface: CLOSED (2026-11-12)** - the security-audit
+  verdicts for all 17 unauthenticated handlers are implemented: the
+  resource-heavy gate now also covers `/api/blocks` (bounded tail
+  window: `?last=N` default 256 / cap 4096, `?height=H` single-block,
+  replacing the unbounded O(chain) walk under state_mutex_),
+  `/api/state/trie_root` and `/api/crypto/pq_verify`; a new
+  `is_sensitive_endpoint` class fails closed over the key-material
+  oracles and fingerprint disclosures (`/api/crypto/lab`,
+  `/api/crypto/canonical`, `/api/zk/derive_matrix`,
+  `/api/zk/recover_shamir`, `/api/telemetry/rdtsc`,
+  `/api/vault/memory`); the caller-supplied `rounds` CPU bomb in
+  `/api/crypto/lab` is clamped to [1, 8192]; and the request target is
+  split into path + query string in `route()` (single authoritative
+  split point for the socket path, route_raw and direct callers), so a
+  query string can never bypass any gate list. The web GUI keeps
+  working through the token flow (CanvasVisualizer's raw fetch switched
+  to `vxFetch`). Tests: `SensitiveEndpointsFailClosed`,
+  `QueryStringCannotBypassGate`, `/api/blocks` 401 regression - all
+  three lanes 41/41. Deliberately left open unauthenticated:
+  `/api/status`, `/api/accounts`, `/api/swarm/peers`,
+  `/api/consensus/finality_status`, `/api/mempool/zk_stats`,
+  `/api/swarm/dandelion_stats`, and the harmless stub
+  `/api/zk/audit_view` (`/api/zk/proof_of_life` moved to the
+  resource-heavy gate after review found its full 7-tier derivation +
+  proof burn behind every unauthenticated POST). Security-review
+  follow-ups landed with the pass: the `?height=H` trailing-comma
+  malformed-JSON fix, the GUI point-lookup (`fetchBlock`) switched to
+  `?height=H`, and positive-path window tests. Known residual
+  (accepted, P3): the 4096-block tail cap still allows an
+  authenticated caller a ~1 GB response built under state_mutex_ —
+  unauthenticated callers are refused by the gate, which is the real
+  fix; revisit the cap if a hostile token holder matters.
+  CLI utilities still owed an attacker walk before the flip.
+  Related residuals discovered with peer discovery (2026-11-11):
+  loopback acceptance in `add_addr_candidate` is a
   localhost-SSRF/probe primitive on a real network and must gain a
   default-off switch together with real-interface advertisement in
   `bind_p2p_listener` (testnet keeps loopback: the three-node topology

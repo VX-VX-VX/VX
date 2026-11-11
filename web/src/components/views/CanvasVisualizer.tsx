@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useWorkspace } from '../../contexts/WorkspaceContext'
+import { useToken } from '../../contexts/TokenContext'
 
 interface Block {
   height: number
@@ -20,6 +21,7 @@ interface CanvasVisualizerProps {
 
 export default function CanvasVisualizer({ block, onPixelSelect }: CanvasVisualizerProps) {
   const { status } = useWorkspace()
+  const { vxFetch } = useToken()
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [frameData, setFrameData] = useState<Uint8Array | null>(null)
   const [hoveredPixel, setHoveredPixel] = useState<{ x: number; y: number; offset: number } | null>(null)
@@ -171,7 +173,7 @@ export default function CanvasVisualizer({ block, onPixelSelect }: CanvasVisuali
         JSON.parse(e.data)
         // Update frame data when new block is sealed
         // Fetch new block data from status
-        fetch(window.location.origin + '/api/blocks')
+        vxFetch(window.location.origin + '/api/blocks')
           .then(res => res.json())
           .then(blocksData => {
             if (blocksData.blocks) {

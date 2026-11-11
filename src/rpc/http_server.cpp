@@ -48,6 +48,21 @@
 
 namespace vx::rpc {
 
+namespace {
+// Public binary surface pass (2026-11-12): the request target may carry a
+// query string. The gate lists compare req.path exactly, so the target is
+// split BEFORE any gate comparison — a caller can never smuggle past
+// is_mutating_endpoint/is_resource_heavy_endpoint/is_sensitive_endpoint by
+// appending "?x=1".
+void split_path_query(std::string &path, std::string &query) {
+    const size_t q = path.find('?');
+    if (q != std::string::npos) {
+        query = path.substr(q + 1);
+        path.erase(q);
+    }
+}
+} // namespace
+
 HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, uint16_t port,
                        const std::string& data_dir)
     : store_(store), ledger_(ledger), mempool_(), miner_(std::make_unique<consensus::PoGWMiner>(store, ledger, mempool_)), port_(port),
@@ -617,6 +632,7 @@ HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
     std::string line = raw.substr(0, line_end);
     std::istringstream iss(line);
     iss >> req.method >> req.path;
+    // query-string split happens centrally in route() (gate-safety)
     size_t pos = raw.find("\r\n\r\n");
     if (pos != std::string::npos) {
         req.body = raw.substr(pos + 4);
@@ -650,6 +666,8 @@ HttpResponse HttpServer::route_raw(const std::string& raw) {
     if (line_end != std::string::npos) {
         std::istringstream iss(raw.substr(0, line_end));
         iss >> req.method >> req.path;
+        // query-string split happens centrally in route() (same gate-safety
+        // as the socket path)
     }
     if (req.method.empty() || req.path.empty())
         return HttpResponse::error(400, "malformed request");
@@ -841,8 +859,11 @@ HttpResponse HttpServer::dispatch(const HttpRequest& req) {
     // token (BACKLOG 0.10 + security review P1-2/P2-1). Fail closed: with
     // no token configured this rejects everything in both classes, before
     // any handler body runs.
-    if ((is_mutating_endpoint(req) || is_resource_heavy_endpoint(req)) && !token_ok(req)) {
-        return HttpResponse::error(401, "auth required for mutating/resource-heavy endpoints");
+    if ((is_mutating_endpoint(req) || is_resource_heavy_endpoint(req) ||
+         is_sensitive_endpoint(req)) &&
+        !token_ok(req)) {
+        return HttpResponse::error(401,
+                                   "auth required for mutating/resource-heavy/sensitive endpoints");
     }
     if (req.method == "GET" && req.path == "/api/status") return handle_status(req);
     if (req.method == "GET" && req.path == "/api/blocks") return handle_blocks(req);
@@ -903,7 +924,14 @@ HttpResponse HttpServer::dispatch(const HttpRequest& req) {
 
 HttpResponse HttpServer::route(const HttpRequest& req) {
     try {
-        return dispatch(req);
+        // Single authoritative target split (public binary surface pass,
+        // 2026-11-12): every entry point — socket parse, route_raw, direct
+        // callers — reaches dispatch through here, so "path?query" can never
+        // reach a gate comparison as a path (and a handler as an unknown
+        // route). Splitting on a copy keeps the caller's request unchanged.
+        HttpRequest split = req;
+        split_path_query(split.path, split.query);
+        return dispatch(split);
     } catch (const std::exception&) {
         // The message is deliberately fixed: handler exceptions can carry
         // fragments of the request body, and echoing them back would be a
@@ -951,17 +979,40 @@ bool HttpServer::is_mutating_endpoint(const HttpRequest& req) noexcept {
 // whole run — an unauthenticated flooder there head-of-line blocks the
 // chain mutators. Both methods and both classes share one fail-closed gate.
 bool HttpServer::is_resource_heavy_endpoint(const HttpRequest& req) noexcept {
-    return req.path == "/api/mempool/pipeline_benchmark"  // GET: 100k-tx bundle under state_mutex_
-        || req.path == "/api/security/audit"              // red-team CPU burn
-        || req.path == "/api/vm/execute_trace"            // assemble + execute + trace JSON
-        || req.path == "/api/neural/simulate"
-        || req.path == "/api/mempool/mev_audit"
-        || req.path == "/api/zk/ivk_scan"                 // holds state_mutex_ throughout
-        || req.path == "/api/swarm/relay_cocoon"          // holds state_mutex_ throughout
-        // Round-2 review: two more full-run state_mutex_ holders — an
-        // unauthenticated flood here parks every chain mutator behind them.
-        || req.path == "/api/zk/stealth_envelope"         // holds state_mutex_ throughout
-        || req.path == "/api/state/prove";                // trie build + proof under state_mutex_
+    return req.path == "/api/mempool/pipeline_benchmark" // GET: 100k-tx bundle under state_mutex_
+           || req.path == "/api/security/audit"          // red-team CPU burn
+           || req.path == "/api/vm/execute_trace"        // assemble + execute + trace JSON
+           || req.path == "/api/neural/simulate" || req.path == "/api/mempool/mev_audit" ||
+           req.path == "/api/zk/ivk_scan"           // holds state_mutex_ throughout
+           || req.path == "/api/swarm/relay_cocoon" // holds state_mutex_ throughout
+           // Round-2 review: two more full-run state_mutex_ holders — an
+           // unauthenticated flood here parks every chain mutator behind them.
+           || req.path == "/api/zk/stealth_envelope" // holds state_mutex_ throughout
+           || req.path == "/api/state/prove"         // trie build + proof under state_mutex_
+           // Public binary surface pass (2026-11-12): full-run state_mutex_
+           // holders and CPU burns that an unauthenticated flood would park
+           // the chain mutators behind (trie_root) or burn O(chain) time on
+           // (blocks, pq_verify).
+           || req.path == "/api/state/trie_root" // trie root hash under state_mutex_
+           || req.path == "/api/blocks"          // full-chain walk under state_mutex_
+           // Security review P3 (2026-11-12): same cost class as derive_matrix
+           // — a full 7-tier key derivation plus proof generation/verification
+           // on the shared zk_matrix_ per unauthenticated POST.
+           || req.path == "/api/zk/proof_of_life"  // 7-tier derive + PoL proof burn
+           || req.path == "/api/crypto/pq_verify"; // 4x WOTS verify + timing oracle
+}
+
+// Public binary surface pass (2026-11-12): a third class — endpoints that
+// return key material, hardware identity or other attacker-relevant recon,
+// or that burn CPU on a caller-supplied knob. The token gate on the two
+// classes above is fail-closed; this list is fail-closed with it.
+bool HttpServer::is_sensitive_endpoint(const HttpRequest &req) noexcept {
+    return req.path == "/api/crypto/lab"           // returns WIF private keys from a seed
+           || req.path == "/api/crypto/canonical"  // dumps vectors + hardware_uuid
+           || req.path == "/api/zk/derive_matrix"  // returns SpendingKey material
+           || req.path == "/api/zk/recover_shamir" // shard demo returns the secret
+           || req.path == "/api/telemetry/rdtsc"   // primitive-timing recon + CPU burn
+           || req.path == "/api/vault/memory";     // arena fingerprint + hw_uuid
 }
 
 // Length-and-byte constant-time comparison; the loop always runs over the
@@ -1080,15 +1131,82 @@ HttpResponse HttpServer::handle_status(const HttpRequest&) {
 
 // ── GET /api/blocks ──────────────────────────────────────────────────────────
 
-HttpResponse HttpServer::handle_blocks(const HttpRequest&) {
+HttpResponse HttpServer::handle_blocks(const HttpRequest &req) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     uint64_t height = store_.chain_height();
 
+    // Public binary surface pass (2026-11-12): the response is bounded by
+    // the query. `?height=H` answers a single block; `?last=N` the chain
+    // tail. The unbounded walk from height 0 — O(chain) full-frame hashing
+    // plus a multi-MB response under state_mutex_ — is gone; the tail cap
+    // bounds the work even for a token holder.
+    static constexpr uint64_t kDefaultLastBlocks = 256;
+    static constexpr uint64_t kMaxLastBlocks = 4096;
+    static constexpr uint64_t kAllBlocks = UINT64_MAX;
+    uint64_t last = kDefaultLastBlocks;
+    uint64_t single = kAllBlocks;
+    {
+        const std::string &q = req.query;
+        size_t pos = 0;
+        while (pos < q.size()) {
+            size_t amp = q.find('&', pos);
+            if (amp == std::string::npos)
+                amp = q.size();
+            std::string_view kv = std::string_view(q).substr(pos, amp - pos);
+            pos = amp + 1;
+            const size_t eq = kv.find('=');
+            if (eq == std::string::npos)
+                continue;
+            const std::string_view key = kv.substr(0, eq);
+            const std::string_view val = kv.substr(eq + 1);
+            // Bounded numeric parse: decimal digits only, at most 19.
+            if (val.empty() || val.size() > 19)
+                continue;
+            uint64_t v = 0;
+            bool digits = true;
+            for (const char c : val) {
+                if (c < '0' || c > '9') {
+                    digits = false;
+                    break;
+                }
+                v = v * 10 + static_cast<uint64_t>(c - '0');
+            }
+            if (!digits)
+                continue;
+            if (key == "height")
+                single = v;
+            else if (key == "last")
+                last = v;
+        }
+    }
+
+    uint64_t begin = 0;
+    uint64_t end = height;
+    if (single != kAllBlocks) {
+        if (single >= height)
+            return HttpResponse::error(404, "block not found");
+        begin = single;
+        end = single + 1;
+    } else {
+        if (last > kMaxLastBlocks)
+            last = kMaxLastBlocks;
+        if (height > last)
+            begin = height - last;
+    }
+
     std::ostringstream oss;
     oss << "{\"blocks\":[";
-    for (uint64_t h = 0; h < height; ++h) {
+    // Security review P2 (2026-11-12): comma on a `first` flag, not on
+    // `h + 1 < height` — in single-block mode end == single + 1, so the old
+    // condition emitted a trailing comma for every non-tip point-lookup
+    // (malformed JSON), and a missing block in the loop would do the same.
+    bool first_block = true;
+    for (uint64_t h = begin; h < end; ++h) {
         auto* raw = store_.get_block(h);
         if (!raw) continue;
+        if (!first_block)
+            oss << ",";
+        first_block = false;
         vx::blockchain::BlockView v{std::span<const uint8_t, 65536>(
             reinterpret_cast<const uint8_t*>(raw), 65536)};
         const auto& hdr = v.header();
@@ -1145,7 +1263,6 @@ HttpResponse HttpServer::handle_blocks(const HttpRequest&) {
                 << "}";
         }
         oss << "]}";
-        if (h + 1 < height) oss << ",";
     }
     oss << "]}";
     return HttpResponse::json(200, oss.str());
@@ -1872,6 +1989,13 @@ HttpResponse HttpServer::handle_crypto_lab(const HttpRequest& req) {
     }
 
     int rounds = extract_num("rounds", 1000);
+    // Public binary surface pass (2026-11-12): the attractor is O(rounds);
+    // a caller-supplied uint32 burn (4294967295) is a CPU bomb. Clamp to
+    // the honest demo range.
+    if (rounds < 1)
+        rounds = 1000;
+    if (rounds > 8192)
+        rounds = 8192;
     bool sac_test = extract_bool("sac_test");
 
     auto attr = vx::math::VortexAttractor::run(seed, static_cast<uint32_t>(rounds), true);

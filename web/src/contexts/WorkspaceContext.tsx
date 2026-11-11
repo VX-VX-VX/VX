@@ -283,19 +283,17 @@ export const WorkspaceProvider: React.FC<{ children: ReactNode }> = ({ children 
   const fetchBlock = useCallback(async (height: number): Promise<Block | null> => {
     const cached = blocks.find(b => b.height === height)
     if (cached) return cached
-    // Blocks endpoint already returns all blocks; a point lookup is a
-    // refresh + search. Returns null when the node does not have the height.
+    // Public binary surface pass (2026-11-12): /api/blocks is a bounded
+    // tail window now (default 256), so a point lookup past the tail must
+    // use the `?height=H` single-block form. Returns null when the node
+    // does not have the height (404) or the window missed it.
     try {
-      const data = await apiCall('/blocks')
-      const found: Block | undefined = data.blocks.find((b: Block) => b.height === height)
-      if (checkAndMarkDirty('blocks', data.blocks)) {
-        setBlocks(data.blocks)
-      }
-      return found ?? null
+      const data = await apiCall(`/blocks?height=${height}`)
+      return (data.blocks?.[0] as Block | undefined) ?? null
     } catch {
       return null
     }
-  }, [apiCall, blocks, checkAndMarkDirty])
+  }, [apiCall, blocks])
 
   const executeTransfer = useCallback(async (sender: string, receiver: string, amount: number) => {
     const data = await apiCall('/transfer', {

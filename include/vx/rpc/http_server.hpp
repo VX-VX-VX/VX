@@ -38,6 +38,8 @@ namespace vx::rpc {
 struct HttpRequest {
     std::string method;
     std::string path;
+    std::string query; // everything after '?' in the request target; the gate lists compare `path`
+                       // only, so a query string can never bypass them
     std::string body;
     std::unordered_map<std::string, std::string> headers;
 };
@@ -332,11 +334,15 @@ private:
     // Mutating endpoints (see is_mutating_endpoint) require the auth token,
     // read ONCE at construction from VX_RPC_TOKEN or VX_RPC_TOKEN_FILE.
     // Resource-heavy endpoints (see is_resource_heavy_endpoint) share the
-    // same fail-closed gate. Fail closed: no token configured -> every
-    // endpoint in either class answers 401; plain read-only endpoints stay
-    // open. The comparison is constant-time.
+    // same fail-closed gate, as do sensitive endpoints (see
+    // is_sensitive_endpoint): key-material oracles and fingerprint
+    // disclosures that the public binary surface must not answer
+    // unauthenticated. Fail closed: no token configured -> every endpoint
+    // in either class answers 401; plain read-only endpoints stay open.
+    // The comparison is constant-time.
     static bool is_mutating_endpoint(const HttpRequest& req) noexcept;
     static bool is_resource_heavy_endpoint(const HttpRequest& req) noexcept;
+    static bool is_sensitive_endpoint(const HttpRequest &req) noexcept;
     static bool constant_time_equal(std::string_view a, std::string_view b) noexcept;
     bool token_ok(const HttpRequest& req) const;
 
