@@ -379,7 +379,39 @@ HttpServer::try_apply_remote_frame(const uint8_t *bytes, const std::string &peer
         if (peer_parked >= kMaxParkedFramesPerPeer)
             return RemoteApply::REFUSED;
         if (parked_witness_frames_.size() >= kMaxParkedWitnessFrames) {
-            parked_witness_frames_.erase(parked_witness_frames_.begin());
+            // Review follow-up (2026-11-12): evict from the MOST
+            // represented source IP, never blindly oldest-global — a
+            // flood from >=4 distinct IPs can fill the whole global cap
+            // fairly and then let new arrivals evict under-represented
+            // peers' frames. Evicting the oldest frame of the max-count
+            // IP guarantees eviction always bites the biggest holder;
+            // a peer below the evicted IP's count never loses a frame.
+            std::map<std::string, size_t> ip_counts;
+            for (const auto &p : parked_witness_frames_) {
+                std::string pip = p.peer_label;
+                const auto pc = pip.rfind(':');
+                if (pc != std::string::npos)
+                    pip.resize(pc);
+                ++ip_counts[pip];
+            }
+            std::string worst_ip = ip_counts.begin()->first;
+            size_t worst_count = ip_counts.begin()->second;
+            for (const auto &e : ip_counts)
+                if (e.second > worst_count) {
+                    worst_count = e.second;
+                    worst_ip = e.first;
+                }
+            for (auto it = parked_witness_frames_.begin(); it != parked_witness_frames_.end();
+                 ++it) {
+                std::string pip = it->peer_label;
+                const auto pc = pip.rfind(':');
+                if (pc != std::string::npos)
+                    pip.resize(pc);
+                if (pip == worst_ip) {
+                    parked_witness_frames_.erase(it);
+                    break; // oldest frame of the worst IP (vector order)
+                }
+            }
         }
         ParkedFrame pf;
         std::memcpy(pf.bytes.data(), bytes, 65536);
@@ -398,19 +430,21 @@ HttpServer::try_apply_remote_frame(const uint8_t *bytes, const std::string &peer
         // must not blame the frame's original deliverer. Between park and
         // retry the witness registry changed — the refusal reflects the
         // frame's PROPOSER (or a poisoned witness entry), not the relayer,
-        // and in gossip the relayer is usually honest. Strike only on live
-        // first delivery (that label chose to send this frame now); a
-        // retry drops silently. The strike is BOTH the score bump and the
-        // ban-channel report_withhold (3 x 34 crosses the ban threshold) —
-        // the whole block is gated, not just the diagnostics.
+        // and in gossip the relayer is usually honest. The BAN channel
+        // (report_withhold, 3 x 34 crosses the threshold) fires only on
+        // live first delivery. The score map still records the retry —
+        // review follow-up: the path must not be free — but as
+        // diagnostics only: a score-map entry never bans by itself, so an
+        // honest relayer cannot be muted by a poisoned retry, while
+        // sustained laundering stays visible and bounded by the map cap.
+        ++witness_withhold_score_[peer];
+        // Security review P2-4 (2.11 third checkbox): the map is bounded
+        // - churned labels must not accumulate forever. Drop the first
+        // entry (key order) when full; an attacker buying evictions
+        // only churns other attackers' entries.
+        if (witness_withhold_score_.size() > kMaxWithholdScoreEntries)
+            witness_withhold_score_.erase(witness_withhold_score_.begin());
         if (!from_park) {
-            ++witness_withhold_score_[peer];
-            // Security review P2-4 (2.11 third checkbox): the map is bounded
-            // - churned labels must not accumulate forever. Drop the first
-            // entry (key order) when full; an attacker buying evictions
-            // only churns other attackers' entries.
-            if (witness_withhold_score_.size() > kMaxWithholdScoreEntries)
-                witness_withhold_score_.erase(witness_withhold_score_.begin());
             // BACKLOG 2.11 third checkbox: the counter now has a consumer -
             // three strikes (34 each) cross the SwarmNode ban threshold.
             swarm_node_->report_withhold(peer, 34);

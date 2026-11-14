@@ -1945,9 +1945,21 @@ amends the list as needed.
   nil. Same-day companion fixes from the same review: parked-retry
   MISMATCH no longer strikes the frame's original deliverer (the witness
   registry changed between park and retry — blame the proposer, not the
-  honest relayer), and the witness park gained a per-peer cap (8 of 32)
-  so one peer cannot evict frames other peers delivered by flooding
-  cheap junk into the pre-PoGW park window.
+  honest relayer; the ban channel is live-delivery-only, the score map
+  keeps recording retries as bounded diagnostics so laundering is not
+  free), and the witness park gained a per-source-IP cap (8 of 32) with
+  eviction-from-the-most-represented-IP so a flood of distinct IPs
+  cannot evict under-represented peers' frames. Second review round
+  follow-ups also landed: registration refuses walk-unreachable
+  transitions (from_window >= PQ_MAX_CERT_CHAIN_DEPTH; replay skips
+  them), which bounds the transitions one key tree can occupy to the
+  walk-reachable set of 16. Accepted residual: the global 50000-cert
+  cap is still a theoretical rollover denial — but filling it requires
+  50000 GENUINE signatures from attacker-owned trees, each burning a
+  one-shot leaf (16 per window), i.e. ~3125 full XMSS key generations;
+  the registry is a rebuildable cache and GET_CERTS backfill re-delivers
+  refused certs, so the attack is economically prohibitive, not
+  structurally impossible.
 - [ ] P3: RingPipelineThroughputNoAllocs floor is TSan-lane flaky — the
   500k ops/s throughput assertion lands ~9% short under ThreadSanitizer
   instrumentation on the dev machine (452-458k observed; reproduced on

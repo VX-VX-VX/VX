@@ -254,14 +254,21 @@ int main() {
         std::cout << "  [4] chain gap caps the walk at the last unambiguous link OK\n";
     }
 
-    // ── 5. Depth cap: the walk stops at PQ_MAX_CERT_CHAIN_DEPTH ───────────
+    // ── 5. Depth: admission bounds chains to the walk-reachable set ───────
+    // (review follow-up 2026-11-14: a transition AT the depth cap can never
+    // be looked up — the walk performs at most PQ_MAX_CERT_CHAIN_DEPTH
+    // lookups, windows 0..15 — so registration refuses it. The depth
+    // guarantee moved from walk-side truncation to admission-side bound;
+    // the walk loop keeps its own cap as defense in depth.)
     {
         const auto master = pseudo_bytes("VX_WIRING_DEPTH_V1", 6);
         const auto pub_seed = pub_seed_from_sk(master);
         const auto sender = make_sender("VX_WIRING_DEPTH_SENDER_V1");
-        // PQ_MAX_CERT_CHAIN_DEPTH + 1 honest hops: the walk must truncate.
-        for (uint32_t w = 0; w <= PQ_MAX_CERT_CHAIN_DEPTH; ++w)
+        // Exactly the walk-reachable hops: from_window 0..DEPTH-1.
+        for (uint32_t w = 0; w + 1 <= PQ_MAX_CERT_CHAIN_DEPTH; ++w)
             assert(register_chain_hop(master, pub_seed, sender, w));
+        // A walk-unreachable transition is refused at admission.
+        assert(!register_chain_hop(master, pub_seed, sender, PQ_MAX_CERT_CHAIN_DEPTH));
         const auto anchor = xmss_root_tree(master, pub_seed, 0);
         const auto capped = xmss_root_tree(master, pub_seed, PQ_MAX_CERT_CHAIN_DEPTH);
         std::array<uint8_t, 32> out{};
@@ -269,8 +276,8 @@ int main() {
         assert(PqWitnessRegistry::instance().advance_root_chain(sender.data(), anchor, out, win));
         assert(win == PQ_MAX_CERT_CHAIN_DEPTH);
         assert(roots_equal(out, capped));
-        std::cout << "  [5] depth cap truncates the walk at " << PQ_MAX_CERT_CHAIN_DEPTH
-                  << " hops OK\n";
+        std::cout << "  [5] admission caps chains at " << PQ_MAX_CERT_CHAIN_DEPTH
+                  << " reachable hops OK\n";
     }
 
     // ── 6. Certificates never flip the PQ sender class ─────────────────────

@@ -987,6 +987,13 @@ bool PqWitnessRegistry::register_rollover_cert(const PqRolloverCert &cert, bool 
     // hash work.
     if (cert.to_window != cert.from_window + 1)
         return false;
+    // Review follow-up (2026-11-12): a transition at or beyond the walk's
+    // maximum depth can never be part of any advance_root_chain walk
+    // (the walk starts at window 0 and hops at most PQ_MAX_CERT_CHAIN_DEPTH
+    // times), so refusing it here bounds the transitions one key tree can
+    // occupy to the walk-reachable set.
+    if (cert.from_window >= PQ_MAX_CERT_CHAIN_DEPTH)
+        return false;
     // Full cryptographic verification: leaf 15 of from_window, the
     // certifying root equals old_root, the transported commitment matches
     // the witness content, and the WOTS+/XMSS chain verifies over the
@@ -1196,6 +1203,12 @@ void PqWitnessRegistry::attach_durable_cert_log(const std::string &path) {
         std::memcpy(&c.witness, rec + 122, sizeof(PqSignatureWitness));
         if (c.to_window != c.from_window + 1)
             break; // policy -> stop
+        // Same walk-reachability bound as the live path. SKIP (not break):
+        // a pre-fix sidecar may legitimately contain walk-unreachable
+        // transitions (the old registration had no depth cap), and breaking
+        // would brick the rest of an honest sidecar — the P2-1 lesson.
+        if (c.from_window >= PQ_MAX_CERT_CHAIN_DEPTH)
+            continue; // walk-unreachable: dead weight, not a poisoning
         if (!pq_verify_rollover(c.old_root, c.from_window, c.to_window, c.new_root, c.witness))
             break; // crypto -> stop
         // Same signed-transition keying as the live path (security review
