@@ -668,6 +668,11 @@ TEST(VortexSwarmP2PTest, HandshakeV2AnnounceRecordedAndAddrsIngested) {
     std::array<uint8_t, 32> srv_id{};
     srv_id[0] = 0xAA;
     server.set_node_id_for_test(srv_id);
+    // PEX SSRF gate (2026-11-14): discovery candidates are loopback in
+    // this in-process topology — the test opts in explicitly (production
+    // default is OFF; the env switch VX_P2P_ALLOW_LOOPBACK covers the
+    // three-node script).
+    server.set_loopback_candidates_allowed_for_test(true);
     ASSERT_TRUE(server.bind_p2p_listener(port));
     server.start();
 
@@ -893,6 +898,10 @@ TEST(VortexSwarmP2PTest, ThreeNodeDiscoveryViaAddrs) {
     node_a.set_node_id_for_test(ida);
     node_b.set_node_id_for_test(idb);
     node_c.set_node_id_for_test(idc);
+    // PEX SSRF gate: loopback candidates opt-in (in-process topology).
+    node_a.set_loopback_candidates_allowed_for_test(true);
+    node_b.set_loopback_candidates_allowed_for_test(true);
+    node_c.set_loopback_candidates_allowed_for_test(true);
     ASSERT_TRUE(node_b.bind_p2p_listener(port_b));
     ASSERT_TRUE(node_c.bind_p2p_listener(port_c));
     node_b.start();
@@ -929,6 +938,7 @@ TEST(VortexSwarmP2PTest, ThreeNodeDiscoveryViaAddrs) {
 
 TEST(VortexSwarmP2PTest, CandidateStoreBoundedAndDeduped) {
     vx::net::SwarmNode node;
+    node.set_loopback_candidates_allowed_for_test(true);
     const uint32_t loop_net = htonl(INADDR_LOOPBACK);
     // Distinct ports: 128 fill the store.
     for (uint16_t i = 1; i <= 128; ++i)
@@ -950,11 +960,52 @@ TEST(VortexSwarmP2PTest, CandidateStoreBoundedAndDeduped) {
 
 TEST(VortexSwarmP2PTest, SeedHostResolutionFeedsCandidates) {
     vx::net::SwarmNode node;
+    // PEX SSRF gate: a seed host resolving to loopback is an OPERATOR
+    // choice (--seed) but flows through add_addr_candidate — the test
+    // topology opts in; production default refuses it.
+    node.set_loopback_candidates_allowed_for_test(true);
     // "localhost" resolves to 127.0.0.1 on any sane system.
     EXPECT_EQ(node.add_seed_host("localhost:19999"), 1u);
     EXPECT_EQ(node.addr_candidate_count(), 1u);
     // A host that cannot resolve is a warning, never a failure.
     EXPECT_EQ(node.add_seed_host("vx-nonexistent-host.invalid"), 0u);
     EXPECT_EQ(node.addr_candidate_count(), 1u);
+    node.emergency_stop();
+}
+
+// PEX SSRF gate (2026-11-14): peer-supplied candidates must not aim the
+// dial budget at infrastructure. The whole loopback /8 and link-local
+// 169.254/16 are refused by default; operator-supplied (--seed) and the
+// explicit opt-in (VX_P2P_ALLOW_LOOPBACK testnet switch) are the only
+// ways a loopback candidate enters the store.
+TEST(VortexSwarmP2PTest, LoopbackCandidatesGatedByDefault) {
+    vx::net::SwarmNode node;
+    const uint32_t loop_net = htonl(INADDR_LOOPBACK);            // 127.0.0.1
+    const uint32_t loop8_net = htonl(0x7F000001u | (77u << 24)); // 127.77.0.1
+    const uint32_t link_local_net = htonl(0xA9FE0001u);          // 169.254.0.1
+    const uint32_t public_net = htonl(0xC0000201u);              // 192.0.2.1
+
+    // Default: every infrastructure target refused for peer-supplied
+    // candidates — the exact-127.0.0.1 shape AND the rest of the /8 AND
+    // link-local (the automated-review follow-up: a bare 127.0.0.1
+    // denylist was incomplete).
+    EXPECT_FALSE(node.add_addr_candidate(loop_net, 12345));
+    EXPECT_FALSE(node.add_addr_candidate(loop8_net, 12345));
+    EXPECT_FALSE(node.add_addr_candidate(link_local_net, 12345));
+    EXPECT_EQ(node.addr_candidate_count(), 0u);
+    // Public targets stay queueable.
+    EXPECT_TRUE(node.add_addr_candidate(public_net, 12345));
+    EXPECT_EQ(node.addr_candidate_count(), 1u);
+
+    // Operator-supplied (--seed) bypasses the gate: the operator chose it.
+    EXPECT_TRUE(node.add_addr_candidate(loop_net, 12346, /*operator_supplied=*/true));
+    EXPECT_EQ(node.addr_candidate_count(), 2u);
+
+    // The testnet switch re-opens loopback for peer-supplied candidates.
+    node.set_loopback_candidates_allowed_for_test(true);
+    EXPECT_TRUE(node.add_addr_candidate(loop_net, 12347));
+    // Link-local stays refused even under the loopback switch: the env
+    // name says LOOPBACK, and the switch must not widen beyond its name.
+    EXPECT_FALSE(node.add_addr_candidate(link_local_net, 12347));
     node.emergency_stop();
 }

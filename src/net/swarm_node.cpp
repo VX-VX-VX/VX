@@ -206,6 +206,17 @@ bool PeerInfo::operator<(const PeerInfo &other) const {
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
 SwarmNode::SwarmNode() {
+    // PEX residual (public binary surface pass, 2026-11-14): discovery
+    // candidates pointing at loopback are a localhost-SSRF/probe
+    // primitive on a real network (a peer can aim our bounded dial
+    // budget at our own RPC port). Default OFF; the three-node loopback
+    // testnet opts in via the environment. Operator-supplied --peer
+    // endpoints never pass through add_addr_candidate and stay allowed
+    // unconditionally.
+    loopback_candidates_allowed_ = [] {
+        const char *e = ::getenv("VX_P2P_ALLOW_LOOPBACK");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
     add_loopback_peer();
 }
 
@@ -1258,7 +1269,7 @@ void SwarmNode::load_or_create_node_id(const std::string &data_dir) {
               << "); running identityless this session\n";
 }
 
-bool SwarmNode::add_addr_candidate(uint32_t ip_net, uint16_t port) {
+bool SwarmNode::add_addr_candidate(uint32_t ip_net, uint16_t port, bool operator_supplied) {
     if (port == 0)
         return false;
     // Never a self-candidate: dialing ourselves is filtered at handshake
@@ -1277,6 +1288,26 @@ bool SwarmNode::add_addr_candidate(uint32_t ip_net, uint16_t port) {
     // bind_p2p_listener (see BACKLOG "public binary surface pass").
     const uint32_t ip_host = ntohl(ip_net);
     if (ip_host == INADDR_ANY || (ip_host >> 24) == 224 || (ip_host >> 24) == 255)
+        return false;
+    // PEX residual (2026-11-14, review follow-up): peer-supplied
+    // candidates must not aim the dial budget at infrastructure — the
+    // whole loopback /8 (not just 127.0.0.1) and the link-local
+    // 169.254/16 range are refused unless VX_P2P_ALLOW_LOOPBACK=1 (the
+    // loopback testnet opts in). Operator --peer endpoints reach
+    // connect_peer_tcp directly and operator --seed hosts pass
+    // operator_supplied=true — the gate is a defense against PEER-supplied
+    // targets only. RFC1918 private ranges ride a future default-off
+    // policy switch for public-network deployments (LAN meshes dial them
+    // legitimately today).
+    const bool is_loopback = (ip_host >> 24) == 127;
+    const bool is_link_local = (ip_host & 0xFFFF0000u) == 0xA9FE0000u;
+    // The env switch re-opens LOOPBACK ONLY, and only for peer-supplied
+    // candidates. Operator-supplied targets (--seed) bypass the gate
+    // entirely — the operator chose them. Link-local (169.254/16 — home
+    // of the cloud-metadata endpoint) stays refused for peer-supplied
+    // candidates unconditionally: no legitimate discovery target lives
+    // there, and the switch's name must not widen its meaning.
+    if (!operator_supplied && ((is_loopback && !loopback_candidates_allowed_) || is_link_local))
         return false;
     std::lock_guard<std::mutex> lock(peers_mutex_);
     for (const auto &c : addr_candidates_)
@@ -1328,7 +1359,7 @@ size_t SwarmNode::add_seed_host(const std::string &host_or_hostport) {
     size_t queued = 0;
     for (addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
         auto *sa = reinterpret_cast<sockaddr_in *>(ai->ai_addr);
-        if (add_addr_candidate(sa->sin_addr.s_addr, port))
+        if (add_addr_candidate(sa->sin_addr.s_addr, port, /*operator_supplied=*/true))
             ++queued;
     }
     ::freeaddrinfo(res);

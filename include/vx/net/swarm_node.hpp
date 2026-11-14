@@ -409,7 +409,9 @@ public:
     // evicted). Callers never cause a dial directly: the health loop dials
     // at most ONE candidate per 5 s tick and only while connected peers
     // are below the discovery floor.
-    bool add_addr_candidate(uint32_t ip_net, uint16_t port);
+    // operator_supplied=true marks operator configuration (--seed hosts):
+    // the loopback gate is a defense against PEER-supplied targets only.
+    bool add_addr_candidate(uint32_t ip_net, uint16_t port, bool operator_supplied = false);
 
     // Test/diagnostic: current candidate count.
     size_t addr_candidate_count() const;
@@ -467,7 +469,20 @@ private:
 
     // The endpoint advertised to peers. ip stays 0 when unbound.
     uint32_t self_listen_ip_ = 0;
+    // PEX residual (2026-11-14): discovery-supplied loopback candidates
+    // are refused unless VX_P2P_ALLOW_LOOPBACK=1 (localhost-SSRF gate;
+    // the loopback testnet opts in). Operator --peer dials bypass
+    // add_addr_candidate entirely.
+    bool loopback_candidates_allowed_ = false;
 
+public:
+    // Test hook: opt the node into loopback discovery candidates without
+    // touching the process environment (the loopback testnet topology).
+    void set_loopback_candidates_allowed_for_test(bool allowed) noexcept {
+        loopback_candidates_allowed_ = allowed;
+    }
+
+private:
     // Handshake/ADDRS helpers shared by both connection loops.
     void send_self_announce(int fd);
     void send_addrs_to(int fd, const std::string &exclude_label);

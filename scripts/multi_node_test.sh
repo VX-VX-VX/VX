@@ -17,6 +17,9 @@ set -u
 
 BUILD_DIR="${1:-build}"
 NODE="$BUILD_DIR/vx_node"
+# PEX SSRF gate (2026-11-14): the loopback testnet topology opts in —
+# discovery candidates on 127.0.0.1 are refused by default otherwise.
+export VX_P2P_ALLOW_LOOPBACK=1
 DATA_ROOT="$(mktemp -d /tmp/vx_multinode.XXXXXX)"
 
 RPC_A=18088; RPC_B=18089; RPC_C=18090

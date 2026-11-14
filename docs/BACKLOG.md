@@ -2115,13 +2115,23 @@ amends the list as needed.
   (commit_utc/make_release/multi_node_test/opsec_scan) talk to
   localhost only. The surface pass is fully closed.
   Related residuals discovered with peer discovery (2026-11-11):
-  loopback acceptance in `add_addr_candidate` is a
-  localhost-SSRF/probe primitive on a real network and must gain a
-  default-off switch together with real-interface advertisement in
-  `bind_p2p_listener` (testnet keeps loopback: the three-node topology
-  depends on it); strike/withhold keying is still by connection address,
-  not node_id, and no durable banlist exists (designed-but-unwired - see
-  the honest gap note in swarm_node.hpp).
+  ~~loopback acceptance in `add_addr_candidate` is a localhost-SSRF/probe
+  primitive~~ **SSRF GATE CLOSED (2026-11-14, same day as the
+  automated-review follow-up)**: peer-supplied candidates must not aim
+  the dial budget at infrastructure - the whole loopback /8 is refused
+  by default (env VX_P2P_ALLOW_LOOPBACK=1 re-opens it for the three-node
+  loopback testnet, which sets it in multi_node_test.sh), and link-local
+  169.254/16 - the cloud-metadata neighborhood - stays refused for
+  peer-supplied candidates UNCONDITIONALLY (the switch re-opens loopback
+  only; its name does not widen). Operator configuration (--peer via
+  connect_peer_tcp, --seed via add_addr_candidate's operator_supplied
+  flag) bypasses the gate: the operator chose it. Regression test
+  LoopbackCandidatesGatedByDefault pins all three behaviors. Still owed:
+  real-interface advertisement in `bind_p2p_listener` (the node still
+  advertises what it bound - loopback today; a broader --bind rides its
+  own item); and strike/withhold keying is still by connection address,
+  not node_id, with no durable banlist (designed-but-unwired - see
+  the honest gap note in swarm_node.hpp) - the NEXT PEX residual.
 - Owner-decision items (NOT beta blockers, tracked in the Q2-Q4
   directive): the 2.12(e) Guard decision, ord_P(7) ECM analysis, the
   CRT-collision formal proof. These gate the NEXT major release, not
