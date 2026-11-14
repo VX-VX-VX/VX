@@ -20,4 +20,22 @@ std::array<uint8_t, 64> sha3_512(const uint8_t *data, size_t len);
 std::vector<uint8_t> shake128(const uint8_t *data, size_t len, size_t out_len);
 std::vector<uint8_t> shake256(const uint8_t *data, size_t len, size_t out_len);
 
+// Streaming SHAKE/SHA3 absorb+squeeze with persistent state — the shape
+// ML-KEM's sampleNTT/prf calls need (continuous XOF streams over an
+// incremental absorb).
+class Shaker {
+public:
+    // rate = block size in bytes; pad_byte = 0x06 (SHA3) or 0x1f (SHAKE).
+    Shaker(size_t rate, uint8_t pad_byte) noexcept;
+    void absorb(const uint8_t *data, size_t len) noexcept;
+    void squeeze(uint8_t *out, size_t out_len) noexcept;
+
+private:
+    uint64_t state_[25];
+    size_t pos_ = 0; // bytes absorbed into the current block
+    size_t rate_;
+    uint8_t pad_byte_;
+    bool squeezing_ = false;
+};
+
 } // namespace vx::crypto::fips202

@@ -100,8 +100,54 @@ struct KeccakSponge {
 
 } // namespace
 
+// ── Streaming Shaker ────────────────────────────────────────────────────────
+
+Shaker::Shaker(size_t rate, uint8_t pad_byte) noexcept : rate_(rate), pad_byte_(pad_byte) {
+    std::memset(state_, 0, sizeof(state_));
+}
+
+void Shaker::absorb(const uint8_t *data, size_t len) noexcept {
+    if (squeezing_)
+        return; // absorbing after squeeze is a caller bug; keep the stream
+    while (len) {
+        const size_t take = (rate_ - pos_ < len) ? rate_ - pos_ : len;
+        for (size_t i = 0; i < take; ++i)
+            state_[(pos_ + i) / 8] ^= static_cast<uint64_t>(data[i]) << (8 * ((pos_ + i) % 8));
+        pos_ += take;
+        data += take;
+        len -= take;
+        if (pos_ == rate_) {
+            keccak_f1600(state_);
+            pos_ = 0;
+        }
+    }
+}
+
+void Shaker::squeeze(uint8_t *out, size_t out_len) noexcept {
+    if (!squeezing_) {
+        // FIPS padding: 10*1 with the domain byte at the current position.
+        state_[pos_ / 8] ^= static_cast<uint64_t>(pad_byte_) << (8 * (pos_ % 8));
+        state_[(rate_ - 1) / 8] ^= 0x80ULL << (8 * ((rate_ - 1) % 8));
+        keccak_f1600(state_);
+        pos_ = 0;
+        squeezing_ = true;
+    }
+    size_t off = 0;
+    while (off < out_len) {
+        const size_t take = (rate_ - pos_ < out_len - off) ? rate_ - pos_ : out_len - off;
+        for (size_t i = 0; i < take; ++i)
+            out[off + i] = static_cast<uint8_t>(state_[(pos_ + i) / 8] >> (8 * ((pos_ + i) % 8)));
+        pos_ += take;
+        off += take;
+        if (pos_ == rate_) {
+            keccak_f1600(state_);
+            pos_ = 0;
+        }
+    }
+}
+
 std::array<uint8_t, 32> sha3_256(const uint8_t *data, size_t len) {
-    KeccakSponge s{.rate = 136, .pad_byte = 0x06};
+    Shaker s(136, 0x06);
     s.absorb(data, len);
     std::array<uint8_t, 32> out{};
     s.squeeze(out.data(), out.size());
@@ -109,7 +155,7 @@ std::array<uint8_t, 32> sha3_256(const uint8_t *data, size_t len) {
 }
 
 std::array<uint8_t, 64> sha3_512(const uint8_t *data, size_t len) {
-    KeccakSponge s{.rate = 72, .pad_byte = 0x06};
+    Shaker s(72, 0x06);
     s.absorb(data, len);
     std::array<uint8_t, 64> out{};
     s.squeeze(out.data(), out.size());
@@ -117,7 +163,7 @@ std::array<uint8_t, 64> sha3_512(const uint8_t *data, size_t len) {
 }
 
 std::vector<uint8_t> shake128(const uint8_t *data, size_t len, size_t out_len) {
-    KeccakSponge s{.rate = 168, .pad_byte = 0x1f};
+    Shaker s(168, 0x1f);
     s.absorb(data, len);
     std::vector<uint8_t> out(out_len);
     s.squeeze(out.data(), out_len);
@@ -125,7 +171,7 @@ std::vector<uint8_t> shake128(const uint8_t *data, size_t len, size_t out_len) {
 }
 
 std::vector<uint8_t> shake256(const uint8_t *data, size_t len, size_t out_len) {
-    KeccakSponge s{.rate = 136, .pad_byte = 0x1f};
+    Shaker s(136, 0x1f);
     s.absorb(data, len);
     std::vector<uint8_t> out(out_len);
     s.squeeze(out.data(), out_len);

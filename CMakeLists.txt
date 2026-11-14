@@ -297,6 +297,27 @@ add_executable(test_fips202_kat tests/test_fips202_kat.cpp)
 target_link_libraries(test_fips202_kat PRIVATE vx_core vx_fips202 gtest gtest_main)
 add_test(NAME VortexFips202KatTest COMMAND test_fips202_kat)
 
+# ML-KEM-768 (FIPS 203) — the DKSAP stealth track's KEM, ACVP-KAT-gated.
+add_library(vx_mlkem STATIC src/crypto/ml_kem.cpp)
+target_link_libraries(vx_mlkem PUBLIC vx_core vx_fips202)
+add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)
+target_link_libraries(test_ml_kem_kat PRIVATE vx_core vx_mlkem gtest gtest_main)
+add_test(NAME VortexMlKem768KatTest COMMAND test_ml_kem_kat)
+
+# DKSAP-Galois stealth-nickname core (track 3/3).
+add_library(vx_dksap STATIC src/crypto/dksap.cpp)
+target_link_libraries(vx_dksap PUBLIC vx_core vx_mlkem)
+add_executable(test_dksap tests/test_dksap.cpp)
+target_link_libraries(test_dksap PRIVATE vx_core vx_dksap gtest gtest_main)
+add_test(NAME VortexDksapTest COMMAND test_dksap)
+
+# SGMT registration layer (nickname -> public keys directory).
+add_library(vx_dksap_sgmt STATIC src/crypto/dksap_sgmt.cpp)
+target_link_libraries(vx_dksap_sgmt PUBLIC vx_core vx_dksap)
+add_executable(test_dksap_sgmt tests/test_dksap_sgmt.cpp)
+target_link_libraries(test_dksap_sgmt PRIVATE vx_core vx_dksap_sgmt gtest gtest_main)
+add_test(NAME VortexDksapSgmtTest COMMAND test_dksap_sgmt)
+
 add_executable(test_rpc_auth tests/test_rpc_auth.cpp)
 target_link_libraries(test_rpc_auth PRIVATE vx_core gtest gtest_main)
 
