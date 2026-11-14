@@ -22,19 +22,21 @@
 
 namespace vx::crypto::dksap {
 
-inline constexpr size_t KEY_COMMIT_SIZE = 32; // the attractor commitments
-inline constexpr size_t KEM_PK_SIZE = 1184;   // ML-KEM-768 ek
-inline constexpr size_t KEM_SK_SIZE = 2400;   // ML-KEM-768 dk
-inline constexpr size_t KEM_CT_SIZE = 1088;   // ML-KEM-768 ct
+inline constexpr size_t T_COMMIT_SIZE = 384; // t̂ spend commitment (12-bit poly)
+inline constexpr size_t KEM_PK_SIZE = 1184;  // ML-KEM-768 ek
+inline constexpr size_t KEM_SK_SIZE = 2400;  // ML-KEM-768 dk
+inline constexpr size_t KEM_CT_SIZE = 1088;  // ML-KEM-768 ct
 
-// The public SGMT payload for a nickname: Kspend ‖ Kkem.
-// Review 2026-11-14 (external): the published Kview was DEAD — no
-// protocol step reads it — so it is no longer published (SKview keeps
-// one INTERNAL role: binding the KEM z). Kspend is a 32-byte attractor
-// commitment (the tx-integration layer pads it into the 42-byte
-// receiver field — not this core's job).
+// The public SGMT payload for a nickname: t̂_spend ‖ Kkem.
+// Variant A (external review, 2026-11-14): the spend commitment is an
+// R_q LWE public key t̂_spend = â∘ŝ_spend + ê_spend — the SAME additive
+// ring homomorphism Monero gets from EC points, transplanted to our
+// lattice ring. Blinding t̂_stealth = t̂_spend + â∘ŝ_mask + ê_mask is a
+// VALID public key of s_stealth = s_spend + s_mask — the one-time
+// secret the Citadel computes by ADDITION (no XOR, no leak), and the
+// network cannot link t̂_stealth back to t̂_spend (LWE hardness).
 struct PublicKeys {
-    std::array<uint8_t, KEY_COMMIT_SIZE> kspend{};
+    std::array<uint8_t, T_COMMIT_SIZE> t_spend{}; // NTT-domain commitment
     std::array<uint8_t, KEM_PK_SIZE> kkem{};
 };
 
@@ -51,16 +53,16 @@ void derive_account(const uint8_t master_sk[256], Account &out);
 
 // ── Sender side ─────────────────────────────────────────────────────────────
 
-// One stealth transfer envelope. The KEM ciphertext travels OUT OF BAND
-// (the witness sidecar) keyed by the transaction digest; the transaction
-// itself carries only the 42-byte Pstealth receiver and the 32-byte
-// ephemeral tag for the radar.
+// One stealth transfer envelope. The blinded one-time public key and the
+// KEM ciphertext travel OUT OF BAND (the witness sidecar, keyed by the
+// transaction digest); the transaction itself carries only the 32-byte
+// Pstealth tracker. (The 32-byte ephemeral tag from the first draft was
+// dropped — external review: ballast.)
 struct StealthTx {
-    std::array<uint8_t, KEY_COMMIT_SIZE> pstealth{}; // masked Kspend commitment
-    std::array<uint8_t, 32> ephem_tag{};             // radar tag
-    std::array<uint8_t, KEM_CT_SIZE> kem_ct{};       // witness sidecar
-    std::array<uint8_t, 32> tx_key{};                // sponge(ss ‖ tag) — the
-                                                     // shared traffic key
+    std::array<uint8_t, 32> pstealth{};             // sponge(t̂_stealth) tracker
+    std::array<uint8_t, T_COMMIT_SIZE> t_stealth{}; // blinded key — sidecar
+    std::array<uint8_t, KEM_CT_SIZE> kem_ct{};      // sidecar
+    std::array<uint8_t, 32> tx_key{};               // sponge(ss ‖ handle)
 };
 
 // Build the stealth envelope toward a nickname's public keys.
@@ -82,7 +84,7 @@ struct RadarHit {
 // per 580-tx block per watched nickname.
 // spend_sk == nullptr (the IVK-only radar) leaves sk_stealth zeroed.
 void radar_scan(const uint8_t kem_sk[KEM_SK_SIZE],
-                const std::array<uint8_t, KEY_COMMIT_SIZE> &kspend, const StealthTx &tx,
+                const std::array<uint8_t, T_COMMIT_SIZE> &t_spend, const StealthTx &tx,
                 bool spend_sk_present, const uint8_t sk_spend[32], RadarHit &out);
 
 } // namespace vx::crypto::dksap
