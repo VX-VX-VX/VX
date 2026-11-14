@@ -26,7 +26,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             git cmake ninja gcc clang openmp gmp openssl python gtest nodejs npm
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # was v4 mutable tag
       - name: Select compiler
         run: |
           if [ "${{ matrix.compiler }}" = "clang" ]; then
@@ -54,7 +54,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             git cmake ninja gcc gmp openssl python gtest
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # was v4 mutable tag
       - name: Configure with ASan + UBSan
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -74,7 +74,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             git cmake ninja clang openmp gmp openssl python gtest
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # was v4 mutable tag
       - name: Configure fuzzers
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -107,8 +107,8 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # was v4 mutable tag
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # was v4 mutable tag
         with:
           node-version: 22
           cache: npm

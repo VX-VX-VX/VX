@@ -2195,6 +2195,48 @@ lives in a path with a space).
   paths, key-import flow); register-scrubbing primitives beyond the
   volatile-store idiom (documented limits of what C++ can promise).
 
+## First Semgrep scan (2026-11-14, static-analysis track)
+
+First full-tree scan (semgrep 1.185.0, 12 of 19 rulesets scanned, merged
+SARIF): 875 findings -> triage 147 warning/error -> **11 REAL RISK +
+136 BENIGN** (per-finding classification by review agent with file:line
+read-outs; full ledger in the scan trail).
+
+- [x] **11 REAL RISK — GitHub Actions mutable tags (supply-chain)**:
+  every `uses:` in ci.yml/codeql.yml pinned by mutable tag; a re-tagged
+  upstream executes arbitrary code in CI. CLOSED same day: all 11 refs
+  pinned to full commit SHAs (checkout 11bd7190 / setup-node 49933ea5 /
+  codeql-action b7b84b63, resolved via git ls-remote refs/tags).
+- [x] **136 BENIGN** — per-file reasons: fixed-size limb/format
+  constants, static_assert'd layouts, guarded ternaries (the codebase
+  already avoids the underflows the rule hunts), attacker-reachable
+  normalizations (leaf_index mask, verifier's & (XMSS_LEAVES-1)), docs
+  loopback curl (documentation text).
+- [x] Hardening notes applied: pq_sign_message masks leaf_idx inside
+  the function (public-API uint32 driving auth-path indexing);
+  Content-Length clamped to the 64 KiB wire cap at parse time (a
+  hostile near-2^64 value could wrap parse_request's framing compare).
+- Residuals: p/yaml ruleset failed (semgrep exit 7 — coverage gap on
+  .github/*.yml); ruleset count is per-marketplace defaults — a curated
+  C++ ruleset selection for the vx core is an upgrade path; rerun after
+  every push (cheap, local).
+
+## Constant-time baseline (2026-11-14, ct-check / Trail of Bits)
+
+Static assembly audit of the crypto surface (analyzer on clang O2 +
+gcc Os, --warnings): every SECRET-touching comparison already goes
+through vx::core::ct_equal (leaf-cache tag, rollover binding digest,
+walked-root vs published root, witness digest, cocoon tag) — no
+early-exit comparison of secret material exists. The tool's FAIL
+verdict decomposes as: std::unordered_map bucket modulo on PUBLIC
+digests/roots (library behavior), FP division in PqSignTimings
+(wall-clock measurement, public), structurally-constant divisions the
+compiler cannot prove (base64 length math over a fixed-size payload),
+and structure-driven branches (loop bounds, public parse state).
+Verified benign per-function; no fix required. Standing rule: any new
+secret compare must use ct_equal, and the ct-check sweep reruns on the
+crypto surface after every signer change (clang O2 + gcc Os/O3).
+
 ## Owner priority table for the next release (audit of v0.0.16, 2026-11-05 late)
 
 Verdict: positive on the architecture changes; praise for freezing the

@@ -77,6 +77,11 @@ bool sensitive_body_path(std::string_view target) {
             return true;
     return false;
 }
+
+// The wire-request cap (semgrep-triage hardening, 2026-11-14): shared by
+// scan_headers (Content-Length clamp) and parse_request (recv-loop bound),
+// so the framing math and the flood bound cannot drift apart.
+constexpr size_t kMaxRequestBytes = 64 * 1024;
 } // namespace
 
 HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, uint16_t port,
@@ -664,6 +669,13 @@ void HttpServer::scan_headers(const std::string& raw, size_t header_end,
             cl_seen = true;
             content_length = static_cast<size_t>(
                 std::strtoull(raw.c_str() + ls + 15, nullptr, 10));
+            // Semgrep-triage hardening (2026-11-14): clamp the
+            // attacker-supplied Content-Length to the read-loop cap — a
+            // hostile near-2^64 value would wrap body_start +
+            // content_length in parse_request's framing compare and end
+            // the read early. Bounded here, the framing math stays exact.
+            if (content_length > kMaxRequestBytes)
+                content_length = kMaxRequestBytes;
         } else if (llen >= 14 &&
                    lower.compare(ls, 14, "authorization:") == 0) {
             ++auth_hits;
@@ -693,7 +705,6 @@ HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
     // arrives split - the old code truncated such bodies mid-field. Read
     // until the declared Content-Length is satisfied (64 KiB cap: every
     // legitimate request fits far below it, and the cap bounds a flood).
-    static constexpr size_t kMaxRequestBytes = 64 * 1024;
     std::string raw;
     raw.reserve(8192);
     char buf[8192];

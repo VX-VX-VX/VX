@@ -24,8 +24,8 @@ jobs:
       - name: Install toolchain
         run: |
           pacman -Syu --noconfirm --needed git cmake ninja gcc openmp gmp gtest
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # was v4 mutable tag
+      - uses: github/codeql-action/init@b7b84b636b4f90c9b31da1bc5f72bfadd5b31410 # was v3 mutable tag
         with:
           languages: cpp
       - name: Build C++ core
@@ -35,7 +35,7 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j"$(nproc)"
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@b7b84b636b4f90c9b31da1bc5f72bfadd5b31410 # was v3 mutable tag
         with:
           category: "/language:cpp"
 
@@ -46,10 +46,10 @@ jobs:
       security-events: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # was v4 mutable tag
+      - uses: github/codeql-action/init@b7b84b636b4f90c9b31da1bc5f72bfadd5b31410 # was v3 mutable tag
         with:
           languages: javascript-typescript
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@b7b84b636b4f90c9b31da1bc5f72bfadd5b31410 # was v3 mutable tag
         with:
           category: "/language:javascript-typescript"

@@ -457,6 +457,11 @@ PqSignatureWitness pq_sign_message(uint32_t leaf_idx, uint32_t subtree_index,
                                    const std::array<uint8_t, 32> &master_sk,
                                    const std::array<uint8_t, 32> &pub_seed,
                                    const std::array<uint8_t, 32> &msg) noexcept {
+    // Semgrep-triage hardening (2026-11-14): every current caller bounds
+    // leaf_idx to 0..XMSS_LEAVES-1, but this is a public API whose uint32
+    // parameter drives level[sib]/auth-path indexing — mask it inside the
+    // function so future misuse cannot read past the window arrays.
+    leaf_idx &= (XMSS_LEAVES - 1);
     PqSignatureWitness w;
     w.leaf_index = leaf_idx;
     w.subtree_index = subtree_index;
