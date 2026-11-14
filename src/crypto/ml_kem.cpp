@@ -480,7 +480,19 @@ void keygen(PublicKey &ek, SecretKey &dk) {
     keygen_derand(seed, ek, dk);
 }
 
-void encaps(const PublicKey &ek, const uint8_t m32[32], Ciphertext &ct, SharedSecret &ss) {
+bool encaps(const PublicKey &ek, const uint8_t m32[32], Ciphertext &ct, SharedSecret &ss) {
+    // Key validation (FIPS 203 §7.2 + automated review): decode each t̂
+    // polynomial and refuse keys with any coefficient ≥ q — a malformed
+    // or corrupted ek must not reach the encapsulation math.
+    {
+        Poly t;
+        for (unsigned i = 0; i < K; ++i) {
+            decode_poly12(ek.data() + 384 * i, t);
+            for (unsigned n = 0; n < N; ++n)
+                if (t[n] >= Q)
+                    return false;
+        }
+    }
     // (K, r) = G(m ‖ H(ek)) — H = SHA3-256 over the FULL encryption key.
     uint8_t in[64];
     std::memcpy(in, m32, 32);
@@ -495,6 +507,7 @@ void encaps(const PublicKey &ek, const uint8_t m32[32], Ciphertext &ct, SharedSe
     }
     kpke_encrypt(ek.data(), m32, g64 + 32, ct); // r = second half of G
     std::memcpy(ss.data(), g64, 32);            // K = first half
+    return true;
 }
 
 void decaps(const SecretKey &dk, const Ciphertext &ct, SharedSecret &ss) {
@@ -517,9 +530,14 @@ void decaps(const SecretKey &dk, const Ciphertext &ct, SharedSecret &ss) {
     Ciphertext ct2;
     kpke_encrypt(ek, m32, g64 + 32, ct2); // r' = second half of G(m' ‖ h)
 
-    // implicit rejection, constant-time: ss = K' XOR mask·(K' XOR J(z||ct))
+    // implicit rejection, constant-time: ss = K' when the re-encryption
+    // matches, J(z‖ct) otherwise. The mask is ARITHMETIC (automated
+    // review: a ternary can be lowered to a branch) with a value barrier
+    // so the compiler cannot reintroduce one.
     const bool ok = vx::core::ct_equal(ct2.data(), ct.data(), CT_SIZE);
-    const uint8_t mask = ok ? 0xFF : 0x00;
+    uint8_t mask =
+        static_cast<uint8_t>(~((static_cast<uint32_t>(ok) - 1) >> 8)); // ok=1→0xFF, ok=0→0x00
+    asm volatile("" : "+r"(mask));                                     // value barrier
     uint8_t jout[32];
     {
         uint8_t in[CT_SIZE + 32];

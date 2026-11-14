@@ -34,8 +34,10 @@ void keygen_derand(const uint8_t seed64[64], PublicKey &ek, SecretKey &dk);
 // Convenience: fills seed64 from the OS CSPRNG, then calls keygen_derand.
 void keygen(PublicKey &ek, SecretKey &dk);
 
-// FIPS 203 §7.2 Algorithm 16. Deterministic given (ek, m32).
-void encaps(const PublicKey &ek, const uint8_t m32[32], Ciphertext &ct, SharedSecret &ss);
+// FIPS 203 §7.2 Algorithm 16. Deterministic given (ek, m32). Returns
+// false (and touches nothing) when the ek fails the modulus check —
+// the public API reports the failure instead of silently proceeding.
+bool encaps(const PublicKey &ek, const uint8_t m32[32], Ciphertext &ct, SharedSecret &ss);
 
 // FIPS 203 §7.3 Algorithm 17 — implicit rejection: a corrupted ct yields
 // a pseudorandom ss derived from dk's z, never an error. Verification

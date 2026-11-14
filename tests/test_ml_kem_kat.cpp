@@ -148,14 +148,14 @@ TEST(VortexMlKem768Kat, RoundTripAndImplicitRejection) {
         m[i] = static_cast<uint8_t>(0xA0 + i);
     vx::crypto::mlkem::Ciphertext ct;
     vx::crypto::mlkem::SharedSecret ss1, ss2;
-    vx::crypto::mlkem::encaps(ek, m, ct, ss1);
+    ASSERT_TRUE(vx::crypto::mlkem::encaps(ek, m, ct, ss1));
     vx::crypto::mlkem::decaps(dk, ct, ss2);
     EXPECT_EQ(0, std::memcmp(ss1.data(), ss2.data(), ss1.size())) << "roundtrip";
 
     // Deterministic encaps: the same (ek, m) pair produces the same ct/ss.
     vx::crypto::mlkem::Ciphertext ct2;
     vx::crypto::mlkem::SharedSecret ss3;
-    vx::crypto::mlkem::encaps(ek, m, ct2, ss3);
+    ASSERT_TRUE(vx::crypto::mlkem::encaps(ek, m, ct2, ss3));
     EXPECT_EQ(0, std::memcmp(ct.data(), ct2.data(), ct.size()));
     EXPECT_EQ(0, std::memcmp(ss1.data(), ss3.data(), ss1.size()));
 
