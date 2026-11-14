@@ -290,6 +290,13 @@ target_link_libraries(test_retarget PRIVATE vx_core gtest gtest_main)
 
 # -- BACKLOG 0.10 (Stage C) test suites ---------------------------------------
 # RPC auth token gate (mutating endpoints fail closed without the token).
+# FIPS 202 (SHA3/SHAKE) — the ML-KEM track's Keccak primitive, KAT-gated.
+add_library(vx_fips202 STATIC src/crypto/fips202.cpp)
+target_link_libraries(vx_fips202 PUBLIC vx_core)
+add_executable(test_fips202_kat tests/test_fips202_kat.cpp)
+target_link_libraries(test_fips202_kat PRIVATE vx_core vx_fips202 gtest gtest_main)
+add_test(NAME VortexFips202KatTest COMMAND test_fips202_kat)
+
 add_executable(test_rpc_auth tests/test_rpc_auth.cpp)
 target_link_libraries(test_rpc_auth PRIVATE vx_core gtest gtest_main)
 
