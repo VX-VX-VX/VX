@@ -22,6 +22,29 @@
 namespace vx::crypto::dksap {
 namespace {
 
+// Uniform ring sampling (SampleNTT-style rejection): 12-bit candidates
+// < q from a continuous SHAKE128 stream. Security review HIGH (2026-11-14):
+// â MUST be uniform — a small-coefficient (CBD) â collapses the RLWE
+// hardness assumption and breaks stealth unlinkability.
+void sample_ring_uniform(const uint8_t *domain32, mlkem::RingPoly &out) {
+    vx::crypto::fips202::Shaker xof(168, 0x1f); // SHAKE128
+    xof.absorb(domain32, 32);
+    unsigned count = 0;
+    while (count < mlkem::RING_N) {
+        uint8_t buf[168];
+        xof.squeeze(buf, sizeof(buf));
+        for (unsigned i = 0; i + 3 <= sizeof(buf) && count < mlkem::RING_N; i += 3) {
+            const uint16_t d0 = static_cast<uint16_t>(buf[i] | ((buf[i + 1] & 0x0F) << 8));
+            const uint16_t d1 =
+                static_cast<uint16_t>((buf[i + 1] >> 4) | (static_cast<uint16_t>(buf[i + 2]) << 4));
+            if (d0 < mlkem::RING_Q)
+                out[count++] = d0;
+            if (count < mlkem::RING_N && d1 < mlkem::RING_Q)
+                out[count++] = d1;
+        }
+    }
+}
+
 // GF(3329) add/sub over ring coefficients (matching ML-KEM's branchless
 // arithmetic — the DKSAP ring ops must stay div-free too).
 inline uint16_t fq_add_pub(uint16_t a, uint16_t b) {
@@ -308,17 +331,27 @@ void radar_scan(const uint8_t kem_sk[KEM_SK_SIZE],
     }
 
     // 4. UNBLIND: t̂_unblinded = t̂_stealth − â∘ŝ_mask − ê_mask == t̂_spend?
-    mlkem::RingPoly t_stealth_hat, blind, t_unblinded;
+    mlkem::RingPoly t_stealth_hat{}, blind{}, t_unblinded{};
     mlkem::ring_unpack12(tx.t_stealth.data(), t_stealth_hat);
+    // Canonical-form check (security review MEDIUM): reject non-canonical
+    // coefficients (>= q) in the submitted blinding — the first draft
+    // compared 384 bytes of a 512-byte array, leaving the tail 64
+    // coefficients unchecked.
+    for (unsigned i = 0; i < mlkem::RING_N; ++i)
+        if (t_stealth_hat[i] >= mlkem::RING_Q)
+            return; // non-canonical input: not a valid blinded key
     mlkem::ring_mul_ntt(a_hat, s_mask_hat, blind);
     for (unsigned i = 0; i < mlkem::RING_N; ++i)
         t_unblinded[i] = fq_sub_pub(fq_sub_pub(t_stealth_hat[i], blind[i]), e_mask_hat[i]);
 
-    mlkem::RingPoly t_spend_hat;
+    // Canonical comparison: pack the unblinded poly to its 12-bit wire
+    // form and compare the full 384 bytes against the commitment — the
+    // packed form is THE canonical identity (no partial-array compare).
+    mlkem::RingPoly t_spend_hat{};
     mlkem::ring_unpack12(t_spend.data(), t_spend_hat);
-    const bool match =
-        vx::core::ct_equal(reinterpret_cast<const uint8_t *>(t_unblinded.data()),
-                           reinterpret_cast<const uint8_t *>(t_spend_hat.data()), T_COMMIT_SIZE);
+    uint8_t unblinded_packed[T_COMMIT_SIZE];
+    mlkem::ring_pack12(t_unblinded, unblinded_packed);
+    const bool match = vx::core::ct_equal(unblinded_packed, t_spend.data(), T_COMMIT_SIZE);
     out.match = match;
     if (!match)
         return;
