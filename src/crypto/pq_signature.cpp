@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -25,6 +26,12 @@ void sponge(const void *data, size_t len, uint8_t out[32]) noexcept {
 }
 
 // Little-endian appender for the deterministic preimage builder.
+// Citadel hardening (2026-11-14): preimage buffers routinely carry the
+// MASTER KEY (pub-seed derivation, WOTS secret chains, rollover bindings
+// all fold master_sk into the preimage). A plain struct left those 128
+// bytes of key material on the signer's stack after every sponge call.
+// The buffer now self-scrubs on scope exit — no call site can forget it,
+// and scrubbing a public-data preimage is a harmless no-op in effect.
 struct PreimageBuf {
     std::array<uint8_t, 128> b{};
     size_t n = 0;
@@ -44,9 +51,52 @@ struct PreimageBuf {
         for (int i = 0; i < 4; ++i)
             b[n++] = static_cast<uint8_t>((v >> (i * 8)) & 0xFF);
     }
+
+    ~PreimageBuf() {
+        vx::core::MemoryCore::scrub_execution_state(b.data(), b.size());
+    }
 };
 
 } // namespace
+
+// Citadel hardening (2026-11-14, security-review P1 fix): the signer is
+// the process's key-material consumer of record, but MemoryCore's debugger
+// check was wired only into the scheduler — pq_sign_transaction and
+// pq_sign_rollover would happily sign under an attached tracer. The gate
+// refuses (fail-closed) when a TRACER is attached. Security review P1:
+// ONLY the TracerPid signal blocks — the PR_GET_DUMPABLE half of
+// check_debugger_attached() also fires on legitimately non-dumpable
+// processes (setuid privilege drop, systemd user manager, sandboxing
+// wrappers), which would turn a deployment-hardening choice into a
+// silent consensus halt. The check reads /proc/self/status via C stdio
+// (no exceptions can escape the noexcept signer; review P3). An explicit
+// env opt-out (VX_CITADEL_ALLOW_TRACE=1) keeps legitimate debugging
+// sessions working — an attacker with control of the environment is
+// already past this layer.
+bool citadel_trace_blocked() noexcept {
+    static const bool allow_trace = [] {
+        const char *e = ::getenv("VX_CITADEL_ALLOW_TRACE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (allow_trace)
+        return false;
+    std::FILE *f = std::fopen("/proc/self/status", "r");
+    if (!f)
+        return false; // no status read -> no tracer knowledge -> allow
+    char line[256];
+    bool traced = false;
+    while (std::fgets(line, sizeof(line), f)) {
+        if (std::strncmp(line, "TracerPid:", 10) == 0) {
+            const char *p = line + 10;
+            while (*p == ' ' || *p == '\t')
+                ++p;
+            traced = (*p != '0');
+            break;
+        }
+    }
+    std::fclose(f);
+    return traced;
+}
 
 // ── Canonical message digest ─────────────────────────────────────────────────
 
@@ -319,6 +369,10 @@ std::array<uint8_t, 32> rollover_binding_digest(const std::array<uint8_t, 32> &o
 
 PqSignatureWitness pq_sign_rollover(const std::array<uint8_t, 32> &master_sk, uint32_t from_tree,
                                     uint32_t to_tree, PqLeafLedger *leaf_ledger) noexcept {
+    // Citadel gate: no key material moves while a tracer watches the
+    // process (fail-closed; see citadel_trace_blocked above).
+    if (citadel_trace_blocked())
+        return PqSignatureWitness{}; // a witness that fails verification
     // Explicit rollover invalidation (P1): the certificate changes the
     // account's active window epoch, so any cached window state must not
     // outlive this call. Cheap (two flag clears), conservative.
@@ -555,6 +609,10 @@ bool pq_sign_transaction(Transaction &tx, const std::array<uint8_t, 32> &master_
                          PqSignTimings *timings, PqLeafLedger *leaf_ledger,
                          PqSignatureWitness *out_witness) noexcept {
     namespace mc = vx::core;
+    // Citadel gate: no key material moves while a tracer watches the
+    // process (fail-closed; see citadel_trace_blocked above).
+    if (citadel_trace_blocked())
+        return false;
     PqSignTimings local{};
     PqSignTimings &t = timings ? *timings : local;
 

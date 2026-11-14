@@ -11,11 +11,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # debug tables of any published binary: every build maps the local source and
 # build directories to relative paths at the compiler level.
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # CUDA note (2026-11-14): prefix-map flags are C/C++-only. nvcc forwards
+    # unknown options to the host g++ unquoted, and this tree lives in a
+    # path with a space ("for pub release") — the flags would split into
+    # "multiple files" and fail every .cu compilation.
     add_compile_options(
-        "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
-        "-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=."
-        "-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=."
-        "-fdebug-prefix-map=${CMAKE_BINARY_DIR}=."
+        "$<$<COMPILE_LANG_AND_ID:C,CXX,GNU,Clang>:-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.>"
+        "$<$<COMPILE_LANG_AND_ID:C,CXX,GNU,Clang>:-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.>"
+        "$<$<COMPILE_LANG_AND_ID:C,CXX,GNU,Clang>:-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.>"
+        "$<$<COMPILE_LANG_AND_ID:C,CXX,GNU,Clang>:-fdebug-prefix-map=${CMAKE_BINARY_DIR}=.>"
     )
 endif()
 
@@ -395,3 +399,50 @@ if(VX_BUILD_FUZZERS)
         target_link_libraries(${fuzz_target} PRIVATE vx_core -fsanitize=fuzzer)
     endforeach()
 endif()
+
+# ── CUDA track (2026-11-14) ──────────────────────────────────────────────────
+# Real GPU ports of consensus primitives, gated by an explicit option: a
+# build with VX_CUDA=OFF (default) contains zero CUDA sources, so portable
+# and OPSEC-sensitive builds are unaffected. The no-stub rule lives in
+# tests/test_cuda_parity: the GPU port ships ONLY with bit-exact CPU/GPU
+# digest parity (including full 64 KiB block frames); a parity failure is
+# a shipped-bug alarm, never a tolerance.
+option(VX_CUDA "Build the CUDA track (GPU VortexSponge256 batch + parity test + bench)" OFF)
+if(VX_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 120) # Blackwell (RTX 50xx), owner GPU
+    endif()
+    add_library(vx_gpu STATIC gpu/vortex_sponge_cuda.cu)
+    set_target_properties(vx_gpu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+    target_link_libraries(vx_gpu PUBLIC CUDA::cudart)
+    add_executable(test_cuda_parity tests/test_cuda_parity.cpp)
+    target_include_directories(test_cuda_parity PRIVATE ${CMAKE_SOURCE_DIR}/gpu
+                               ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(test_cuda_parity PRIVATE vx_core vx_gpu gtest gtest_main)
+    add_test(NAME VortexCudaParityTest COMMAND test_cuda_parity)
+    # Deliverable 2: the 1024-bit Solinas field (division-free fold
+    # reduction), parity-gated against GMP the same way.
+    add_library(vx_gpu_field STATIC gpu/vortex_field_cuda.cu)
+    set_target_properties(vx_gpu_field PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+    target_link_libraries(vx_gpu_field PUBLIC CUDA::cudart)
+    add_executable(test_cuda_field_parity tests/test_cuda_field_parity.cpp)
+    target_include_directories(test_cuda_field_parity PRIVATE ${CMAKE_SOURCE_DIR}/gpu
+                               ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(test_cuda_field_parity PRIVATE vx_core vx_gpu_field gtest gtest_main)
+    add_test(NAME VortexCudaFieldParityTest COMMAND test_cuda_field_parity)
+    add_executable(bench_sponge_gpu gpu/bench_sponge.cu gpu/bench_sponge_cpu.cpp)
+    target_include_directories(bench_sponge_gpu PRIVATE ${CMAKE_SOURCE_DIR}/gpu
+                               ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(bench_sponge_gpu PRIVATE vx_core vx_gpu)
+endif()
+
+# clangd-lsp integration (2026-11-14): real-time type diagnostics for
+# editor-side agent tooling. Note: the set() form of this variable is
+# ignored by this CMake/Makefile combination (observed), so the flag is
+# passed on the configure command line:
+#   cmake -S . -B build_assert -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+# compile_commands.json is then symlinked to the repo root for clangd.

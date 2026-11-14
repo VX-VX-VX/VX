@@ -49,3 +49,4 @@ web/dist/
 
 # ── Local-only copies of removed tracked files (stay on disk, never in git) ──
 /main.cpp
+compile_commands.json

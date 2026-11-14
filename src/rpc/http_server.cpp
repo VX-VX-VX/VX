@@ -61,6 +61,22 @@ void split_path_query(std::string &path, std::string &query) {
         path.erase(q);
     }
 }
+
+// Citadel hardening (2026-11-14): the endpoints whose request bodies carry
+// key material (wallet seed_hex, crypto-lab seeds). Query-tolerant by
+// construction: the request target is split on '?' BEFORE the comparison —
+// security review P2: a "?x=1" suffix would otherwise bypass the scrub.
+bool sensitive_body_path(std::string_view target) {
+    std::string path(target);
+    std::string query;
+    split_path_query(path, query);
+    static const std::array<std::string_view, 2> kSensitiveBodyPaths{"/api/wallet/rollover",
+                                                                     "/api/crypto/lab"};
+    for (const auto p : kSensitiveBodyPaths)
+        if (path == p)
+            return true;
+    return false;
+}
 } // namespace
 
 HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, uint16_t port,
@@ -712,6 +728,13 @@ HttpRequest HttpServer::parse_request(int client_fd, bool& ok) {
         // request must never leak into this request's body. A short close
         // (fewer bytes arrived than declared) keeps what arrived.
         if (req.body.size() > content_length) req.body.resize(content_length);
+        // Citadel hardening (security review P2): `raw` holds the FULL
+        // wire request — a second heap copy of a key-carrying body. Wipe
+        // it before it dies; the handler and route() copies are scrubbed
+        // on their own paths.
+        if (sensitive_body_path(req.path)) {
+            vx::core::MemoryCore::scrub_execution_state(raw.data(), raw.size());
+        }
     }
     ok = true;
     return req;
@@ -921,6 +944,14 @@ void HttpServer::handle_client(int client_fd) {
     auto res = route(req);
     send_response(client_fd, res);
     ::close(client_fd);
+    // Citadel hardening (2026-11-14): key-carrying request bodies (wallet
+    // seed_hex, crypto-lab seeds) must not linger in the connection
+    // thread's heap. The handlers scrub their own decoded copies; this
+    // wipes the transport copy once the response is out. Scrubbing is a
+    // no-op for every other request shape.
+    if (!req.body.empty() && sensitive_body_path(req.path)) {
+        vx::core::MemoryCore::scrub_execution_state(req.body.data(), req.body.size());
+    }
 }
 
 HttpResponse HttpServer::dispatch(const HttpRequest& req) {
@@ -1003,7 +1034,14 @@ HttpResponse HttpServer::route(const HttpRequest& req) {
         // route). Splitting on a copy keeps the caller's request unchanged.
         HttpRequest split = req;
         split_path_query(split.path, split.query);
-        return dispatch(split);
+        // Citadel hardening (security review P2): `split` is a second heap
+        // copy of a key-carrying body (route() copies the caller's
+        // request). Scrub it before it dies — the caller's own copy is
+        // scrubbed in handle_client; parse_request's raw buffer below.
+        HttpResponse res = dispatch(split);
+        if (!split.body.empty() && sensitive_body_path(split.path))
+            vx::core::MemoryCore::scrub_execution_state(split.body.data(), split.body.size());
+        return res;
     } catch (const std::exception&) {
         // The message is deliberately fixed: handler exceptions can carry
         // fragments of the request body, and echoing them back would be a
@@ -2039,6 +2077,17 @@ HttpResponse HttpServer::handle_crypto_lab(const HttpRequest& req) {
     };
 
     std::string seed = extract(req.body, "seed");
+    // Citadel hardening (2026-11-14): whatever seed the caller supplied
+    // dies with the handler — the response still echoes it by design
+    // (the lab is a key-material oracle and is token-gated for exactly
+    // that reason), but the handler's own copy is wiped on every exit.
+    struct LabSeedScrub {
+        std::string &s;
+        ~LabSeedScrub() {
+            if (!s.empty())
+                vx::core::MemoryCore::scrub_execution_state(s.data(), s.size());
+        }
+    } lab_seed_scrub{seed};
     // PUBLIC RELEASE GENESIS ATTRACTOR SEED (test vector) — see
     // src/blockchain/genesis.cpp. Never used for live private keys.
     if (seed.empty()) seed =
@@ -3547,6 +3596,20 @@ HttpResponse HttpServer::handle_wallet_rollover(const HttpRequest &req) {
     // operation must not silently sign with a half-parsed key.
     std::array<uint8_t, 32> master_sk{};
     std::string seed_hex;
+    // Citadel hardening (2026-11-14): the decoded master key and its hex
+    // form must never linger on the handler's stack, whatever exit the
+    // handler takes (early 400s, 409s, success). RAII scrub on scope
+    // exit; the request body's copy is scrubbed by the connection
+    // handler (sensitive-body set) after the response is sent.
+    struct KeyScrub {
+        std::array<uint8_t, 32> &sk;
+        std::string &hex;
+        ~KeyScrub() {
+            vx::core::MemoryCore::scrub_execution_state(sk.data(), sk.size());
+            if (!hex.empty())
+                vx::core::MemoryCore::scrub_execution_state(hex.data(), hex.size());
+        }
+    } key_scrub{master_sk, seed_hex};
     std::string pat = "\"seed_hex\"";
     size_t p = req.body.find(pat);
     if (p != std::string::npos) {
@@ -3565,8 +3628,13 @@ HttpResponse HttpServer::handle_wallet_rollover(const HttpRequest &req) {
             }
         }
     }
-    if (seed_hex.size() >= 2 && seed_hex[0] == '0' && seed_hex[1] == 'x')
-        seed_hex = seed_hex.substr(2);
+    if (seed_hex.size() >= 2 && seed_hex[0] == '0' && seed_hex[1] == 'x') {
+        // Citadel hardening (security review P3): wipe BEFORE trimming —
+        // move-assign substr() would free the original heap block with the
+        // seed bytes unscrubbed.
+        vx::core::MemoryCore::scrub_execution_state(seed_hex.data(), seed_hex.size());
+        seed_hex.erase(0, 2);
+    }
     if (seed_hex.size() != 64) {
         return HttpResponse::error(
             400, "seed_hex (exactly 64 hex chars) is required for a key-lifecycle operation");

@@ -2131,6 +2131,70 @@ amends the list as needed.
   only when every box above is checked and all three lanes are green
   on the release tree.
 
+## CUDA track (opened 2026-11-14, owner directive: real work, no stubs)
+
+The GPU track is REAL and parity-gated. Hardware/toolchain: RTX 5070 Ti
+Laptop (Blackwell, sm_120, 46 SMs), CUDA 13.4 (/opt/cuda). The build is
+a strict option — `VX_CUDA=ON` (default OFF): a build without it
+contains zero CUDA sources, so portable/OPSEC-sensitive builds are
+untouched. The forensic prefix-map flags are C/C++-scoped (nvcc
+forwards unknown flags to the host compiler unquoted and this tree
+lives in a path with a space).
+
+- [x] **VortexSponge256 on GPU** — `gpu/vortex_sponge_cuda.cu`: batch
+  kernel (one thread per message, host prefix-sum, fail-closed errors),
+  `tests/test_cuda_parity` pins BIT-EXACT CPU/GPU digest parity over
+  ~2100 vectors (empty, rate boundaries, multi-chunk, full 64 KiB
+  frames), `gpu/bench_sponge_gpu` reports honest numbers (transfer
+  included, CPU reference with an anti-DCE checksum fold). First bench
+  (kernel v1): 4096 x 64 KiB in ~46 ms = 5.9 GB/s incl. transfer,
+  12.4x vs one CPU thread — transfer-bound; the next kernel revision
+  targets persistent/resident batching. The parity test caught two real
+  bugs pre-commit: the empty-message absorb mix (GPU mixed one zero
+  rate block the CPU never mixes) and the CPU bench being dead-code-
+  eliminated into a 0.0000 ms lie.
+- [x] **1024-bit Solinas field on GPU** — `gpu/vortex_field_cuda.cu`:
+  16x64-limb schoolbook multiply + division-free fold reduction
+  (2^1024 ≡ 2^k + c for the three secure_crt moduli, no division,
+  `unsigned __int128` carry chains throughout). `test_cuda_field_parity`
+  pins bit-exact GMP parity: 1024 random pairs x 3 moduli, the pow3
+  chain the attractor's cubic map performs, edge elements 0/1/N-1 —
+  all green. The parity hunt caught TWO shipped-bug classes before
+  commit: a uint64 `mid` overflow in the 64x64 limb product (the
+  p01+p10+carry sum itself overflows — fixed by 128-bit products) and
+  carry-undercounting in every limb adder (`carry && s1 == 0` misses
+  overflow for carry >= 2 — fixed by __int128 carry chains everywhere).
+  The host replica of the full kernel (tests against GMP on the CPU)
+  is checked into the debug trail, not shipped.
+- [ ] **PoGW candidate hashing batch** — bulk frame-hash scan on GPU
+  once the above lands (the work gate is the same sponge, but the
+  caller shape differs).
+- [ ] **PoGW candidate hashing batch** — bulk frame-hash scan on GPU
+  once the above lands (the work gate is the same sponge, but the
+  caller shape differs).
+- [ ] **ZK-cocoon batch verify** — needs the SNARK research track to
+  exist first (see the contracts spec §5 and the DKSAP design
+  question; nothing to verify yet, so nothing to build yet).
+
+## Citadel hardening round 1 (2026-11-14, owner directive: real work, no stubs)
+
+- [x] `PreimageBuf` is now self-scrubbing (RAII): WOTS/pub-seed/rollover
+  preimages carry the master key and previously lingered on the signer's
+  stack after every sponge call.
+- [x] `citadel_trace_blocked()`: pq_sign_transaction and
+  pq_sign_rollover refuse to move key material while a debugger is
+  attached or the process is non-dumpable (fail-closed; the
+  MemoryCore check existed but was wired only into the scheduler).
+  Opt-out for legitimate debugging: VX_CITADEL_ALLOW_TRACE=1.
+- [x] RPC key-material lifecycle: handle_wallet_rollover scrubs the
+  decoded master key + hex on every exit path; handle_crypto_lab scrubs
+  the seed; the connection handler scrubs the transport body for the
+  key-carrying paths after the response is out.
+- [ ] Round 2 candidates: MADV_DONTDUMP on the signer's local arenas;
+  zeroization audit of the remaining master_sk call sites (wallet demo
+  paths, key-import flow); register-scrubbing primitives beyond the
+  volatile-store idiom (documented limits of what C++ can promise).
+
 ## Owner priority table for the next release (audit of v0.0.16, 2026-11-05 late)
 
 Verdict: positive on the architecture changes; praise for freezing the
