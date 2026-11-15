@@ -112,6 +112,15 @@ public:
     /// Remove specific transactions from mempool (after they're sealed in a block)
     void remove_sealed(const std::vector<Transaction>& sealed_txs) noexcept;
 
+    /// A transaction the state layer REFUSED (e.g. a registration that lost
+    /// the first-come-wins race). Removing it via remove_sealed would
+    /// advance the sender's pending nonce past a tx that never applied —
+    /// a permanent nonce gap. drop_txs rewinds instead: pending outgoing is
+    /// un-reserved and the pending nonce returns to the lowest dropped
+    /// nonce for that sender. (Miner wedge fix, adversarial review
+    /// 2026-11-15 P1.)
+    void drop_txs(const std::vector<Transaction> &dropped) noexcept;
+
     /// Clear entire mempool
     void clear() noexcept;
 

@@ -33,6 +33,18 @@ struct UndoRecord {
     // to the byte-identical pre-fork state (a re-applied GENESIS_2 mint
     // demands an untracked receiver).
     std::vector<std::string> created_addresses;
+    // DKSAP wire integration: SGMT registration effects. Each entry carries
+    // the trie KEY (32 B) and the leaf it replaced — the journal is keyed by
+    // the key, never the nickname (the sidecar record is not visible to the
+    // undo layer). Recorded AFTER ledger apply from ApplyResult::sgmt_undo
+    // via record_sgmt_undo; a missing entry makes the rollback's coverage
+    // guard refuse instead of silently dropping a trie reversal.
+    struct SgmtLeafUndo {
+        std::array<uint8_t, 32> key{};
+        std::array<uint8_t, 32> prev_leaf{};
+        bool existed = false;
+    };
+    std::vector<SgmtLeafUndo> sgmt_undo;
 };
 
 // A displaced fork block preserved by a rollback (BACKLOG 0.12): the
@@ -60,6 +72,13 @@ public:
 
     // Record state changes before applying a block
     void apply_block(const blockchain::BlockView& block);
+
+    // DKSAP wire integration: append the SGMT leaf effects of an applied
+    // block to that block's journal record. The ApplyResult carries the
+    // replaced-leaf snapshots because only the ledger can see the sidecar
+    // record that named the trie key. Called AFTER ledger_.apply_block
+    // succeeded; the newest record for the height is the target.
+    void record_sgmt_undo(uint64_t height, const std::vector<ApplyResult::SgmtUndoEntry> &entries);
 
     // Drop the newest in-memory record: the caller recorded a pre-state
     // entry but the block did NOT enter the ledger (apply refused), so a

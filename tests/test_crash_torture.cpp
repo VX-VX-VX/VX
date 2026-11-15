@@ -271,10 +271,19 @@ JournalLayout scan_journal(const std::vector<uint8_t>& d) {
         if (created_pos + 8 > d.size()) break;
         const uint64_t created = u64_le(d.data() + created_pos);
         if (created > 2 * MAX_TX_PER_BLOCK) break;
+        // v3 layout (DKSAP wire integration): after the created-address
+        // list comes the sgmt-undo count (8 B) and the sgmt entries
+        // (key 32 + prev_leaf 32 + existed 1 = 65 B each).
+        const size_t sgmt_pos = created_pos + 8 + created * 42;
+        if (sgmt_pos + 8 > d.size())
+            break;
+        const uint64_t sgmt = u64_le(d.data() + sgmt_pos);
+        if (sgmt > MAX_TX_PER_BLOCK)
+            break;
         // Record size (UndoEngine::record_bytes): 88 fixed bytes, which
-        // already include the created-count field, plus the tx array and
-        // the created-address list.
-        const size_t rec = 88 + tx * kUndoTxSize + created * 42;
+        // already include the created-count field, plus the tx array, the
+        // created-address list, and (v3) the sgmt-undo array.
+        const size_t rec = 88 + tx * kUndoTxSize + created * 42 + 8 + sgmt * 65;
         if (off + rec > d.size()) break;
         L.heights.push_back(u64_le(d.data() + off));
         L.tx_counts.push_back(tx);

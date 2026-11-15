@@ -70,9 +70,19 @@ if(MSVC)
         add_compile_options(/openmp)
     endif()
 else()
+    # External review 2026-11-15: an unconditional -march=native bakes the
+    # host's AVX-512 (Zen 4) into the "portable" Public Core binary — it
+    # dies with SIGILL on any x86-64 without it. Dev builds keep native
+    # (default ON); a release/portable build passes -DVX_NATIVE_ARCH=OFF
+    # and lands on the safe x86-64-v3 (AVX2) baseline.
+    option(VX_NATIVE_ARCH "Optimize strictly for the host CPU (-march=native)" ON)
+    if(VX_NATIVE_ARCH)
+        add_compile_options(-march=native)
+    else()
+        add_compile_options(-march=x86-64-v3)
+    endif()
     add_compile_options(
         -O3
-        -march=native
         -Wall
         -Wextra
         -Wpedantic
@@ -104,6 +114,16 @@ add_library(vx_core STATIC
     src/crypto/simd_accel.cpp
     src/crypto/zk_key_matrix.cpp
     src/crypto/canonical_vectors.cpp
+    # DKSAP wire integration: the header-only ledger apply_block and the RPC
+    # SGMT surface call the DKSAP core and the SGMT resolve layer — compile
+    # them INTO vx_core so every target that links the ledger resolves them
+    # (the standalone vx_dksap* libs below are replaced by these members).
+    src/crypto/dksap.cpp
+    src/crypto/dksap_sgmt.cpp
+    # ...and their crypto foundations (the DKSAP core draws the sponge
+    # sampler and the ML-KEM primitives).
+    src/crypto/fips202.cpp
+    src/crypto/ml_kem.cpp
     src/crypto/key_import.cpp
     src/neural/virtual_tensor.cpp
     src/state/mempool.cpp
@@ -291,32 +311,38 @@ target_link_libraries(test_retarget PRIVATE vx_core gtest gtest_main)
 # -- BACKLOG 0.10 (Stage C) test suites ---------------------------------------
 # RPC auth token gate (mutating endpoints fail closed without the token).
 # FIPS 202 (SHA3/SHAKE) — the ML-KEM track's Keccak primitive, KAT-gated.
-add_library(vx_fips202 STATIC src/crypto/fips202.cpp)
-target_link_libraries(vx_fips202 PUBLIC vx_core)
+# External review 2026-11-15: the DKSAP wire integration folded fips202.cpp
+# and ml_kem.cpp INTO vx_core (the header-only ledger and the RPC surface
+# reference them) — standalone vx_fips202/vx_mlkem statics here would be a
+# double compile + duplicate symbols, so the tests link vx_core only.
 add_executable(test_fips202_kat tests/test_fips202_kat.cpp)
-target_link_libraries(test_fips202_kat PRIVATE vx_core vx_fips202 gtest gtest_main)
+target_link_libraries(test_fips202_kat PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexFips202KatTest COMMAND test_fips202_kat)
 
 # ML-KEM-768 (FIPS 203) — the DKSAP stealth track's KEM, ACVP-KAT-gated.
-add_library(vx_mlkem STATIC src/crypto/ml_kem.cpp)
-target_link_libraries(vx_mlkem PUBLIC vx_core vx_fips202)
 add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)
-target_link_libraries(test_ml_kem_kat PRIVATE vx_core vx_mlkem gtest gtest_main)
+target_link_libraries(test_ml_kem_kat PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexMlKem768KatTest COMMAND test_ml_kem_kat)
 
-# DKSAP-Galois stealth-nickname core (track 3/3).
-add_library(vx_dksap STATIC src/crypto/dksap.cpp)
-target_link_libraries(vx_dksap PUBLIC vx_core vx_mlkem)
+# DKSAP-Galois stealth-nickname core (track 3/3) + SGMT layer: compiled
+# INTO vx_core (the header-only ledger apply_block and the RPC SGMT surface
+# reference them), so the tests link vx_core.
 add_executable(test_dksap tests/test_dksap.cpp)
-target_link_libraries(test_dksap PRIVATE vx_core vx_dksap gtest gtest_main)
+target_link_libraries(test_dksap PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexDksapTest COMMAND test_dksap)
 
-# SGMT registration layer (nickname -> public keys directory).
-add_library(vx_dksap_sgmt STATIC src/crypto/dksap_sgmt.cpp)
-target_link_libraries(vx_dksap_sgmt PUBLIC vx_core vx_dksap)
 add_executable(test_dksap_sgmt tests/test_dksap_sgmt.cpp)
-target_link_libraries(test_dksap_sgmt PRIVATE vx_core vx_dksap_sgmt gtest gtest_main)
+target_link_libraries(test_dksap_sgmt PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexDksapSgmtTest COMMAND test_dksap_sgmt)
+
+# DKSAP wire integration: digest-keyed sidecar registry (SGMT registration
+# records — consensus-visible and durable — plus radar-only StealthTx
+# bundles) and the STEALTH/SGMTLEAF receiver-payload helpers. HEADER-ONLY:
+# the ledger's inline apply_block references the helpers and the registry
+# lookup, so no extra lib.
+add_executable(test_sgmt_wiring tests/test_sgmt_wiring.cpp)
+target_link_libraries(test_sgmt_wiring PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexSgmtWiringTest COMMAND test_sgmt_wiring)
 
 add_executable(test_rpc_auth tests/test_rpc_auth.cpp)
 target_link_libraries(test_rpc_auth PRIVATE vx_core gtest gtest_main)
@@ -364,7 +390,12 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_attractor_degeneracy test_pq_rollover
             test_pq_rollover_wiring
             test_crt_seam_theorems test_derivation_migration
-            test_digest_uniformity)
+            test_digest_uniformity
+            # Later additions (external review 2026-11-15): the KAT/DKSAP
+            # wire suites were missing from the guard — their assert() calls
+            # would silently no-op under the Release -DNDEBUG flag.
+            test_fips202_kat test_ml_kem_kat
+            test_dksap test_dksap_sgmt test_sgmt_wiring)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -451,6 +482,7 @@ if(VX_CUDA)
     target_include_directories(test_cuda_parity PRIVATE ${CMAKE_SOURCE_DIR}/gpu
                                ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(test_cuda_parity PRIVATE vx_core vx_gpu gtest gtest_main)
+    target_compile_options(test_cuda_parity PRIVATE -UNDEBUG)
     add_test(NAME VortexCudaParityTest COMMAND test_cuda_parity)
     # Deliverable 2: the 1024-bit Solinas field (division-free fold
     # reduction), parity-gated against GMP the same way.
@@ -461,6 +493,7 @@ if(VX_CUDA)
     target_include_directories(test_cuda_field_parity PRIVATE ${CMAKE_SOURCE_DIR}/gpu
                                ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(test_cuda_field_parity PRIVATE vx_core vx_gpu_field gtest gtest_main)
+    target_compile_options(test_cuda_field_parity PRIVATE -UNDEBUG)
     add_test(NAME VortexCudaFieldParityTest COMMAND test_cuda_field_parity)
     add_executable(bench_sponge_gpu gpu/bench_sponge.cu gpu/bench_sponge_cpu.cpp)
     target_include_directories(bench_sponge_gpu PRIVATE ${CMAKE_SOURCE_DIR}/gpu

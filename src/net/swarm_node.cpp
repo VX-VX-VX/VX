@@ -6,6 +6,7 @@
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/crypto/simd_accel.hpp"
 #include "vx/crypto/pq_signature.hpp"
+#include "vx/crypto/dksap_sidecars.hpp"
 #include "vx/core/hw_intrinsics.hpp"
 #include "vx/core/u128.hpp"
 #include "vx/state/ledger_state.hpp"
@@ -558,6 +559,38 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             handle_get_certs(fd, label, payload);
             continue;
         }
+        // ── DKSAP wire integration: sidecar records (dialed side — the same
+        // validated shape as the accept loop above) ────────────────────────
+        if (type == WireMsgType::DKSAP_SGMT_REG && payload.size() >= 32 + 1 + 384 + 1184) {
+            std::array<uint8_t, 32> digest{};
+            std::memcpy(digest.data(), payload.data(), 32);
+            const uint8_t nlen = payload[32];
+            if (nlen == 0 || nlen > 32 || payload.size() != 32 + 1 + nlen + 384 + 1184) {
+                report_withhold(label, 20);
+                continue;
+            }
+            vx::crypto::dksap::SgmtRecord rec;
+            rec.nickname.assign(reinterpret_cast<const char *>(payload.data() + 33), nlen);
+            std::memcpy(rec.pub.t_spend.data(), payload.data() + 33 + nlen, 384);
+            std::memcpy(rec.pub.kkem.data(), payload.data() + 33 + nlen + 384, 1184);
+            vx::crypto::dksap::DksapSidecarRegistry::instance().register_sgmt_candidate(digest,
+                                                                                        rec);
+            if (sidecar_callback_)
+                sidecar_callback_(digest);
+            continue;
+        }
+        if (type == WireMsgType::DKSAP_STEALTH &&
+            payload.size() == 32 + sizeof(vx::crypto::dksap::StealthTx)) {
+            std::array<uint8_t, 32> digest{};
+            std::memcpy(digest.data(), payload.data(), 32);
+            vx::crypto::dksap::StealthBundle b;
+            std::memcpy(&b.tx, payload.data() + 32, sizeof(b.tx));
+            vx::crypto::dksap::DksapSidecarRegistry::instance().register_stealth_candidate(digest,
+                                                                                           b);
+            if (sidecar_callback_)
+                sidecar_callback_(digest);
+            continue;
+        }
         break; // unexpected message type: drop the connection
     }
     {
@@ -1096,6 +1129,99 @@ void SwarmNode::broadcast_rollover_cert(const vx::crypto::pq::PqRolloverCert &ce
 
 void SwarmNode::set_frame_hook(FrameHook hook) {
     frame_hook_ = std::move(hook);
+}
+
+void SwarmNode::set_sidecar_callback(SidecarHook hook) {
+    sidecar_callback_ = std::move(hook);
+}
+
+void SwarmNode::broadcast_sidecars_for(const std::span<const uint8_t, 65536> &frame) {
+    auto *raw = reinterpret_cast<const blockchain::RawBlock *>(frame.data());
+    const uint32_t count =
+        raw->header.tx_count > blockchain::MAX_TX_PER_BLOCK ? 0u : raw->header.tx_count;
+    // Payloads are variable-length (the SGMT record carries the nickname),
+    // so a byte vector is the transport shape for both kinds. Two batches:
+    // each kind rides its OWN message type (the receiver shape-checks per
+    // type — a stealth bundle under the SGMT type would close connections).
+    std::vector<std::vector<uint8_t>> payloads;
+    std::vector<std::vector<uint8_t>> stealth_payloads;
+    for (uint32_t i = 0; i < count; ++i) {
+        const blockchain::Transaction &tx = raw->transactions[i];
+        const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+        if (vx::crypto::dksap::receiver_is_stealth(tx.receiver_nfa)) {
+            // Relay every candidate (bounded per digest); the receiver is
+            // not an authority — each peer re-resolves against the frame.
+            // STEALTH sidecars ride THEIR OWN message type (adversarial
+            // review 2026-11-15 P0): a 1572-byte bundle sent as SGMT_REG
+            // fails the receiver's shape check on both branches and closes
+            // the connection — the first stealth transfer would disconnect
+            // the node from its entire peer set.
+            for (const auto &b :
+                 vx::crypto::dksap::DksapSidecarRegistry::instance().copy_stealth_candidates(
+                     digest)) {
+                std::vector<uint8_t> payload;
+                payload.reserve(32 + sizeof(vx::crypto::dksap::StealthTx));
+                payload.insert(payload.end(), digest.begin(), digest.end());
+                const auto *p = reinterpret_cast<const uint8_t *>(&b.tx);
+                payload.insert(payload.end(), p, p + sizeof(vx::crypto::dksap::StealthTx));
+                stealth_payloads.push_back(std::move(payload));
+            }
+        } else if (vx::crypto::dksap::receiver_is_sgmtleaf(tx.receiver_nfa)) {
+            for (const auto &rec :
+                 vx::crypto::dksap::DksapSidecarRegistry::instance().copy_sgmt_candidates(digest)) {
+                std::vector<uint8_t> payload;
+                payload.reserve(32 + 1 + rec.nickname.size() + 384 + 1184);
+                payload.insert(payload.end(), digest.begin(), digest.end());
+                payload.push_back(static_cast<uint8_t>(rec.nickname.size()));
+                payload.insert(payload.end(), rec.nickname.begin(), rec.nickname.end());
+                payload.insert(payload.end(), rec.pub.t_spend.begin(), rec.pub.t_spend.end());
+                payload.insert(payload.end(), rec.pub.kkem.begin(), rec.pub.kkem.end());
+                payloads.push_back(std::move(payload));
+            }
+        }
+    }
+    if (payloads.empty() && stealth_payloads.empty())
+        return;
+    // Snapshot + send outside the lock (same reasoning as broadcast_frame);
+    // a short header send desyncs the peer's stream, so it is fatal there.
+    std::vector<int> fds;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        fds.reserve(peer_fds_.size());
+        for (const auto &[addr, fd] : peer_fds_) {
+            (void)addr;
+            fds.push_back(fd);
+        }
+    }
+    for (int fd : fds) {
+        if (!payloads.empty())
+            (void)send_wire_payloads_to(fd, WireMsgType::DKSAP_SGMT_REG, payloads);
+        if (!stealth_payloads.empty())
+            (void)send_wire_payloads_to(fd, WireMsgType::DKSAP_STEALTH, stealth_payloads);
+    }
+}
+
+bool SwarmNode::send_wire_payloads_to(int fd, WireMsgType type,
+                                      const std::vector<std::vector<uint8_t>> &payloads) {
+    for (const auto &payload : payloads) {
+        WireHeader hdr =
+            make_header(type, static_cast<uint32_t>(payload.size()), session_nonce_.fetch_add(1));
+        hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
+        ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
+        if (n != static_cast<ssize_t>(sizeof(hdr)))
+            return false;
+        size_t off = 0;
+        while (off < payload.size()) {
+            n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR)
+                    continue;
+                return false;
+            }
+            off += static_cast<size_t>(n);
+        }
+    }
+    return true;
 }
 
 void SwarmNode::handle_incoming_frame(const std::string &from_peer,
@@ -1707,6 +1833,53 @@ void SwarmNode::serve_connection(int c) {
             handle_get_certs(c, peer_label, payload);
             continue;
         }
+        // ── DKSAP wire integration: sidecar records ────────────────────────
+        // A record is stored ONLY after full shape validation: the digest
+        // keys it to exactly one transaction, the nickname range is checked,
+        // and the ring commitment is canonical (the registry re-checks —
+        // nothing malformed is ever stored). A store failure does not kill
+        // the connection: gossip races with the frame and losers are the
+        // normal case, the same shape as witness arrival.
+        if (type == WireMsgType::DKSAP_SGMT_REG && payload.size() >= 32 + 1 + 384 + 1184) {
+            if (promote()) {
+                fire_connected();
+                announce();
+            }
+            std::array<uint8_t, 32> digest{};
+            std::memcpy(digest.data(), payload.data(), 32);
+            const uint8_t nlen = payload[32];
+            if (nlen == 0 || nlen > 32 || payload.size() != 32 + 1 + nlen + 384 + 1184) {
+                report_withhold(peer_label, 20); // malformed: strict shape
+                continue;
+            }
+            vx::crypto::dksap::SgmtRecord rec;
+            rec.nickname.assign(reinterpret_cast<const char *>(payload.data() + 33), nlen);
+            std::memcpy(rec.pub.t_spend.data(), payload.data() + 33 + nlen, 384);
+            std::memcpy(rec.pub.kkem.data(), payload.data() + 33 + nlen + 384, 1184);
+            vx::crypto::dksap::DksapSidecarRegistry::instance().register_sgmt_candidate(digest,
+                                                                                        rec);
+            if (sidecar_callback_)
+                sidecar_callback_(digest);
+            continue;
+        }
+        if (type == WireMsgType::DKSAP_STEALTH &&
+            payload.size() == 32 + sizeof(vx::crypto::dksap::StealthTx)) {
+            if (promote()) {
+                fire_connected();
+                announce();
+            }
+            std::array<uint8_t, 32> digest{};
+            std::memcpy(digest.data(), payload.data(), 32);
+            vx::crypto::dksap::StealthBundle b;
+            static_assert(sizeof(vx::crypto::dksap::StealthTx) == 32 + 4 + 384 + 1088 + 32,
+                          "StealthTx must be a fixed contiguous byte layout");
+            std::memcpy(&b.tx, payload.data() + 32, sizeof(b.tx));
+            vx::crypto::dksap::DksapSidecarRegistry::instance().register_stealth_candidate(digest,
+                                                                                           b);
+            if (sidecar_callback_)
+                sidecar_callback_(digest);
+            continue;
+        }
         break;
     }
     if (registered) {
@@ -1874,8 +2047,10 @@ struct SimNode {
         if (g) {
             BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(
                 reinterpret_cast<const uint8_t *>(g), SB_BLOCK_BYTES)};
-            ledger->apply_block(v);
+            const auto r = ledger->apply_block(v);
             undo->apply_block(v);
+            if (r.ok)
+                undo->record_sgmt_undo(v.header().block_height, r.sgmt_undo);
         }
     }
 
@@ -1934,7 +2109,9 @@ struct SimNode {
 
             BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(frame.data(), SB_BLOCK_BYTES)};
             undo->apply_block(v);
-            ledger->apply_block(v);
+            const auto r = ledger->apply_block(v);
+            if (r.ok)
+                undo->record_sgmt_undo(v.header().block_height, r.sgmt_undo);
             cumulative_pogw = work_of_heights(height());
         }
         return cumulative_pogw;
@@ -2231,7 +2408,12 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
                 BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(b_frames[h - 1].data(),
                                                                      SB_BLOCK_BYTES)};
                 node_a.undo->apply_block(v);
-                if (node_a.ledger->apply_block(v).ok) {
+                const auto r = node_a.ledger->apply_block(v);
+                if (r.ok) {
+                    // DKSAP wire integration: forward the trie effects the
+                    // block committed (the undo journal is keyed by the trie
+                    // key — the sidecar is invisible to the undo layer).
+                    node_a.undo->record_sgmt_undo(v.header().block_height, r.sgmt_undo);
                     node_a.undo->commit_undo_point();
                     node_a.store->append_block(b_frames[h - 1]);
                     ++report.blocks_resynced;

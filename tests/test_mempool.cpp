@@ -58,6 +58,40 @@ TEST(VortexMempoolTest, MempoolConstruction) {
     EXPECT_EQ(mempool.stats().byte_occupancy, 0);
 }
 
+// ── Miner-wedge fix (adversarial review 2026-11-15 P1): drop_txs removes
+// a state-refused transaction AND rewinds the pending nonce — the tx never
+// applied, so the sender's next submit reuses its nonce instead of leaving
+// a permanent gap.
+TEST(VortexMempoolTest, DropTxRewindsPendingNonce) {
+    vx::state::Mempool pool;
+    vx::blockchain::Address a{};
+    const char atag[] = "NFA_DROP_TX_A_00000000000000000000000000";
+    std::memcpy(a.data(), atag, std::strlen(atag));
+    vx::blockchain::Transaction t0{};
+    std::memcpy(t0.sender_nfa, a.data(), 42);
+    vx::blockchain::Transaction t1 = t0;
+    vx::blockchain::tx_set_amount(t0, 500'000'000);
+    vx::blockchain::tx_set_nonce(t0, 0);
+    vx::blockchain::tx_set_amount(t1, 600'000'000);
+    vx::blockchain::tx_set_nonce(t1, 1);
+    // submit() verifies the structural cocoon digest first.
+    vx::blockchain::sign_transaction(t0);
+    vx::blockchain::sign_transaction(t1);
+    const vx::core::U128 bal = vx::core::U128(10'000'000'000ull);
+    ASSERT_TRUE(pool.submit(t0, bal, 0).ok);
+    ASSERT_TRUE(pool.submit(t1, bal, 1).ok);
+    ASSERT_EQ(pool.stats().count, 2u);
+
+    // The state layer refused t0 (the lower nonce of the two): drop it.
+    pool.drop_txs(std::vector<vx::blockchain::Transaction>{t0});
+    EXPECT_EQ(pool.stats().count, 1u);
+    // The pending nonce is rewound to the DROPPED nonce (0), not advanced:
+    // the sender resubmits with the same nonce, no permanent gap.
+    EXPECT_EQ(pool.get_next_nonce(a), 0u);
+    // t1 survives (a higher nonce above a dropped head is the caller's
+    // concern; drop_txs removes exactly the named txs).
+}
+
 // ── BACKLOG 0.14(a): the global fee sort must never invert a sender's
 // nonce chain. Sender A has a low-fee nonce-0 and a high-fee nonce-1;
 // sender B has one mid-fee tx. Under the old global sort the pull order

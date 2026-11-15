@@ -7,6 +7,7 @@
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/genesis.hpp"
 #include "vx/crypto/pq_signature.hpp"
+#include "vx/crypto/dksap_sidecars.hpp"
 #include "vx/storage/block_store.hpp"
 #include "vx/state/ledger_state.hpp"
 #include "vx/rpc/http_server.hpp"
@@ -298,6 +299,12 @@ int main(int argc, char* argv[]) {
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(ledger_path + ".pqw");
     // Rollover certs (v0.0.18): replay the durable cert sidecar too.
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_cert_log(ledger_path + ".pqr");
+    // DKSAP wire integration: the SGMT registration records are consensus-
+    // visible — a node re-applying its own history refuses any SGMTLEAF
+    // tx whose record is missing, so the durable log must be attached
+    // BEFORE the replay loop below.
+    vx::crypto::dksap::DksapSidecarRegistry::instance().attach_sgmt_durable_log(ledger_path +
+                                                                                ".sgm");
     uint64_t current_height = store.chain_height();
     std::cout << "      ✓ Chain height: " << current_height << " blocks (tip = #" << (current_height - 1) << ")\n\n";
 

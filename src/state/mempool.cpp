@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace vx::state {
 
@@ -407,6 +409,90 @@ std::vector<Transaction> Mempool::pull_for_sealing(size_t max_count) noexcept {
         }
     }
     return result;
+}
+
+void Mempool::drop_txs(const std::vector<Transaction> &dropped) noexcept {
+    struct DropKey {
+        Address sender;
+        uint32_t nonce;
+        bool operator==(const DropKey &other) const noexcept {
+            return nonce == other.nonce && std::memcmp(sender.data(), other.sender.data(), 42) == 0;
+        }
+    };
+    struct KeyHash {
+        size_t operator()(const DropKey &k) const noexcept {
+            size_t h = 1469598103934665603ull;
+            for (uint8_t b : k.sender) {
+                h ^= b;
+                h *= 1099511628211ull;
+            }
+            return h ^ (k.nonce + 0x9e3779b9 + (h << 6) + (h >> 2));
+        }
+    };
+    std::unordered_map<Address, uint32_t, AddressHash> rewind_nonce;
+    std::unordered_set<DropKey, KeyHash> drop_set;
+    for (const auto &tx : dropped) {
+        DropKey key{tx_address(tx.sender_nfa), tx_nonce_local(tx)};
+        drop_set.insert(key);
+        auto it = rewind_nonce.find(key.sender);
+        if (it == rewind_nonce.end() || tx_nonce_local(tx) < it->second)
+            rewind_nonce[key.sender] = tx_nonce_local(tx);
+    }
+
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    const size_t cnt = count_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < cnt; ++i) {
+        if (!entries_[i].valid)
+            continue;
+        DropKey key{tx_address(entries_[i].tx.sender_nfa), entries_[i].sender_nonce};
+        if (drop_set.find(key) == drop_set.end())
+            continue;
+        Address sender = tx_address(entries_[i].tx.sender_nfa);
+        uint64_t amount = tx_amount_local(entries_[i].tx);
+        uint32_t fee = tx_fee_local(entries_[i].tx);
+        // Un-reserve the pending outgoing (never applied — full refund).
+        auto pending_it = pending_outgoing_.find(sender);
+        if (pending_it != pending_outgoing_.end()) {
+            if (pending_it->second >= U128(amount + fee))
+                pending_it->second = pending_it->second - U128(amount + fee);
+            else {
+                std::fputs("mempool: pending_outgoing_ underflow (drop_txs invariant violation)\n",
+                           stderr);
+                pending_it->second = U128{0};
+            }
+            if (pending_it->second.is_zero())
+                pending_outgoing_.erase(pending_it);
+        }
+        // Rewind the pending nonce to the dropped nonce: the state layer
+        // refused it, so the sender's next expected nonce is THIS nonce.
+        {
+            auto &cur = pending_nonces_[sender];
+            const uint32_t want = rewind_nonce[sender];
+            if (cur > want || cur == 0)
+                cur = want;
+        }
+        auto pc = pending_counts_.find(sender);
+        if (pc != pending_counts_.end()) {
+            if (pc->second > 0)
+                --pc->second;
+            if (pc->second == 0)
+                pending_counts_.erase(pc);
+        }
+        entries_[i].valid = false;
+    }
+
+    // Compact the array (move valid entries to front) and update the count —
+    // the same bookkeeping remove_sealed performs; without it the drop is
+    // invisible to stats() and to pull_for_sealing.
+    size_t write_idx = 0;
+    for (size_t i = 0; i < cnt; ++i) {
+        if (entries_[i].valid) {
+            if (write_idx != i)
+                entries_[write_idx] = entries_[i];
+            ++write_idx;
+        }
+    }
+    count_.store(write_idx, std::memory_order_release);
 }
 
 void Mempool::remove_sealed(const std::vector<Transaction>& sealed_txs) noexcept {

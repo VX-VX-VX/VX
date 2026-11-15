@@ -166,6 +166,10 @@ public:
     // seal_mutex_ itself, in the established order.
     void on_witness_arrived(const std::array<uint8_t, 32> &digest);
 
+    // DKSAP wire integration: sidecar-parked frame retry (the analog of
+    // on_witness_arrived for SGMT registration records).
+    void on_sidecar_arrived(const std::array<uint8_t, 32> &digest);
+
     // BACKLOG 2.11 third checkbox: witness retention window. Fires on the
     // SwarmNode peer-connected callback (one-shot per promotion): re-serves
     // the witnesses of the last kWitnessRetentionBlocks stored blocks to the
@@ -259,6 +263,13 @@ private:
     // Gossip one sealed frame: PQ witnesses first, then the frame (BACKLOG
     // 0.8 ordering - a peer without the witnesses cannot apply the block).
     void broadcast_frame_bytes(const uint8_t* frame65536);
+
+    // DKSAP wire integration endpoints: SGMT nickname registration and
+    // stealth transfer submission, the radar watch list, and the hit log.
+    HttpResponse handle_sgmt_register(const HttpRequest &req);
+    HttpResponse handle_sgmt_stealth(const HttpRequest &req);
+    HttpResponse handle_sgmt_watch(const HttpRequest &req);
+    HttpResponse handle_sgmt_hits(const HttpRequest &req);
 
     HttpResponse handle_status(const HttpRequest& req);
     HttpResponse handle_blocks(const HttpRequest& req);
@@ -361,6 +372,24 @@ private:
     // Auth token state (never logged, never echoed back).
     std::string auth_token_;
     bool auth_enabled_ = false;
+
+    // ── DKSAP wire integration: the radar watch list ───────────────────────
+    // Each entry is one locally-held account (the node IS the wallet for
+    // testnet mode): the IVK can decapsulate, SKspend additionally
+    // regenerates the one-time secret. The radar cycle runs per sealed
+    // frame: STEALTH receivers -> digest -> StealthTx bundle -> radar_scan
+    // (view_tag two-phase) -> hits resolved to nicknames via the SGMT
+    // trie. Secret-bearing fields live only in RAM.
+    struct RadarWatch {
+        std::string nickname;
+        std::array<uint8_t, vx::crypto::dksap::T_COMMIT_SIZE> t_spend{};
+        std::vector<uint8_t> kem_sk; // dksap::KEM_SK_SIZE
+        bool spend_sk_present = false;
+        std::array<uint8_t, 32> sk_spend{};
+    };
+    std::vector<RadarWatch> radar_watches_;
+    std::vector<std::string> radar_hits_; // capped, in-memory
+    void run_radar_for_frame(const uint8_t *frame65536);
 
     storage::BlockStore& store_;
     state::LedgerState& ledger_;

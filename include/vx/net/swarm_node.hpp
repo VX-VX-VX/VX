@@ -66,6 +66,16 @@ enum class WireMsgType : uint8_t {
     // reachable again by a third node. The old fail-closed rule is
     // preserved one notch further out: 0x0E still fails closed.
     ADDRS = 0x0D,
+    // DKSAP wire integration: digest-keyed sidecar records. SGMT_REG =
+    // digest(32) + nlen(1) + nickname(n, 1..32) + PublicKeys(1568) for an
+    // on-chain SGMTLEAF registration (consensus-visible: the receiving
+    // node can only apply the dependent block once this record is in the
+    // registry). STEALTH = digest(32) + StealthTx(1540) for an on-chain
+    // STEALTH transfer (radar-only, never consensus). Both keyed by
+    // tx_msg_digest — a record replayed under a foreign digest cannot
+    // pass the leaf gate.
+    DKSAP_SGMT_REG = 0x0E,
+    DKSAP_STEALTH = 0x0F,
 };
 
 // Wire flags
@@ -236,6 +246,15 @@ public:
     // for unknown message types.
     void broadcast_rollover_cert(const vx::crypto::pq::PqRolloverCert &cert);
 
+    // DKSAP wire integration: broadcast the sidecar records the frame's
+    // transactions need. For every STEALTH receiver the StealthTx bundle
+    // (digest(32) + bundle(1540)) and for every SGMTLEAF receiver the
+    // registration record (digest(32) + nlen(1) + nickname + keys(1568))
+    // is looked up by the tx digest and relayed — call BEFORE
+    // broadcast_frame so receiving nodes can resolve their parked frames
+    // on arrival. A missing record is skipped (nothing to relay).
+    void broadcast_sidecars_for(const std::span<const uint8_t, 65536> &frame);
+
     // BACKLOG 1.5 P0 GATE: cert backfill. Announces to ONE peer the ids of
     // this node's most recently stored certificates (connect-time
     // retention; max_ids is capped at 64 by the wire format). The peer
@@ -266,6 +285,13 @@ public:
     using FrameHook =
         std::function<void(const uint8_t *frame, size_t len, const std::string &peer_label)>;
     void set_frame_hook(FrameHook hook);
+
+    // DKSAP wire integration: invoked when a sidecar record arrives over
+    // the wire (DKSAP_SGMT_REG / DKSAP_STEALTH). The node layer retries
+    // any parked frames whose SGMT registration sidecar just arrived (the
+    // analog of the witness retry hook).
+    using SidecarHook = std::function<void(const std::array<uint8_t, 32> &digest)>;
+    void set_sidecar_callback(SidecarHook hook);
 
     // BACKLOG 2.11 stage 2: fired on BOTH reader loops after a PQ_WITNESS
     // message is registered in the witness registry, so the intake layer
@@ -523,6 +549,7 @@ private:
     // Callback for verified inbound block frames (set by the node layer)
     FrameHook frame_hook_;
     WitnessCallback witness_callback_;
+    SidecarHook sidecar_callback_;
     PeerConnectedCallback peer_connected_callback_;
 
     // VX60 wire statistics (atomic: updated from multiple threads)
@@ -573,6 +600,11 @@ private:
         int fd,
         const std::vector<std::array<uint8_t, 32 + 42 + sizeof(vx::crypto::pq::PqSignatureWitness)>>
             &payloads);
+    // DKSAP wire integration: variable-length sidecar payloads under one
+    // message type (the SGMT record carries the nickname). Same dup-fd and
+    // partial-send discipline as send_payloads_to.
+    bool send_wire_payloads_to(int fd, WireMsgType type,
+                               const std::vector<std::vector<uint8_t>> &payloads);
 
     // BACKLOG 1.5 P0 GATE: cert backfill plumbing. Handlers parse a
     // bounded id list (count <= 64), answer targeted; senders use the same

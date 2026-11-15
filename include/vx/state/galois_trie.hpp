@@ -85,6 +85,26 @@ class GaloisTrie {
 public:
     GaloisTrie();
 
+    // Deep copy (see Node::clone_from): LedgerState snapshots hold the
+    // trie by value, so a trie copy is a full node-tree clone — the root,
+    // leaf and node counters copy byte-for-byte.
+    GaloisTrie(const GaloisTrie &o)
+        : root_(o.root_), leaf_count_(o.leaf_count_), node_count_(o.node_count_) {
+        root_node_.clone_from(o.root_node_);
+    }
+    GaloisTrie &operator=(const GaloisTrie &o) {
+        if (this != &o) {
+            root_node_ = Node{};
+            root_node_.clone_from(o.root_node_);
+            root_ = o.root_;
+            leaf_count_ = o.leaf_count_;
+            node_count_ = o.node_count_;
+        }
+        return *this;
+    }
+    GaloisTrie(GaloisTrie &&) = default;
+    GaloisTrie &operator=(GaloisTrie &&) = default;
+
     /// Insert/update a 32-byte value under a 32-byte key. Returns new root.
     std::array<uint8_t, 32> put(const uint8_t key[32], const uint8_t val[32]);
 
@@ -145,6 +165,24 @@ private:
             for (auto it = children.begin(); it != children.end(); ++it)
                 if (it->first == idx) { children.erase(it); return true; }
             return false;
+        }
+        // Deep copy: LedgerState is snapshotted by value (crash-torture
+        // reorg tests), and the SGMT trie is now part of that state — the
+        // unique_ptr-based sparse children cannot be default-copied, so the
+        // clone is explicit and recursive.
+        void clone_from(const Node &src) {
+            std::memcpy(child_bitmap, src.child_bitmap, sizeof(child_bitmap));
+            self_hash = src.self_hash;
+            value = src.value;
+            is_leaf = src.is_leaf;
+            has_value = src.has_value;
+            children.clear();
+            children.reserve(src.children.size());
+            for (const auto &[idx, child] : src.children) {
+                auto copy = std::make_unique<Node>();
+                copy->clone_from(*child);
+                children.emplace_back(idx, std::move(copy));
+            }
         }
     };
 

@@ -854,7 +854,7 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(2);
+        bytes.push_back(3); // kUndoVersion 3 (DKSAP sgmt-undo)
         bytes.push_back(0);
         bytes.push_back(0);
         bytes.push_back(0);
@@ -872,7 +872,7 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(2);
+        bytes.push_back(3); // kUndoVersion 3 (DKSAP sgmt-undo)
         bytes.push_back(0);
         bytes.push_back(0);
         bytes.push_back(0);
@@ -891,7 +891,7 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
     {
         std::vector<uint8_t> bytes;
         bytes.insert(bytes.end(), {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'});
-        bytes.push_back(2);
+        bytes.push_back(3); // kUndoVersion 3 (DKSAP sgmt-undo)
         bytes.push_back(0);
         bytes.push_back(0);
         bytes.push_back(0);
@@ -902,12 +902,13 @@ TEST(VortexDocumentedGapsTest, UndoJournalRejectsHostileFiles) {
         put_u64(bytes, 0);                   // prev supply
         put_u64(bytes, 0);                   // prev accounts count
         put_u64(bytes, 0);                   // tx_count = 0
-        put_u64(bytes, 0);                   // created_count = 0 (v2 field)
+        put_u64(bytes, 0);                   // created_count = 0
+        put_u64(bytes, 0);                   // sgmt_count = 0 (v3 field)
         bytes.insert(bytes.end(), 10, 0xAB); // torn tail
         write_file(bytes);
         vx::state::UndoEngine undo(dir, store, ledger);
         ASSERT_TRUE(std::filesystem::exists(jpath));
-        EXPECT_EQ(std::filesystem::file_size(jpath), 12ULL + 88ULL)
+        EXPECT_EQ(std::filesystem::file_size(jpath), 12ULL + 96ULL)
             << "the torn tail was not healed to the last complete record";
         EXPECT_TRUE(undo.rollback_to_height(0)) << undo.last_error();
     }

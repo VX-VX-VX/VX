@@ -42,14 +42,18 @@ namespace {
 // truncating to the last complete record.
 
 constexpr char kUndoMagic[8] = {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'};
-constexpr uint32_t kUndoVersion = 2;
+// v3: + sgmt_undo (DKSAP wire integration) — key(32) + prev_leaf(32) +
+// existed(1) per registration. A pre-v3 journal is discarded by the
+// reject-or-migrate policy and rebuilt from live block application.
+constexpr uint32_t kUndoVersion = 3;
 constexpr size_t kUndoHeaderSize = 12;
 constexpr size_t kUndoTxSize = 42 + 42 + 16 + 16 + 4;
+constexpr size_t kUndoSgmtSize = 32 + 32 + 1;
 // A zero-tx record: the smallest possible complete record (height, time,
-// tip, supply, accounts count, zero tx count, zero created addresses).
-// Fewer bytes than this at the end of a file cannot start a valid record —
-// that is a torn tail, not corruption.
-constexpr size_t kMinRecordSize = 88;
+// tip, supply, accounts count, zero tx count, zero created addresses, and
+// — v3 — a zero sgmt-undo count). Fewer bytes than this at the end of a
+// file cannot start a valid record — that is a torn tail, not corruption.
+constexpr size_t kMinRecordSize = 96;
 // A safety cap on replay input, not a real limit: 64 MiB covers roughly
 // 400k single-tx records; larger files are treated as malformed.
 constexpr size_t kUndoFileCap = 64ULL * 1024 * 1024;
@@ -86,8 +90,8 @@ void put_bytes(std::vector<uint8_t>& out, const uint8_t* p, size_t n) {
 }
 
 size_t record_bytes(const UndoRecord& r) {
-    return 8 + 8 + 32 + 16 + 8 + 8 + r.transactions.size() * kUndoTxSize +
-           8 + r.created_addresses.size() * 42;
+    return 8 + 8 + 32 + 16 + 8 + 8 + r.transactions.size() * kUndoTxSize + 8 +
+           r.created_addresses.size() * 42 + 8 + r.sgmt_undo.size() * kUndoSgmtSize;
 }
 void serialize_record(const UndoRecord& r, std::vector<uint8_t>& out) {
     put_u64(out, r.height);
@@ -119,6 +123,12 @@ void serialize_record(const UndoRecord& r, std::vector<uint8_t>& out) {
         uint8_t addr[42] = {0};
         std::memcpy(addr, created.data(), std::min(created.size(), size_t(42)));
         put_bytes(out, addr, 42);
+    }
+    put_u64(out, r.sgmt_undo.size());
+    for (const auto &s : r.sgmt_undo) {
+        put_bytes(out, s.key.data(), 32);
+        put_bytes(out, s.prev_leaf.data(), 32);
+        out.push_back(s.existed ? 1 : 0);
     }
 }
 
@@ -202,6 +212,25 @@ bool parse_record(ByteReader& r, UndoRecord& out) {
         r.get_bytes(addr, 42);
         if (!r.ok) return false;
         out.created_addresses.emplace_back(reinterpret_cast<const char*>(addr), 42);
+    }
+    const uint64_t sgmt_count = r.get_u64();
+    if (!r.ok)
+        return false;
+    // A block cannot register more nicknames than it has transactions.
+    if (sgmt_count > blockchain::MAX_TX_PER_BLOCK)
+        return false; // malformed
+    out.sgmt_undo.reserve(sgmt_count);
+    for (uint64_t i = 0; i < sgmt_count; ++i) {
+        UndoRecord::SgmtLeafUndo s;
+        r.get_bytes(s.key.data(), 32);
+        r.get_bytes(s.prev_leaf.data(), 32);
+        const uint8_t *existed;
+        if (!r.take(1, &existed))
+            return false;
+        s.existed = (*existed != 0);
+        if (!r.ok)
+            return false;
+        out.sgmt_undo.push_back(std::move(s));
     }
     return r.ok;
 }
@@ -307,6 +336,34 @@ void UndoEngine::apply_block(const blockchain::BlockView& block) {
 
     // Store record in undo journal
     undo_journal_.push_back(record);
+}
+
+void UndoEngine::record_sgmt_undo(uint64_t height,
+                                  const std::vector<ApplyResult::SgmtUndoEntry> &entries) {
+    if (entries.empty())
+        return;
+    // The block that just applied has the newest record for that height —
+    // append there so the rollback's newest-first traversal sees this
+    // block's effects before older ones (the oldest snapshot wins for
+    // repeated registrations of one nickname across rolled-back blocks).
+    for (auto it = undo_journal_.rbegin(); it != undo_journal_.rend(); ++it) {
+        if (it->height != height)
+            continue;
+        for (const auto &e : entries) {
+            UndoRecord::SgmtLeafUndo s;
+            std::memcpy(s.key.data(), e.key.data(), 32);
+            std::memcpy(s.prev_leaf.data(), e.prev_leaf.data(), 32);
+            s.existed = e.existed;
+            it->sgmt_undo.push_back(std::move(s));
+        }
+        return;
+    }
+    // No journal record for the height: the block was applied without a
+    // pre-state entry (a path that bypasses UndoEngine::apply_block). Its
+    // trie effects would be reversed by nothing — the coverage guard makes
+    // the rollback refuse instead of silently dropping them.
+    std::fprintf(stderr, "[UNDO] no journal record for height %llu: SGMT undo dropped\n",
+                 static_cast<unsigned long long>(height));
 }
 
 void UndoEngine::commit_undo_point() {
@@ -616,6 +673,20 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
             std::memcpy(created_addr.data(), created.data(),
                         std::min(created.size(), size_t(42)));
             ledger_.forget_empty_address(created_addr);
+        }
+
+        // DKSAP wire integration: restore the SGMT leaves this block
+        // replaced. Records unwind newest-first, so for a nickname
+        // registered in several of the rolled-back blocks the OLDEST
+        // pre-block leaf wins — exactly the pre-reorg trie.
+        for (const auto &s : record.sgmt_undo) {
+            if (!ledger_.sgmt_restore(s.key, s.prev_leaf, s.existed)) {
+                std::fprintf(stderr,
+                             "[UNDO] state/journal mismatch: SGMT leaf restore at height %llu\n",
+                             static_cast<unsigned long long>(record.height));
+                last_error_ = "ERR_UNDO_STATE_MISMATCH";
+                return false;
+            }
         }
     }
 

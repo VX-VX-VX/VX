@@ -70,8 +70,13 @@ bool sensitive_body_path(std::string_view target) {
     std::string path(target);
     std::string query;
     split_path_query(path, query);
-    static const std::array<std::string_view, 2> kSensitiveBodyPaths{"/api/wallet/rollover",
-                                                                     "/api/crypto/lab"};
+    static const std::array<std::string_view, 3> kSensitiveBodyPaths{"/api/wallet/rollover",
+                                                                     "/api/crypto/lab",
+                                                                     // DKSAP wire integration:
+                                                                     // kem_sk/sk_spend ride the
+                                                                     // body — the transport
+                                                                     // copies must not linger.
+                                                                     "/api/sgmt/watch"};
     for (const auto p : kSensitiveBodyPaths)
         if (path == p)
             return true;
@@ -287,6 +292,10 @@ void HttpServer::attach_p2p(uint16_t p2p_port, const std::vector<std::string> &p
     // BACKLOG 2.11 stage 2: retry parked frames when their witnesses arrive.
     swarm_node_->set_witness_callback(
         [this](const std::array<uint8_t, 32> &digest) { on_witness_arrived(digest); });
+    // DKSAP wire integration: retry sidecar-parked frames when their
+    // SGMT registration record arrives.
+    swarm_node_->set_sidecar_callback(
+        [this](const std::array<uint8_t, 32> &digest) { on_sidecar_arrived(digest); });
     // BACKLOG 2.11 third checkbox: a newly promoted peer gets the witness
     // retention window re-served (fire-and-forget gossip alone leaves a
     // peer that connected mid-stream permanently unable to verify).
@@ -443,8 +452,9 @@ HttpServer::try_apply_remote_frame(const uint8_t *bytes, const std::string &peer
         parked_witness_frames_.push_back(std::move(pf));
         return RemoteApply::PARKED;
     }
-    if (wstatus == vx::blockchain::WitnessRootStatus::MISMATCH) {
-        // Withholding becomes attribution: the commitment names a witness
+    if (wstatus ==
+        vx::blockchain::WitnessRootStatus::MISMATCH) { // Withholding becomes attribution: the
+                                                       // commitment names a witness
         // set no canonical rule produces. Scored per peer; escalation to a
         // mute/ban rides the SwarmNode reputation surface.
         // Security review 2026-11-12 (MEDIUM): a MISMATCH on a PARKED-RETRY
@@ -473,6 +483,64 @@ HttpServer::try_apply_remote_frame(const uint8_t *bytes, const std::string &peer
         return RemoteApply::REFUSED;
     }
 
+    // ── DKSAP wire integration: sidecar pre-gate ────────────────────────────
+    // An SGMTLEAF registration tx cannot apply without its digest-keyed
+    // record (the ledger refuses "sidecar missing"). Parking it — like the
+    // MISSING_WITNESS shape above — lets the frame apply on sidecar
+    // arrival instead of being dropped: gossip races, records usually land
+    // one hop behind the frame. Appending first would also work (the
+    // rollback_last_append path exists) but burns a PoGW-verified append
+    // on a frame that is refused by construction.
+    {
+        const auto *fr = reinterpret_cast<const vx::blockchain::RawBlock *>(f.data());
+        uint32_t scount =
+            fr->header.tx_count > vx::blockchain::MAX_TX_PER_BLOCK ? 0u : fr->header.tx_count;
+        bool missing_sgmt = false;
+        for (uint32_t i = 0; i < scount && !missing_sgmt; ++i) {
+            const auto &t = fr->transactions[i];
+            if (!vx::crypto::dksap::receiver_is_sgmtleaf(t.receiver_nfa))
+                continue;
+            uint8_t frame_leaf_raw[32];
+            if (!vx::crypto::dksap::sgmtleaf_of(t.receiver_nfa, frame_leaf_raw)) {
+                missing_sgmt = true; // non-canonical receiver: consensus refuses anyway
+                continue;
+            }
+            std::array<uint8_t, 32> frame_leaf{};
+            std::memcpy(frame_leaf.data(), frame_leaf_raw, 32);
+            const auto d = vx::crypto::pq::tx_msg_digest(t);
+            vx::crypto::dksap::SgmtRecord rec;
+            if (!vx::crypto::dksap::DksapSidecarRegistry::instance().resolve_sgmt_record(
+                    d, frame_leaf, rec))
+                missing_sgmt = true; // no candidate commits this leaf
+        }
+        if (missing_sgmt) {
+            purge_expired_parked_locked();
+            std::string ip = peer;
+            const auto colon = ip.rfind(':');
+            if (colon != std::string::npos)
+                ip.resize(colon);
+            size_t peer_parked = 0;
+            for (const auto &p : parked_witness_frames_) {
+                std::string peer_ip = p.peer_label;
+                const auto pcolon = peer_ip.rfind(':');
+                if (pcolon != std::string::npos)
+                    peer_ip.resize(pcolon);
+                if (peer_ip == ip)
+                    ++peer_parked;
+            }
+            if (peer_parked >= kMaxParkedFramesPerPeer)
+                return RemoteApply::REFUSED;
+            if (parked_witness_frames_.size() >= kMaxParkedWitnessFrames)
+                return RemoteApply::REFUSED; // global cap: same policy as witnesses
+            ParkedFrame pf;
+            std::memcpy(pf.bytes.data(), bytes, 65536);
+            pf.arrived = std::chrono::steady_clock::now();
+            pf.peer_label = peer;
+            parked_witness_frames_.push_back(std::move(pf));
+            return RemoteApply::PARKED;
+        }
+    }
+
     if (!store_.append_block(f))
         return RemoteApply::REFUSED;
     auto* raw = store_.get_block(h);
@@ -488,9 +556,15 @@ HttpServer::try_apply_remote_frame(const uint8_t *bytes, const std::string &peer
     }
 
     // Gossip one hop past the origin; peers that already have it will drop
-    // the duplicate at the height check above. Witnesses first (BACKLOG 0.8).
+    // the duplicate at the height check above. Witnesses first (BACKLOG 0.8),
+    // then the DKSAP sidecars (parked SGMT registrations resolve on arrival),
+    // then the frame.
     swarm_node_->broadcast_witnesses_for(std::span<const uint8_t, 65536>(bytes, 65536));
+    swarm_node_->broadcast_sidecars_for(std::span<const uint8_t, 65536>(bytes, 65536));
     swarm_node_->broadcast_frame(std::span<const uint8_t, 65536>(bytes, 65536));
+    // The radar cycle runs under the state_mutex_ this function already
+    // holds (the frame just became our tip).
+    run_radar_for_frame(bytes);
     // SSE push (v0.0.8): a remote frame is now our new tip — same event the
     // local miner fires, so GUI clients hear remote seals too.
     broadcast_sse_event("block_sealed", "{\"height\":" + std::to_string(h) + "}");
@@ -570,6 +644,47 @@ void HttpServer::on_witness_arrived(const std::array<uint8_t, 32> &digest) {
 size_t HttpServer::parked_witness_count() {
     std::lock_guard<std::mutex> state_lock(state_mutex_);
     return parked_witness_frames_.size();
+}
+
+void HttpServer::on_sidecar_arrived(const std::array<uint8_t, 32> &digest) {
+    // DKSAP wire integration: the analog of on_witness_arrived — a sidecar
+    // record just landed; retry any parked frame whose SGMTLEAF tx named
+    // this digest (the sidecar pre-gate parked it).
+    std::vector<ParkedFrame> candidates;
+    {
+        std::lock_guard<std::mutex> state_lock(state_mutex_);
+        if (parked_witness_frames_.empty())
+            return;
+        purge_expired_parked_locked();
+        for (auto it = parked_witness_frames_.begin(); it != parked_witness_frames_.end();) {
+            const auto *raw = reinterpret_cast<const vx::blockchain::RawBlock *>(it->bytes.data());
+            const uint32_t count =
+                raw->header.tx_count > vx::blockchain::MAX_TX_PER_BLOCK ? 0u : raw->header.tx_count;
+            bool hit = false;
+            for (uint32_t i = 0; i < count && !hit; ++i) {
+                const auto &tx = raw->transactions[i];
+                if (!vx::crypto::dksap::receiver_is_sgmtleaf(tx.receiver_nfa))
+                    continue;
+                if (vx::crypto::pq::tx_msg_digest(tx) == digest)
+                    hit = true;
+            }
+            if (hit) {
+                candidates.push_back(std::move(*it));
+                it = parked_witness_frames_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto &pf : candidates) {
+        const auto outcome =
+            try_apply_remote_frame(pf.bytes.data(), pf.peer_label, /*from_park=*/true);
+        if (outcome == RemoteApply::PARKED) {
+            std::lock_guard<std::mutex> state_lock(state_mutex_);
+            if (parked_witness_frames_.size() < kMaxParkedWitnessFrames)
+                parked_witness_frames_.push_back(std::move(pf));
+        }
+    }
 }
 
 void HttpServer::serve_witness_retention(const std::string &peer_label) {
@@ -1004,7 +1119,17 @@ HttpResponse HttpServer::dispatch(const HttpRequest& req) {
     if (req.method == "POST" && req.path == "/api/mempool/submit") return handle_mempool_submit(req);
     if (req.method == "POST" && req.path == "/api/mempool/seal") return handle_mempool_seal(req);
 
- // VX60 P2P wire + split-brain reorg
+    // DKSAP wire integration: SGMT registration / stealth transfer / radar.
+    if (req.method == "POST" && req.path == "/api/sgmt/register")
+        return handle_sgmt_register(req);
+    if (req.method == "POST" && req.path == "/api/sgmt/stealth")
+        return handle_sgmt_stealth(req);
+    if (req.method == "POST" && req.path == "/api/sgmt/watch")
+        return handle_sgmt_watch(req);
+    if (req.method == "GET" && req.path == "/api/sgmt/hits")
+        return handle_sgmt_hits(req);
+
+    // VX60 P2P wire + split-brain reorg
     if (req.method == "GET" && req.path == "/api/swarm/peers") return handle_swarm_peers(req);
     if (req.method == "POST" && req.path == "/api/swarm/simulate_split_reorg") return handle_swarm_simulate_split_reorg(req);
 
@@ -1092,7 +1217,14 @@ bool HttpServer::is_mutating_endpoint(const HttpRequest& req) noexcept {
            // Wallet policy (owner sign-off 2026-11-11): burns the certificate
            // leaf (an irreversible key-lifecycle event) and registers a
            // rollover certificate — same fail-closed token gate.
-           || req.path == "/api/wallet/rollover";
+           || req.path == "/api/wallet/rollover"
+           // DKSAP wire integration: SGMT registration seals a nickname into
+           // the trie (a permanent consensus event — squatting), the stealth
+           // transfer moves value into a stealth tracker, and the radar
+           // watch list accepts secret key material. All three are
+           // fail-closed token-gated.
+           || req.path == "/api/sgmt/register" || req.path == "/api/sgmt/stealth" ||
+           req.path == "/api/sgmt/watch";
 }
 
 // Security-review P1-2/P2-1: endpoints that never mutate persistent state
@@ -1133,7 +1265,10 @@ bool HttpServer::is_sensitive_endpoint(const HttpRequest &req) noexcept {
            || req.path == "/api/zk/derive_matrix"  // returns SpendingKey material
            || req.path == "/api/zk/recover_shamir" // shard demo returns the secret
            || req.path == "/api/telemetry/rdtsc"   // primitive-timing recon + CPU burn
-           || req.path == "/api/vault/memory";     // arena fingerprint + hw_uuid
+           || req.path == "/api/vault/memory"      // arena fingerprint + hw_uuid
+           // DKSAP wire integration: /api/sgmt/hits lists inbound stealth
+           // transfers (an attacker-writable privacy surface if unauthenticated).
+           || req.path == "/api/sgmt/hits";
 }
 
 // Length-and-byte constant-time comparison; the loop always runs over the
@@ -1623,6 +1758,12 @@ HttpServer::validate_signed_transfer(const HttpRequest& req,
 void HttpServer::broadcast_frame_bytes(const uint8_t* frame65536) {
     swarm_node_->broadcast_witnesses_for(
         std::span<const uint8_t, 65536>(frame65536, 65536));
+    // DKSAP wire integration: sidecars before the frame (the same ordering
+    // rule as witnesses — a peer without the record cannot apply the block).
+    swarm_node_->broadcast_sidecars_for(std::span<const uint8_t, 65536>(frame65536, 65536));
+    // The radar cycle runs on every sealed frame under the caller's
+    // state_mutex_ (the watch entries are the node-wallet's IVKs).
+    run_radar_for_frame(frame65536);
     swarm_node_->broadcast_frame(
         std::span<const uint8_t, 65536>(frame65536, 65536));
 }
@@ -1768,6 +1909,399 @@ HttpResponse HttpServer::handle_mempool_seal(const HttpRequest& /*req*/) {
         << "\"transfers\":" << sealed.header().tx_count << ","
         << "\"mempool_count\":" << st.count << "}";
     return HttpResponse::json(200, oss.str());
+}
+
+// ── DKSAP wire integration: SGMT registration / stealth transfer / radar ────
+// The submission endpoints follow /api/transfer: the server NEVER signs on
+// the user's behalf — a PQ witness over the assembled transaction rides in
+// the request, is verified BEFORE any registry write, and the sidecar
+// record is durably logged before the dependent block may apply.
+
+namespace {
+
+bool rpc_parse_hex(const std::string &hex, uint8_t *out, size_t n) {
+    if (hex.size() != n * 2)
+        return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const int hi = nib(hex[2 * i]);
+        const int lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0)
+            return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+std::string rpc_field(const HttpRequest &req, const std::string &key) {
+    std::string pat = "\"" + key + "\"";
+    size_t pos = req.body.find(pat);
+    if (pos == std::string::npos)
+        return "";
+    pos += pat.size();
+    while (pos < req.body.size() && (req.body[pos] == ' ' || req.body[pos] == '\t'))
+        ++pos;
+    if (pos >= req.body.size() || req.body[pos] != ':')
+        return "";
+    ++pos;
+    while (pos < req.body.size() && (req.body[pos] == ' ' || req.body[pos] == '\t'))
+        ++pos;
+    if (pos >= req.body.size() || req.body[pos] != '"')
+        return "";
+    size_t end = req.body.find('"', pos);
+    if (end == std::string::npos)
+        return "";
+    return req.body.substr(pos, end - pos);
+}
+
+std::string rpc_field_b64(const HttpRequest &req, const std::string &key) {
+    // Base64 values contain no quote characters — the tolerant scan above
+    // applies as-is.
+    return rpc_field(req, key);
+}
+
+HttpResponse rpc_strip_nfa(std::string payload, vx::blockchain::Address &out) {
+    if (payload.size() >= 7 && payload.rfind("NFA_V6_", 0) == 0)
+        payload = payload.substr(7);
+    const size_t start = (payload.size() > 42) ? payload.size() - 42 : 0;
+    std::memset(out.data(), 0, 42);
+    std::memcpy(out.data(), payload.data() + start, std::min(payload.size() - start, size_t(42)));
+    if (payload.rfind("GENESIS", 0) == 0 || payload.rfind("MINER_", 0) == 0)
+        return HttpResponse::error(403, "system sender prefixes are not accepted here");
+    // ok: sentinel with the class default status
+    return HttpResponse::json(200, "");
+}
+
+bool rpc_parse_witness_b64(const std::string &witness_b64, vx::crypto::pq::PqSignatureWitness &w) {
+    static constexpr char kB64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    auto nib = [](char c) -> int {
+        for (int i = 0; i < 64; ++i)
+            if (kB64[i] == c)
+                return i;
+        if (c == '-')
+            return 62;
+        if (c == '_')
+            return 63; // url-safe too
+        return -1;
+    };
+    std::string clean;
+    clean.reserve(witness_b64.size());
+    for (char c : witness_b64) {
+        if (c == '\n' || c == '\r' || c == ' ')
+            continue;
+        if (c == '=')
+            break;
+        clean.push_back(c);
+    }
+    if (clean.size() % 4 != 0 || clean.size() / 4 * 3 != sizeof(vx::crypto::pq::PqSignatureWitness))
+        return false;
+    uint8_t *out = reinterpret_cast<uint8_t *>(&w);
+    size_t oi = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char c : clean) {
+        const int v = nib(c);
+        if (v < 0)
+            return false;
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (oi >= sizeof(w))
+                return false;
+            out[oi++] = static_cast<uint8_t>((acc >> bits) & 0xFF);
+        }
+    }
+    return oi == sizeof(w);
+}
+
+} // namespace
+
+namespace {
+/// Guarded uint parse (external review P3): std::stoul throws on garbage —
+/// route()'s catch turns that into a 500; these fields deserve a clean 403.
+bool rpc_field_u32(const HttpRequest &req, const std::string &key, uint32_t &out) {
+    const std::string v = rpc_field(req, key);
+    if (v.empty()) {
+        out = 0;
+        return true;
+    }
+    try {
+        const unsigned long long n = std::stoull(v);
+        out = (n > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(n);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+} // namespace
+
+HttpResponse HttpServer::handle_sgmt_register(const HttpRequest &req) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+
+    const std::string nickname = rpc_field(req, "nickname");
+    if (!vx::crypto::dksap::nickname_valid(nickname))
+        return HttpResponse::error(403, "nickname must be 1..32 printable ASCII bytes");
+
+    // The claimed account: PUBLIC key material only — the master seed
+    // never crosses the wire (the client derives locally).
+    vx::crypto::dksap::PublicKeys pub{};
+    if (!rpc_parse_hex(rpc_field(req, "t_spend_hex"), pub.t_spend.data(), pub.t_spend.size()))
+        return HttpResponse::error(403, "t_spend_hex must be 768 hex chars");
+    if (!rpc_parse_hex(rpc_field(req, "kkem_hex"), pub.kkem.data(), pub.kkem.size()))
+        return HttpResponse::error(403, "kkem_hex must be 2368 hex chars");
+
+    vx::blockchain::Address sender{};
+    if (auto err = rpc_strip_nfa(rpc_field(req, "sender"), sender); err.status_code != 200)
+        return err;
+
+    // First-come-wins pre-check: fail fast when the nickname is occupied by
+    // a different commitment (the consensus gate refuses it anyway — the
+    // registration must never poison the durable log first).
+    const auto key = vx::crypto::dksap::sgmt_key(nickname);
+    std::array<uint8_t, 32> existing{};
+    if (ledger_.sgmt_trie().get(key.data(), existing.data())) {
+        const auto commit = vx::crypto::dksap::sgmt_commit(nickname, pub);
+        if (!vx::core::ct_equal(existing.data(), commit.data(), 32))
+            return HttpResponse::error(403, "nickname already registered (first-come-wins)");
+    }
+
+    const auto leaf = vx::crypto::dksap::sgmt_commit(nickname, pub);
+    vx::blockchain::Transaction tx{};
+    std::memcpy(tx.sender_nfa, sender.data(), 42);
+    vx::crypto::dksap::make_sgmtleaf_receiver(leaf.data(), tx.receiver_nfa);
+    vx::blockchain::tx_set_amount(tx, 0);
+    uint32_t fee = 1000, nonce = 0;
+    if (!rpc_field_u32(req, "fee_atoms", fee))
+        return HttpResponse::error(403, "fee_atoms is not a number");
+    if (!rpc_field_u32(req, "nonce", nonce))
+        return HttpResponse::error(403, "nonce is not a number");
+    if (rpc_field(req, "nonce").empty())
+        nonce = ledger_.get_next_nonce(sender);
+    tx_set_fee(tx, fee);
+    tx_set_nonce(tx, nonce);
+
+    const std::string witness_b64 = rpc_field_b64(req, "witness_b64");
+    if (witness_b64.empty())
+        return HttpResponse::error(403, "PQ witness required (witness_b64)");
+    vx::crypto::pq::PqSignatureWitness w;
+    if (!rpc_parse_witness_b64(witness_b64, w))
+        return HttpResponse::error(403, "witness_b64 is not a valid base64 witness");
+    pq_set_transaction_anchor(tx, w);
+    if (!pq_verify_transaction(tx, w))
+        return HttpResponse::error(403, "witness failed WOTS+/XMSS verification for this tx");
+    if (!vx::crypto::pq::PqWitnessRegistry::instance().register_witness(tx, w))
+        return HttpResponse::error(403, "witness rejected by the registry");
+
+    // Durable sidecar BEFORE admission: the block that carries this tx
+    // cannot apply without the record (the ledger refuses it fail-closed).
+    const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+    vx::crypto::dksap::SgmtRecord rec;
+    rec.nickname = nickname;
+    rec.pub = pub;
+    // Candidate intake only: the record is durably committed by the ledger
+    // AFTER the block's leaf gate passes (gossip never persists unverified
+    // data — security review 2026-11-15).
+    if (!vx::crypto::dksap::DksapSidecarRegistry::instance().register_sgmt_candidate(digest, rec))
+        return HttpResponse::error(403, "SGMT record rejected (malformed nickname or keys)");
+
+    const auto sub =
+        mempool_.submit(tx, ledger_.balance_of(sender), ledger_.get_next_nonce(sender));
+    if (!sub.ok)
+        return HttpResponse::error(403, "mempool admission refused: " + sub.error);
+    const uint64_t height_before = store_.chain_height();
+    miner_->mine_one(true);
+    if (store_.chain_height() == height_before)
+        return HttpResponse::json(202, "{\"status\":\"queued\",\"queued_in_mempool\":true}");
+    const auto *raw = store_.get_block(height_before);
+    if (raw)
+        broadcast_frame_bytes(reinterpret_cast<const uint8_t *>(raw));
+    std::ostringstream oss;
+    oss << "{\"status\":\"ok\",\"nickname\":\"" << json_escape(nickname) << "\",\"leaf_hex\":\""
+        << hex_bytes(leaf.data(), 32) << "\"}";
+    return HttpResponse::json(200, oss.str());
+}
+
+HttpResponse HttpServer::handle_sgmt_stealth(const HttpRequest &req) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+
+    // The recipient is named by nickname + the claimed public record; the
+    // SGMT trie is the authority — a mismatching claim is refused here
+    // (the client-side name-shadowing protection, enforced server-side).
+    const std::string nickname = rpc_field(req, "recipient_nickname");
+    if (!vx::crypto::dksap::nickname_valid(nickname))
+        return HttpResponse::error(403, "recipient_nickname must be 1..32 printable ASCII bytes");
+    vx::crypto::dksap::PublicKeys recv_keys{};
+    if (!rpc_parse_hex(rpc_field(req, "recipient_t_spend_hex"), recv_keys.t_spend.data(),
+                       recv_keys.t_spend.size()))
+        return HttpResponse::error(403, "recipient_t_spend_hex must be 768 hex chars");
+    if (!rpc_parse_hex(rpc_field(req, "recipient_kkem_hex"), recv_keys.kkem.data(),
+                       recv_keys.kkem.size()))
+        return HttpResponse::error(403, "recipient_kkem_hex must be 2368 hex chars");
+    if (!vx::crypto::dksap::sgmt_resolve(ledger_.sgmt_trie(), nickname, recv_keys))
+        return HttpResponse::error(403, "nickname is unknown or the claimed keys do not match"
+                                        " the on-chain record");
+
+    vx::blockchain::Address sender{};
+    if (auto err = rpc_strip_nfa(rpc_field(req, "sender"), sender); err.status_code != 200)
+        return err;
+
+    // Build the stealth envelope toward the verified recipient keys.
+    vx::crypto::dksap::StealthTx bundle;
+    vx::crypto::dksap::stealth_send(recv_keys, bundle);
+
+    // Value transfer into the Pstealth tracker.
+    double amount_vx = 0.0;
+    {
+        const std::string amount_str = rpc_field(req, "amount_vx");
+        try {
+            amount_vx = amount_str.empty() ? 0.0 : std::stod(amount_str);
+        } catch (...) {
+            return HttpResponse::error(403, "amount_vx is not a number");
+        }
+    }
+    if (!(amount_vx > 0.0) || amount_vx > 1.8e11)
+        return HttpResponse::error(403, "amount_vx must be a positive finite number");
+    const uint64_t amount_atomics = static_cast<uint64_t>(amount_vx * 100'000'000ULL);
+
+    vx::blockchain::Transaction tx{};
+    std::memcpy(tx.sender_nfa, sender.data(), 42);
+    vx::crypto::dksap::make_stealth_receiver(bundle.pstealth.data(), tx.receiver_nfa);
+    tx_set_amount(tx, amount_atomics); // explicit LE (review P3: host-endian memcpy)
+    uint32_t fee = 1000, nonce = 0;
+    if (!rpc_field_u32(req, "fee_atoms", fee))
+        return HttpResponse::error(403, "fee_atoms is not a number");
+    if (!rpc_field_u32(req, "nonce", nonce))
+        return HttpResponse::error(403, "nonce is not a number");
+    if (rpc_field(req, "nonce").empty())
+        nonce = ledger_.get_next_nonce(sender);
+    tx_set_fee(tx, fee);
+    tx_set_nonce(tx, nonce);
+
+    const std::string witness_b64 = rpc_field_b64(req, "witness_b64");
+    if (witness_b64.empty())
+        return HttpResponse::error(403, "PQ witness required (witness_b64)");
+    vx::crypto::pq::PqSignatureWitness w;
+    if (!rpc_parse_witness_b64(witness_b64, w))
+        return HttpResponse::error(403, "witness_b64 is not a valid base64 witness");
+    pq_set_transaction_anchor(tx, w);
+    if (!pq_verify_transaction(tx, w))
+        return HttpResponse::error(403, "witness failed WOTS+/XMSS verification for this tx");
+    if (!vx::crypto::pq::PqWitnessRegistry::instance().register_witness(tx, w))
+        return HttpResponse::error(403, "witness rejected by the registry");
+
+    const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+    vx::crypto::dksap::StealthBundle b;
+    b.tx = bundle;
+    vx::crypto::dksap::DksapSidecarRegistry::instance().register_stealth_candidate(digest, b);
+
+    const auto sub =
+        mempool_.submit(tx, ledger_.balance_of(sender), ledger_.get_next_nonce(sender));
+    if (!sub.ok)
+        return HttpResponse::error(403, "mempool admission refused: " + sub.error);
+    const uint64_t height_before = store_.chain_height();
+    miner_->mine_one(true);
+    if (store_.chain_height() == height_before)
+        return HttpResponse::json(202, "{\"status\":\"queued\",\"queued_in_mempool\":true}");
+    const auto *raw = store_.get_block(height_before);
+    if (raw)
+        broadcast_frame_bytes(reinterpret_cast<const uint8_t *>(raw));
+    std::ostringstream oss;
+    oss << "{\"status\":\"ok\",\"pstealth_hex\":\"" << hex_bytes(bundle.pstealth.data(), 32)
+        << "\"}";
+    return HttpResponse::json(200, oss.str());
+}
+
+HttpResponse HttpServer::handle_sgmt_watch(const HttpRequest &req) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (radar_watches_.size() >= 64)
+        return HttpResponse::error(403, "radar watch list is full (64)");
+    RadarWatch w;
+    w.nickname = rpc_field(req, "nickname");
+    w.kem_sk.resize(vx::crypto::dksap::KEM_SK_SIZE);
+    if (!rpc_parse_hex(rpc_field(req, "kem_sk_hex"), w.kem_sk.data(), w.kem_sk.size()))
+        return HttpResponse::error(403, "kem_sk_hex must be 4800 hex chars");
+    if (!rpc_parse_hex(rpc_field(req, "t_spend_hex"), w.t_spend.data(), w.t_spend.size()))
+        return HttpResponse::error(403, "t_spend_hex must be 768 hex chars");
+    const std::string sk_spend_hex = rpc_field(req, "sk_spend_hex");
+    if (!sk_spend_hex.empty()) {
+        if (!rpc_parse_hex(sk_spend_hex, w.sk_spend.data(), 32))
+            return HttpResponse::error(403, "sk_spend_hex must be 64 hex chars");
+        w.spend_sk_present = true;
+    }
+    radar_watches_.push_back(std::move(w));
+    // Citadel hygiene: the request body is a transport copy of key material
+    // — scrub it before it lingers on the connection thread's heap.
+    vx::core::MemoryCore::scrub_execution_state(
+        const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(req.body.data())), req.body.size());
+    return HttpResponse::json(
+        200, "{\"status\":\"ok\",\"watch_count\":" + std::to_string(radar_watches_.size()) + "}");
+}
+
+HttpResponse HttpServer::handle_sgmt_hits(const HttpRequest &req) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    std::ostringstream oss;
+    oss << "{\"hits\":[";
+    for (size_t i = 0; i < radar_hits_.size(); ++i) {
+        if (i)
+            oss << ",";
+        oss << radar_hits_[i];
+    }
+    oss << "],\"count\":" << radar_hits_.size() << "}";
+    return HttpResponse::json(200, oss.str());
+}
+
+// The radar cycle: per sealed frame, every STEALTH receiver resolves its
+// digest-keyed StealthTx bundle and each watch entry runs the two-phase
+// decaps (view_tag pre-filter -> FO only on match). Runs UNDER the
+// caller's state_mutex_ (the same contract as broadcast_frame_bytes):
+// radar_watches_ / radar_hits_ are touched from the dispatch thread only.
+void HttpServer::run_radar_for_frame(const uint8_t *frame65536) {
+    if (radar_watches_.empty())
+        return;
+    const auto *raw = reinterpret_cast<const vx::blockchain::RawBlock *>(frame65536);
+    const uint32_t count =
+        raw->header.tx_count > vx::blockchain::MAX_TX_PER_BLOCK ? 0u : raw->header.tx_count;
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto &tx = raw->transactions[i];
+        if (!vx::crypto::dksap::receiver_is_stealth(tx.receiver_nfa))
+            continue;
+        uint8_t pstealth[32];
+        if (!vx::crypto::dksap::stealth_pstealth_of(tx.receiver_nfa, pstealth))
+            continue; // non-canonical receiver: consensus refused it anyway
+        const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+        vx::crypto::dksap::StealthBundle bundle;
+        vx::crypto::dksap::StealthBundle matched;
+        if (!vx::crypto::dksap::DksapSidecarRegistry::instance().resolve_stealth_bundle(
+                digest, pstealth, matched))
+            continue; // no candidate carries this tracker
+        for (const auto &w : radar_watches_) {
+            vx::crypto::dksap::RadarHit hit;
+            vx::crypto::dksap::radar_scan(w.kem_sk.data(), w.t_spend, matched.tx,
+                                          w.spend_sk_present,
+                                          w.spend_sk_present ? w.sk_spend.data() : nullptr, hit);
+            if (!hit.match)
+                continue;
+            std::ostringstream oss;
+            oss << "{\"nickname\":\"" << json_escape(w.nickname) << "\","
+                << "\"pstealth_hex\":\"" << hex_bytes(pstealth, 32) << "\","
+                << "\"height\":" << store_.chain_height() - 1 << ","
+                << "\"tx_index\":" << i << ","
+                << "\"sk_stealth_hex\":\"" << hex_bytes(hit.sk_stealth.data(), 32) << "\"}";
+            radar_hits_.push_back(oss.str());
+            if (radar_hits_.size() > 4096)
+                radar_hits_.erase(radar_hits_.begin());
+        }
+    }
 }
 
 // ── POST /api/security/audit ──────────────────────────────────────────────────

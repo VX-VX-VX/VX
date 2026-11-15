@@ -6,7 +6,10 @@
 #include "vx/blockchain/genesis.hpp"
 #include "vx/core/ct_equal.hpp"
 #include "vx/core/u128.hpp"
+#include "vx/crypto/dksap_sidecars.hpp"
+#include "vx/crypto/dksap_sgmt.hpp"
 #include "vx/crypto/pq_signature.hpp"
+#include "vx/state/galois_trie.hpp"
 
 #include <array>
 #include <cstdint>
@@ -42,6 +45,20 @@ struct ApplyResult {
     std::string error;
     U128 fees_burned;
     U128 fees_miner_reward;
+    // DKSAP wire integration: every SGMT registration this block committed
+    // is recorded with the value it replaced, so the undo journal (whose
+    // records are keyed by the trie KEY, not the nickname — the sidecar is
+    // not visible to UndoEngine) can restore the exact pre-block leaf.
+    struct SgmtUndoEntry {
+        std::array<uint8_t, 32> key{};
+        std::array<uint8_t, 32> prev_leaf{};
+        bool existed = false;
+    };
+    std::vector<SgmtUndoEntry> sgmt_undo;
+    // (digest, record) pairs this block committed — the undo layer forwards
+    // them to record_sgmt_undo, and the registry persistence rides the
+    // commit phase via commit_sgmt_record (never the gossip intake).
+    std::vector<std::pair<std::array<uint8_t, 32>, vx::crypto::dksap::SgmtRecord>> sgmt_committed;
 };
 
 /**
@@ -139,6 +156,15 @@ public:
         // Self-certifying bindings produced by this block's pre-check loop;
         // applied only after every transaction validated (see round-7 note).
         std::vector<std::pair<Address, std::array<uint8_t, 32>>> new_bindings_;
+        // DKSAP wire integration: registrations collected in the pre-check
+        // loop, committed only after every gate passes.
+        struct NewSgmtLeaf {
+            std::array<uint8_t, 32> digest{};
+            std::array<uint8_t, 32> key{};
+            std::array<uint8_t, 32> leaf{};
+            vx::crypto::dksap::SgmtRecord record{};
+        };
+        std::vector<NewSgmtLeaf> new_sgmt_leaves_;
 
         // Legacy Genesis v1 exemption (fee=0/nonce=0 skips nonce accounting)
         // is scoped to the actual genesis replay window. Unscoped, ANY user
@@ -175,6 +201,40 @@ public:
             // digest check authorizes anyone (the digest needs no key —
             // the reviewer moved 1 VX out of the genesis receiver with it),
             // so it no longer accepts anything on the consensus path.
+            // DKSAP wire integration: receiver-payload classes. STEALTH
+            // carries the Pstealth tracker (a value receiver); SGMTLEAF
+            // carries the frame-committed 32-byte registration leaf (no
+            // value semantics). A coinbase may credit NEITHER — emission
+            // cannot flow into a stealth tracker (no PQ witness can be
+            // signed over it until the stealth spend path ships) or into
+            // a registration receiver.
+            const bool is_stealth_receiver =
+                vx::crypto::dksap::receiver_is_stealth(tx.receiver_nfa);
+            const bool is_sgmtleaf_receiver =
+                vx::crypto::dksap::receiver_is_sgmtleaf(tx.receiver_nfa);
+            if ((is_genesis || is_miner) && (is_stealth_receiver || is_sgmtleaf_receiver)) {
+                res.error = "tx " + std::to_string(i) +
+                            ": coinbase cannot credit a STEALTH/SGMTLEAF receiver";
+                return res;
+            }
+            // A registration moves NO value — a nonzero amount would debit
+            // the sender while the commit loop skips the receiver credit
+            // (the leaf is not an account), failing the supply law by
+            // exactly `amount` and wedging the miner on the poisoned tx
+            // (adversarial review 2026-11-15). A STEALTH receiver must be
+            // canonically padded — a dirty-pad variant is a distinct account
+            // the radar can never see (stranded funds, review P2-7).
+            if (is_sgmtleaf_receiver && amount != 0) {
+                res.error =
+                    "tx " + std::to_string(i) + ": SGMTLEAF registration must carry zero amount";
+                return res;
+            }
+            uint8_t stealth_pad_check[32];
+            if (is_stealth_receiver &&
+                !vx::crypto::dksap::stealth_pstealth_of(tx.receiver_nfa, stealth_pad_check)) {
+                res.error = "tx " + std::to_string(i) + ": non-canonical STEALTH receiver payload";
+                return res;
+            }
             if (is_genesis || is_miner) {
                 if (is_miner) {
                     // BACKLOG 0.6 remainder closed (2026-11-03): the coinbase
@@ -306,7 +366,9 @@ public:
             }
 
             // Allow zero amount for MINER_ coinbase (actual reward computed from fees)
-            if (amount == 0 && !is_miner) {
+            // and for SGMTLEAF registrations (the leaf is not value; only the
+            // fee is charged). Everything else must move real atoms.
+            if (amount == 0 && !is_miner && !is_sgmtleaf_receiver) {
                 res.error = "tx " + std::to_string(i) + ": zero transfer";
                 return res;
             }
@@ -417,6 +479,78 @@ public:
                 intra_debits_[sender] = acc + this_debit;
                 fees[i] = U128(fee);
             }
+            // ── SGMTLEAF registration gate (DKSAP wire integration) ────
+            // The leaf is frame-committed (the receiver payload IS the
+            // commitment — every node sees the same leaf regardless of
+            // which sidecar it received, fork-free by construction). The
+            // record travels out of band keyed by the tx digest: a tampered
+            // or substituted record produces a different commitment and the
+            // frame's leaf refuses it. First-come-wins: an occupied key is
+            // permanent in v1 — the identical (record, leaf) pair re-applies
+            // as a no-op (replay / reorg re-apply).
+            std::array<uint8_t, 32> reg_leaf{};
+            vx::crypto::dksap::SgmtRecord reg_record{};
+            if (is_sgmtleaf_receiver) {
+                if (!vx::crypto::dksap::sgmtleaf_of(tx.receiver_nfa, reg_leaf.data())) {
+                    res.error =
+                        "tx " + std::to_string(i) + ": non-canonical SGMTLEAF receiver payload";
+                    return res;
+                }
+                const auto reg_digest = vx::crypto::pq::tx_msg_digest(tx);
+                // Candidate model: gossip is unauthenticated, so the ledger
+                // resolves the candidate that ACTUALLY commits this frame's
+                // leaf — a bogus first-arriver cannot displace the honest
+                // record (security review 2026-11-15).
+                if (!vx::crypto::dksap::DksapSidecarRegistry::instance().resolve_sgmt_record(
+                        reg_digest, reg_leaf, reg_record)) {
+                    res.error = "tx " + std::to_string(i) +
+                                ": SGMT registration sidecar missing or non-matching"
+                                " (backfill before apply)";
+                    return res;
+                }
+                if (!vx::crypto::dksap::nickname_valid(reg_record.nickname)) {
+                    res.error = "tx " + std::to_string(i) + ": malformed SGMT nickname";
+                    return res;
+                }
+                const auto reg_commit =
+                    vx::crypto::dksap::sgmt_commit(reg_record.nickname, reg_record.pub);
+                if (!vx::core::ct_equal(reg_commit.data(), reg_leaf.data(), 32)) {
+                    res.error =
+                        "tx " + std::to_string(i) + ": SGMT record does not commit the frame leaf";
+                    return res;
+                }
+                const auto reg_key = vx::crypto::dksap::sgmt_key(reg_record.nickname);
+                std::array<uint8_t, 32> existing{};
+                if (sgmt_trie_.get(reg_key.data(), existing.data()) &&
+                    !vx::core::ct_equal(existing.data(), reg_leaf.data(), 32)) {
+                    res.error = "tx " + std::to_string(i) +
+                                ": nickname already registered (first-come-wins)";
+                    return res;
+                }
+                // Intra-block duplicate discipline: two registration txs in
+                // one block. Same key + same leaf is an idempotent no-op;
+                // same key + different leaf must be refused BEFORE any
+                // commit (the second pre-check ran against the unmutated
+                // trie, so the trie check above cannot see the first tx).
+                bool intra_dup = false;
+                for (const auto &entry : new_sgmt_leaves_) {
+                    if (!(entry.key == reg_key))
+                        continue;
+                    if (!vx::core::ct_equal(entry.leaf.data(), reg_leaf.data(), 32)) {
+                        res.error = "tx " + std::to_string(i) +
+                                    ": conflicting registrations for one nickname"
+                                    " within a single block";
+                        return res;
+                    }
+                    intra_dup = true;
+                    break;
+                }
+                if (!intra_dup) {
+                    new_sgmt_leaves_.push_back(
+                        {reg_digest, reg_key, reg_leaf, std::move(reg_record)});
+                }
+            }
+
             // Emission accounting: mints are separated by sender class so
             // the gate below the loop can price the subsidy entitlement
             // (MINER_) separately from protocol allocations (GENESIS).
@@ -625,8 +759,13 @@ public:
                     set_next_nonce(sender, blockchain::tx_nonce(tx) + 1);
                 }
             }
-            record_balance(receiver);
-            balances_[receiver] = balances_[receiver] + debits[i];
+            // SGMTLEAF receivers hold no value (the registration leaf is not
+            // an account): skip the credit — debits[i] is 0 and the tracked
+            // address map must not grow an empty entry per registration.
+            if (!vx::crypto::dksap::receiver_is_sgmtleaf(tx.receiver_nfa)) {
+                record_balance(receiver);
+                balances_[receiver] = balances_[receiver] + debits[i];
+            }
             ++applied;
         }
 
@@ -685,6 +824,42 @@ public:
             bind_pq_sender(addr, root);
         }
         new_bindings_.clear();
+
+        // DKSAP wire integration: the SGMT registrations collected in the
+        // pre-check are committed ONLY here — every gate passed. Each entry
+        // records the leaf it replaced (or its absence) for the undo
+        // journal, so a reorg restores the exact pre-block trie. The
+        // resolved record is durably appended ONLY now (gossip intake never
+        // persists unverified data — security review 2026-11-15), and a
+        // durable-append failure refuses the block (a memory-only committed
+        // record would brick the node against its own history after
+        // restart).
+        for (auto &entry : new_sgmt_leaves_) {
+            ApplyResult::SgmtUndoEntry e;
+            e.key = entry.key;
+            e.existed = sgmt_trie_.get(entry.key.data(), e.prev_leaf.data());
+            if (!vx::crypto::dksap::DksapSidecarRegistry::instance().commit_sgmt_record(
+                    entry.digest, entry.record)) {
+                // Roll back the trie puts done so far in THIS block, then
+                // the balances through the commit journal, then refuse.
+                for (auto it = res.sgmt_undo.rbegin(); it != res.sgmt_undo.rend(); ++it) {
+                    if (!sgmt_restore(it->key, it->prev_leaf, it->existed)) {
+                        res.error = "ERR_APPLY_INTEGRITY: SGMT durable-append failure with"
+                                    " a non-restorable trie (corruption signal)";
+                        rollback_commit();
+                        return res;
+                    }
+                }
+                res.error = "tx " + std::to_string(n - new_sgmt_leaves_.size()) +
+                            ": SGMT record could not be durably committed (disk failure?)";
+                rollback_commit();
+                return res;
+            }
+            sgmt_trie_.put(entry.key.data(), entry.leaf.data());
+            res.sgmt_undo.push_back(e);
+            res.sgmt_committed.emplace_back(entry.digest, entry.record);
+        }
+        new_sgmt_leaves_.clear();
 
         res.ok = true;
         res.transfers = n;
@@ -864,10 +1039,32 @@ public:
         next_height_ = h;
     }
 
+    /// The SGMT trie: consensus state for the DKSAP nickname registry.
+    /// Deterministic across nodes given the same sidecar records (the leaf
+    /// values are frame-committed; the records only gate acceptance), so no
+    /// on-chain root hash is needed in v1. Read access for the wallet's
+    /// sender-side resolve; the undo journal restores leaves by KEY.
+    const vx::state::GaloisTrie &sgmt_trie() const noexcept {
+        return sgmt_trie_;
+    }
+
+    /// Reorg-undo restore: put the replaced leaf back, or erase a leaf the
+    /// block created. Returns false when the trie and journal disagree
+    /// (an erase of a key that no longer exists — corruption signal).
+    bool sgmt_restore(const std::array<uint8_t, 32> &key, const std::array<uint8_t, 32> &prev_leaf,
+                      bool existed) {
+        if (!existed)
+            return sgmt_trie_.erase(key.data());
+        // The block replaced an existing leaf — put the pre-block value back.
+        sgmt_trie_.put(key.data(), prev_leaf.data());
+        return true;
+    }
+
 private:
     std::unordered_map<Address, U128, AddressHash> balances_;
     std::unordered_map<Address, uint32_t, AddressHash> nonces_;
     std::unordered_map<Address, std::array<uint8_t, 32>, AddressHash> pq_roots_;
+    vx::state::GaloisTrie sgmt_trie_;
     U128 burned_supply_{0};
     // Cumulative issuance under the 7,000,000,000 VX hard cap. Mutated
     // only after a block fully validates (transactional, like balances).

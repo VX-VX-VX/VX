@@ -4,6 +4,8 @@
 #include <iostream>
 #include <chrono>
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -213,6 +215,22 @@ void PoGWMiner::mine_one(bool single_shot) {
                 blockchain::BlockView(std::span<const uint8_t, 65536>(frame.data(), 65536)));
             if (!applied.ok) {
                 store_.rollback_last_append();
+                // Adversarial review 2026-11-15 (P1): a tx the ledger
+                // refuses would be re-sealed into EVERY future block —
+                // a permanent miner wedge (first-come-wins registration
+                // losers, or any state-refused shape). The error names the
+                // offending index ("tx N: ..."); drop exactly that one tx
+                // (index 0 is the coinbase) and rewind its pending state.
+                const char *e = applied.error.c_str();
+                const char *txp = std::strstr(e, "tx ");
+                if (txp != nullptr) {
+                    const uint64_t idx = std::strtoull(txp + 3, nullptr, 10);
+                    if (idx > 0 && idx <= txs.size()) {
+                        mempool_.drop_txs(std::vector<blockchain::Transaction>{txs[idx - 1]});
+                        std::cerr << "[MINER] dropped refused tx (index " << idx
+                                  << ") from the mempool\n";
+                    }
+                }
                 std::cerr << "[MINER] Block #" << height << " REJECTED"
                           << " (applied=" << applied.ok
                           << (applied.error.empty() ? "" : (std::string(": ") + applied.error))
