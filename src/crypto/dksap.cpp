@@ -22,6 +22,23 @@
 namespace vx::crypto::dksap {
 namespace {
 
+// The view-tag: ONE shared helper — sender and scanner cannot diverge.
+// Security review HIGH (2026-11-14): the first draft hashed a 416-byte
+// scratch buffer with a 352-byte UNINITIALIZED tail — a non-deterministic
+// tag (the tests passed on UB stack-layout luck). Absorb exactly the
+// intended bytes, no scratch buffer.
+std::array<uint8_t, 4> compute_view_tag(const uint8_t m32[32],
+                                        const std::array<uint8_t, T_COMMIT_SIZE> &t_spend) {
+    vx::blockchain::VortexSponge256 sp;
+    const uint8_t tag[] = "VX_DKSAP_VTAG_V1";
+    sp.absorb(tag, sizeof(tag) - 1);
+    sp.absorb(m32, 32);
+    sp.absorb(t_spend.data(), t_spend.size());
+    std::array<uint8_t, 32> vt{};
+    sp.finalize(vt.data());
+    return {vt[0], vt[1], vt[2], vt[3]};
+}
+
 // Uniform ring sampling (SampleNTT-style rejection): 12-bit candidates
 // < q from a continuous SHAKE128 stream. Security review HIGH (2026-11-14):
 // â MUST be uniform — a small-coefficient (CBD) â collapses the RLWE
@@ -81,7 +98,7 @@ std::array<uint8_t, 32> attractor_commit(const std::array<uint8_t, 32> &secret) 
     uint8_t attr_seed[256];
     {
         vx::crypto::fips202::Shaker xof(136, 0x1f); // SHAKE256
-        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_ATTR_V1"), 17);
+        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_ATTR_V1"), 16);
         xof.absorb(secret.data(), secret.size());
         xof.squeeze(attr_seed, sizeof(attr_seed));
     }
@@ -131,7 +148,7 @@ void derive_account(const uint8_t master_sk[256], Account &out) {
         // RLWE hardness assumption — stealth unlinkability breaks).
         uint8_t a_dom[32];
         vx::crypto::fips202::Shaker xof(136, 0x1f);
-        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_RING_A_V1"), 21);
+        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_RING_A_V1"), 18);
         xof.squeeze(a_dom, sizeof(a_dom));
         sample_ring_uniform(a_dom, a_hat);
         mlkem::ring_ntt(a_hat);
@@ -197,6 +214,9 @@ void stealth_send(const PublicKeys &recipient, StealthTx &out) {
     if (!mlkem::encaps(recipient.kkem, m32, out.kem_ct, ss))
         std::abort(); // the SGMT-published key failed validation
 
+    out.view_tag = compute_view_tag(m32, recipient.t_spend);
+    vx::core::MemoryCore::scrub_execution_state(m32, 32); // burn the randomness
+
     // 2. TXKEY = sponge(ss ‖ handle); handle = sponge(t̂_spend) — the
     //    account handle both sides derive from the SGMT record.
     uint8_t handle[32];
@@ -241,7 +261,7 @@ void stealth_send(const PublicKeys &recipient, StealthTx &out) {
         // RLWE hardness assumption — stealth unlinkability breaks).
         uint8_t a_dom[32];
         vx::crypto::fips202::Shaker xof(136, 0x1f);
-        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_RING_A_V1"), 21);
+        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_RING_A_V1"), 18);
         xof.squeeze(a_dom, sizeof(a_dom));
         sample_ring_uniform(a_dom, a_hat);
         mlkem::ring_ntt(a_hat);
@@ -276,11 +296,27 @@ void radar_scan(const uint8_t kem_sk[KEM_SK_SIZE],
 
     // 1. Decapsulate: the true recipient's KEM key yields the sender's ss
     //    (implicit rejection gives everyone else pseudorandom noise).
+    // Two-phase decaps (external review): the cheap K-PKE.Decrypt phase
+    // recovers m' for the view-tag check; the expensive FO re-encryption
+    // runs ONLY on the 4-byte match (2^-32 false positives; the radar is
+    // local, so the early exit is not an oracle).
     mlkem::SharedSecret ss;
     mlkem::Ciphertext ct;
     std::memcpy(ct.data(), tx.kem_ct.data(), KEM_CT_SIZE);
-    mlkem::decaps(*reinterpret_cast<const mlkem::SecretKey *>(static_cast<const void *>(kem_sk)),
-                  ct, ss);
+    uint8_t m32[32];
+    mlkem::decaps_filter(
+        *reinterpret_cast<const mlkem::SecretKey *>(static_cast<const void *>(kem_sk)), ct, m32);
+    {
+        const auto vt = compute_view_tag(m32, t_spend);
+        bool tag_ok = true;
+        for (unsigned i = 0; i < 4; ++i)
+            tag_ok &= (vt[i] == tx.view_tag[i]);
+        if (!tag_ok)
+            return; // foreign transaction: skip the expensive phase
+    }
+    mlkem::decaps_finish(
+        *reinterpret_cast<const mlkem::SecretKey *>(static_cast<const void *>(kem_sk)), ct, m32,
+        ss);
 
     // 2. TXKEY from ss + the account handle (identical to the sender).
     uint8_t handle[32];
@@ -323,7 +359,7 @@ void radar_scan(const uint8_t kem_sk[KEM_SK_SIZE],
         // RLWE hardness assumption — stealth unlinkability breaks).
         uint8_t a_dom[32];
         vx::crypto::fips202::Shaker xof(136, 0x1f);
-        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_RING_A_V1"), 21);
+        xof.absorb(reinterpret_cast<const uint8_t *>("VX_DKSAP_RING_A_V1"), 18);
         xof.squeeze(a_dom, sizeof(a_dom));
         sample_ring_uniform(a_dom, a_hat);
         mlkem::ring_ntt(a_hat);

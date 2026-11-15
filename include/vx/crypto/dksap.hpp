@@ -60,6 +60,12 @@ void derive_account(const uint8_t master_sk[256], Account &out);
 // dropped — external review: ballast.)
 struct StealthTx {
     std::array<uint8_t, 32> pstealth{};             // sponge(t̂_stealth) tracker
+    // view_tag (external review): a 4-byte pre-filter computable by the
+    // SENDER from the encapsulation randomness — the radar's cheap
+    // K-PKE.Decrypt phase recovers m' and checks it BEFORE the expensive
+    // FO re-encryption. 2^-32 false positives; the radar is local, so the
+    // early exit is not an oracle.
+    std::array<uint8_t, 4> view_tag{};
     std::array<uint8_t, T_COMMIT_SIZE> t_stealth{}; // blinded key — sidecar
     std::array<uint8_t, KEM_CT_SIZE> kem_ct{};      // sidecar
     std::array<uint8_t, 32> tx_key{};               // sponge(ss ‖ handle)

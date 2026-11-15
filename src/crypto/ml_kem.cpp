@@ -510,13 +510,15 @@ bool encaps(const PublicKey &ek, const uint8_t m32[32], Ciphertext &ct, SharedSe
     return true;
 }
 
-void decaps(const SecretKey &dk, const Ciphertext &ct, SharedSecret &ss) {
+void decaps_filter(const SecretKey &dk, const Ciphertext &ct, uint8_t m32_out[32]) {
+    kpke_decrypt(dk.data(), ct, m32_out);
+}
+
+void decaps_finish(const SecretKey &dk, const Ciphertext &ct, const uint8_t m32[32],
+                   SharedSecret &ss) {
     const uint8_t *ek = dk.data() + 384 * K;
     const uint8_t *h = dk.data() + 384 * K + 384 * K + 32;
     const uint8_t *z = dk.data() + SK_SIZE - 32;
-
-    uint8_t m32[32];
-    kpke_decrypt(dk.data(), ct, m32);
 
     uint8_t g64[64];
     {
@@ -550,6 +552,54 @@ void decaps(const SecretKey &dk, const Ciphertext &ct, SharedSecret &ss) {
     // (The first draft had the mask inverted — ss took J on success.)
     for (unsigned i = 0; i < 32; ++i)
         ss[i] = static_cast<uint8_t>(jout[i] ^ (mask & (jout[i] ^ g64[i])));
+}
+
+void decaps(const SecretKey &dk, const Ciphertext &ct, SharedSecret &ss) {
+    uint8_t m32[32];
+    decaps_filter(dk, ct, m32);
+    decaps_finish(dk, ct, m32, ss);
+}
+
+// ── Public ring primitives ──────────────────────────────────────────────────
+
+void ring_ntt(RingPoly &a) {
+    Poly tmp;
+    std::memcpy(tmp.data(), a.data(), sizeof(a));
+    ntt(tmp);
+    std::memcpy(a.data(), tmp.data(), sizeof(a));
+}
+
+void ring_intt(RingPoly &a) {
+    Poly tmp;
+    std::memcpy(tmp.data(), a.data(), sizeof(a));
+    intt(tmp);
+    std::memcpy(a.data(), tmp.data(), sizeof(a));
+}
+
+void ring_mul_ntt(const RingPoly &a, const RingPoly &b, RingPoly &out) {
+    Poly ta, tb, to;
+    std::memcpy(ta.data(), a.data(), sizeof(a));
+    std::memcpy(tb.data(), b.data(), sizeof(b));
+    mul_ntt(ta, tb, to);
+    std::memcpy(out.data(), to.data(), sizeof(out));
+}
+
+void ring_cbd2(const uint8_t buf[128], RingPoly &out) {
+    Poly tmp;
+    cbd(buf, 2, tmp);
+    std::memcpy(out.data(), tmp.data(), sizeof(out));
+}
+
+void ring_pack12(const RingPoly &c, uint8_t *out) {
+    Poly tmp;
+    std::memcpy(tmp.data(), c.data(), sizeof(c));
+    encode_poly12(tmp, out);
+}
+
+void ring_unpack12(const uint8_t *in, RingPoly &c) {
+    Poly tmp;
+    decode_poly12(in, tmp);
+    std::memcpy(c.data(), tmp.data(), sizeof(c));
 }
 
 } // namespace vx::crypto::mlkem

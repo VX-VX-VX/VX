@@ -159,6 +159,14 @@ TEST(VortexMlKem768Kat, RoundTripAndImplicitRejection) {
     EXPECT_EQ(0, std::memcmp(ct.data(), ct2.data(), ct.size()));
     EXPECT_EQ(0, std::memcmp(ss1.data(), ss3.data(), ss1.size()));
 
+    // Two-phase invariant: decaps == decaps_finish(decaps_filter(...)).
+    vx::crypto::mlkem::SharedSecret ss_split;
+    uint8_t m_cand[32];
+    vx::crypto::mlkem::decaps_filter(dk, ct, m_cand);
+    vx::crypto::mlkem::decaps_finish(dk, ct, m_cand, ss_split);
+    EXPECT_EQ(0, std::memcmp(ss1.data(), ss_split.data(), ss1.size()))
+        << "two-phase decaps must equal the one-shot decaps";
+
     // Implicit rejection: a single flipped ciphertext bit yields a DIFFERENT
     // pseudorandom secret (never an error, never the original secret).
     vx::crypto::mlkem::Ciphertext bad = ct;

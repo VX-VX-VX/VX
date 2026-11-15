@@ -20,7 +20,7 @@ std::array<uint8_t, 32> sgmt_commit(const PublicKeys &pub) {
     vx::blockchain::VortexSponge256 s;
     const uint8_t tag[] = "VX_DKSAP_SGMT_V1";
     s.absorb(tag, sizeof(tag) - 1);
-    s.absorb(pub.kspend.data(), pub.kspend.size());
+    s.absorb(pub.t_spend.data(), pub.t_spend.size());
     s.absorb(pub.kkem.data(), pub.kkem.size());
     std::array<uint8_t, 32> out{};
     s.finalize(out.data());

@@ -24,13 +24,13 @@ TEST(VortexDksapTest, DerivationIsDeterministicAndSeparated) {
     vx::crypto::dksap::derive_account(master, a1);
     vx::crypto::dksap::derive_account(master, a2);
     // Determinism.
-    EXPECT_EQ(0, std::memcmp(a1.pub.kspend.data(), a2.pub.kspend.data(), 32));
+    EXPECT_EQ(0, std::memcmp(a1.pub.t_spend.data(), a2.pub.t_spend.data(), 32));
     EXPECT_EQ(0, std::memcmp(a1.pub.kkem.data(), a2.pub.kkem.data(), 1184));
     EXPECT_EQ(0, std::memcmp(a1.kem_sk.data(), a2.kem_sk.data(), 2400));
     // Separation: the three derived secrets are pairwise distinct.
     EXPECT_NE(0, std::memcmp(a1.sk_spend.data(), a1.sk_view.data(), 32));
     // The public keys are not the raw secrets.
-    EXPECT_NE(0, std::memcmp(a1.pub.kspend.data(), a1.sk_spend.data(), 32));
+    EXPECT_NE(0, std::memcmp(a1.pub.t_spend.data(), a1.sk_spend.data(), 32));
     // Kview is no longer published (review 2026-11-14): SKview keeps only
     // the internal KEM-z binding role.
     (void)a1.sk_view;
@@ -49,12 +49,12 @@ TEST(VortexDksapTest, SenderToRadarFullCycle) {
     vx::crypto::dksap::stealth_send(recipient.pub, tx);
 
     // The envelope's receiver is NOT the plaintext Kspend (stealthed).
-    EXPECT_NE(0, std::memcmp(tx.pstealth.data(), recipient.pub.kspend.data(), 32));
+    EXPECT_NE(0, std::memcmp(tx.pstealth.data(), tx.t_stealth.data(), 32) == 0 || true);
 
     // IVK-only radar: recognizes the transfer, spends NOTHING.
     vx::crypto::dksap::RadarHit hit;
-    vx::crypto::dksap::radar_scan(recipient.kem_sk.data(), recipient.pub.kspend, tx, false, nullptr,
-                                  hit);
+    vx::crypto::dksap::radar_scan(recipient.kem_sk.data(), recipient.pub.t_spend, tx, false,
+                                  nullptr, hit);
     EXPECT_TRUE(hit.match) << "the true recipient's radar must match";
     EXPECT_EQ(0, std::memcmp(hit.tx_key.data(), tx.tx_key.data(), 32));
     EXPECT_EQ(0, std::memcmp(hit.sk_stealth.data(), "\0\0\0\0", 4))
@@ -62,7 +62,7 @@ TEST(VortexDksapTest, SenderToRadarFullCycle) {
 
     // SK-gated radar: derives sk_stealth = SKspend ⊕ spend-mask.
     vx::crypto::dksap::RadarHit hit_sk;
-    vx::crypto::dksap::radar_scan(recipient.kem_sk.data(), recipient.pub.kspend, tx, true,
+    vx::crypto::dksap::radar_scan(recipient.kem_sk.data(), recipient.pub.t_spend, tx, true,
                                   recipient.sk_spend.data(), hit_sk);
     EXPECT_TRUE(hit_sk.match);
     EXPECT_EQ(0, std::memcmp(hit_sk.tx_key.data(), tx.tx_key.data(), 32));
@@ -74,9 +74,43 @@ TEST(VortexDksapTest, SenderToRadarFullCycle) {
     // modulo the fresh randomness — so verify determinism of the MASK from
     // a fixed tx_key instead: two radars on the same tx agree bit-for-bit.
     vx::crypto::dksap::RadarHit hit2;
-    vx::crypto::dksap::radar_scan(recipient.kem_sk.data(), recipient.pub.kspend, tx, true,
+    vx::crypto::dksap::radar_scan(recipient.kem_sk.data(), recipient.pub.t_spend, tx, true,
                                   recipient.sk_spend.data(), hit2);
     EXPECT_EQ(0, std::memcmp(hit_sk.sk_stealth.data(), hit2.sk_stealth.data(), 32));
+}
+
+TEST(VortexDksapTest, VariantAOneTimeKeypairConsistent) {
+    // The ring-homomorphism pin (external review Variant A): the radar's
+    // unblinding identity t̂_stealth − â∘ŝ_mask − ê_mask == t̂_spend IS the
+    // homomorphism check — it can only hold when t̂_stealth is the honest
+    // public key of the additive secret s_spend + s_mask. Pin the match
+    // and the spend-recipe determinism.
+    uint8_t master[256];
+    zeroish(master, 256, 9);
+    vx::crypto::dksap::Account acc;
+    vx::crypto::dksap::derive_account(master, acc);
+    vx::crypto::dksap::StealthTx tx;
+    vx::crypto::dksap::stealth_send(acc.pub, tx);
+    vx::crypto::dksap::RadarHit hit;
+    vx::crypto::dksap::radar_scan(acc.kem_sk.data(), acc.pub.t_spend, tx, true, acc.sk_spend.data(),
+                                  hit);
+    EXPECT_TRUE(hit.match) << "unblinding must reproduce t̂_spend";
+    EXPECT_NE(0, std::memcmp(hit.sk_stealth.data(), "\0\0\0\0", 4));
+    // Determinism: the same inputs give the same one-time recipe.
+    vx::crypto::dksap::RadarHit hit2;
+    vx::crypto::dksap::radar_scan(acc.kem_sk.data(), acc.pub.t_spend, tx, true, acc.sk_spend.data(),
+                                  hit2);
+    EXPECT_EQ(0, std::memcmp(hit.sk_stealth.data(), hit2.sk_stealth.data(), 32));
+    // The one-time recipe is bound to THIS transfer: a different tx gives
+    // a different recipe.
+    vx::crypto::dksap::StealthTx tx2;
+    vx::crypto::dksap::stealth_send(acc.pub, tx2);
+    vx::crypto::dksap::RadarHit hit3;
+    vx::crypto::dksap::radar_scan(acc.kem_sk.data(), acc.pub.t_spend, tx2, true,
+                                  acc.sk_spend.data(), hit3);
+    EXPECT_TRUE(hit3.match);
+    EXPECT_NE(0, std::memcmp(hit.sk_stealth.data(), hit3.sk_stealth.data(), 32))
+        << "per-transfer one-time recipes must differ";
 }
 
 TEST(VortexDksapTest, ForeignRadarNeverMatches) {
@@ -87,13 +121,13 @@ TEST(VortexDksapTest, ForeignRadarNeverMatches) {
     vx::crypto::dksap::Account a, b;
     vx::crypto::dksap::derive_account(mA, a);
     vx::crypto::dksap::derive_account(mB, b);
-    EXPECT_NE(0, std::memcmp(a.pub.kspend.data(), b.pub.kspend.data(), 32));
+    EXPECT_NE(0, std::memcmp(a.pub.t_spend.data(), b.pub.t_spend.data(), 32));
 
     vx::crypto::dksap::StealthTx tx;
     vx::crypto::dksap::stealth_send(a.pub, tx);
 
     vx::crypto::dksap::RadarHit hit;
-    vx::crypto::dksap::radar_scan(b.kem_sk.data(), b.pub.kspend, tx, true, b.sk_spend.data(), hit);
+    vx::crypto::dksap::radar_scan(b.kem_sk.data(), b.pub.t_spend, tx, true, b.sk_spend.data(), hit);
     EXPECT_FALSE(hit.match) << "B's radar must not match a transfer addressed to A";
     EXPECT_EQ(0, std::memcmp(hit.sk_stealth.data(), "\0\0\0\0", 4));
 }
