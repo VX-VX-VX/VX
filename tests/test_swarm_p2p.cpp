@@ -20,6 +20,8 @@
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <fstream>
+#include <sys/stat.h>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -1007,5 +1009,141 @@ TEST(VortexSwarmP2PTest, LoopbackCandidatesGatedByDefault) {
     // Link-local stays refused even under the loopback switch: the env
     // name says LOOPBACK, and the switch must not widen beyond its name.
     EXPECT_FALSE(node.add_addr_candidate(link_local_net, 12347));
+    node.emergency_stop();
+}
+
+// ── 9. PEX 2/2: dormant identity-enforcement gate (security review
+// 2026-11-15, HIGH) ───────────────────────────────────────────────────
+// While the v2 handshake id is UNAUTHENTICATED, identity-keyed
+// enforcement must be fully dormant: strikes no-op, nothing reaches
+// the durable banlist, banned rows load as DATA but enforce nothing.
+// A spoofer announcing a victim's id must not durably censor it.
+
+namespace {
+std::array<uint8_t, 32> test_id(uint8_t tag) {
+    std::array<uint8_t, 32> id{};
+    id[0] = tag;
+    id[31] = static_cast<uint8_t>(tag + 1);
+    return id;
+}
+} // namespace
+
+// Dormant strikes are complete no-ops: no ban, no durable row.
+TEST(VortexSwarmP2PTest, DormantIdStrikesNoOp) {
+    vx::net::SwarmNode node;
+    const std::string dir = "/tmp/vx_pex_dormant_" + std::to_string(getpid());
+    node.attach_banlist_path(dir);
+    const auto id = test_id(0xA1);
+
+    // Enforcement OFF by default: three strikes → still not banned.
+    node.report_id_strike(id, 34);
+    node.report_id_strike(id, 34);
+    node.report_id_strike(id, 34);
+    EXPECT_FALSE(node.id_is_banned(id));
+
+    // The banlist file must NOT exist (no durable row was written).
+    struct stat st{};
+    const std::string path = dir + "/banlist";
+    EXPECT_TRUE(::stat(path.c_str(), &st) != 0)
+        << "durable banlist written while dormant — spoofer-censorship risk";
+    node.emergency_stop();
+}
+
+// Dormant ban-check: rows loaded from disk stay DATA (no handshake
+// refusal) while the gate is OFF; flipping the gate enables them.
+TEST(VortexSwarmP2PTest, DormantLoadedRowsEnforceNothingUntilEnabled) {
+    vx::net::SwarmNode node;
+    const std::string dir = "/tmp/vx_pex_loaded_" + std::to_string(getpid());
+    node.attach_banlist_path(dir);
+    const auto victim = test_id(0xB2);
+
+    // A pre-seeded banlist row (simulated persisted state): while
+    // dormant this must NOT refuse anything.
+    node.enable_id_enforcement();       // write a row the honest way
+    node.report_id_strike(victim, 100); // single 100 → banned
+    EXPECT_TRUE(node.id_is_banned(victim));
+    node.emergency_stop();
+
+    // New node, same dir: row loads as DATA.
+    vx::net::SwarmNode fresh;
+    fresh.attach_banlist_path(dir);
+    // Dormant again by default (fresh instance): row is inert.
+    EXPECT_FALSE(fresh.id_is_banned(victim));
+    fresh.enable_id_enforcement(); // VX60-SEC KEM-PoP future: ON
+    EXPECT_TRUE(fresh.id_is_banned(victim));
+    fresh.emergency_stop();
+}
+
+// After the gate flips ON, strikes accumulate by id across port
+// rotations and cross the durable ban threshold (the anti-laundering
+// property the whole mechanism exists for).
+TEST(VortexSwarmP2PTest, EnabledIdStrikesAccumulateAndPersist) {
+    vx::net::SwarmNode node;
+    const std::string dir = "/tmp/vx_pex_enabled_" + std::to_string(getpid());
+    node.attach_banlist_path(dir);
+    node.enable_id_enforcement();
+    const auto id = test_id(0xC3);
+
+    // Three strikes (34 each) — as if arriving from three rotated ports.
+    node.report_id_strike(id, 34);
+    node.report_id_strike(id, 34);
+    EXPECT_FALSE(node.id_is_banned(id));
+    node.report_id_strike(id, 34);
+    EXPECT_TRUE(node.id_is_banned(id));
+
+    // Durable row exists on disk.
+    struct stat st{};
+    EXPECT_EQ(::stat((dir + "/banlist").c_str(), &st), 0);
+
+    // A fresh instance loads the row and enforces it once enabled.
+    vx::net::SwarmNode fresh;
+    fresh.attach_banlist_path(dir);
+    EXPECT_FALSE(fresh.id_is_banned(id)); // dormant on boot
+    fresh.enable_id_enforcement();
+    EXPECT_TRUE(fresh.id_is_banned(id)); // survived the restart
+    fresh.emergency_stop();
+}
+
+// Malformed banlist rows are skipped, never fatal, never a silent
+// unban: valid rows still load beside the garbage.
+TEST(VortexSwarmP2PTest, MalformedBanlistRowSkipped) {
+    vx::net::SwarmNode node;
+    const std::string dir = "/tmp/vx_pex_malformed_" + std::to_string(getpid());
+    const std::string path = dir + "/banlist";
+    mkdir(dir.c_str(), 0700);
+    const auto good = test_id(0xD4);
+    std::array<char, 65> hex{};
+    static const char *d = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        hex[i * 2] = d[good[i] >> 4];
+        hex[i * 2 + 1] = d[good[i] & 0xF];
+    }
+    std::ofstream out(path, std::ios::binary);
+    out << "zz-not-hex-garbage-row\n"                         // malformed
+        << std::string(hex.data(), 64) << " 1752500000 100\n" // valid
+        << "\n"                                               // empty
+        << "abc\n";                                           // too short
+    out.close();
+
+    node.attach_banlist_path(dir); // fail-closed per row: skip + warn
+    node.enable_id_enforcement();
+    EXPECT_TRUE(node.id_is_banned(good)); // valid row loaded
+    const auto unknown = test_id(0xE5);
+    EXPECT_FALSE(node.id_is_banned(unknown));
+    node.emergency_stop();
+}
+
+// Old-world (all-zero) announce: nothing to key on even when
+// enforcement is enabled — no in-memory entry, no ban.
+TEST(VortexSwarmP2PTest, OldWorldZeroIdNeverBanned) {
+    vx::net::SwarmNode node;
+    const std::string dir = "/tmp/vx_pex_oldworld_" + std::to_string(getpid());
+    node.attach_banlist_path(dir);
+    node.enable_id_enforcement();
+    const std::array<uint8_t, 32> zero{};
+    node.report_id_strike(zero, 100);
+    EXPECT_FALSE(node.id_is_banned(zero));
+    struct stat st{};
+    EXPECT_TRUE(::stat((dir + "/banlist").c_str(), &st) != 0);
     node.emergency_stop();
 }

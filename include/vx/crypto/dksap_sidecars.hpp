@@ -23,9 +23,11 @@
 #include "vx/core/ct_equal.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -256,9 +258,25 @@ public:
         auto it = sgmt_.find(digest);
         if (it != sgmt_.end() && scan(it))
             return true;
-        const_cast<DksapSidecarRegistry *>(this)->replay_sgmt_durable_tail(kSgmtMemCap);
-        it = sgmt_.find(digest);
-        return it != sgmt_.end() && scan(it);
+        // Durable-index fallback (security review 2026-11-15, MEDIUM —
+        // revised): the OLD design replayed the WHOLE durable file on a
+        // miss — an unauthenticated DoS lever — then memoized misses,
+        // which starved honest consensus resolves. The NEW design keeps
+        // a digest→offset index built at attach (and extended on every
+        // append); a miss is served by ONE pread of a single record:
+        // O(1), no full-file parse, no gate, no starvation — consensus
+        // always sees the log.
+        SgmtRecord single;
+        if (load_sgmt_record_indexed(digest, single)) {
+            // Row was fsync'd only after the leaf gate passed originally:
+            // restored as a COMMITTED candidate, then scanned.
+            const_cast<DksapSidecarRegistry *>(this)->insert_candidate(digest, single,
+                                                                       /*committed=*/true);
+            it = sgmt_.find(digest);
+            if (it != sgmt_.end() && scan(it))
+                return true;
+        }
+        return false;
     }
 
     /// Resolve the bundle whose Pstealth matches the frame receiver.
@@ -303,8 +321,17 @@ public:
                 if (c.committed && c.rec.nickname == rec.nickname &&
                     c.rec.pub.t_spend == rec.pub.t_spend && c.rec.pub.kkem == rec.pub.kkem)
                     return true; // same digest, same record: row already durable
-        insert_candidate(digest, rec, /*committed=*/true);
-        return append_sgmt_durable(digest, rec);
+        // Insert UNCOMMITTED first: the committed flag must flip only AFTER
+        // the durable append succeeded. A committed-but-undurable candidate
+        // would make the next re-commit dedup-skip the append — the block
+        // applies without a log row and the node refuses its own history
+        // after restart (vx-audit 2026-11-15, P1). On append failure the
+        // candidate stays uncommitted (evictable, harmless).
+        insert_candidate(digest, rec, /*committed=*/false);
+        if (!append_sgmt_durable(digest, rec))
+            return false;
+        mark_committed_locked(digest, rec);
+        return true;
     }
 
     /// Relay helper: every candidate for a digest (bounded; the relayer is
@@ -339,6 +366,13 @@ public:
     size_t sgmt_size() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         return sgmt_.size();
+    }
+    /// Test seam: drop one digest's in-memory entry so the next resolve
+    /// must serve through the durable-index fallback (the path in-memory
+    /// eviction would force). Production never calls this — eviction is LRU.
+    void forget_sgmt_for_test(const std::array<uint8_t, 32> &digest) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sgmt_.erase(digest);
     }
     size_t stealth_size() const noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -433,6 +467,20 @@ private:
         return true;
     }
 
+    /// Flip an existing candidate to committed AFTER its durable row is
+    /// confirmed fsync'd (caller holds mutex_). No-op when the candidate is
+    /// absent (it can only be evicted across lock releases; within one
+    /// commit_sgmt_record hold it is present).
+    void mark_committed_locked(const std::array<uint8_t, 32> &digest, const SgmtRecord &rec) {
+        auto it = sgmt_.find(digest);
+        if (it == sgmt_.end())
+            return;
+        for (auto &c : it->second.sg)
+            if (c.rec.nickname == rec.nickname && c.rec.pub.t_spend == rec.pub.t_spend &&
+                c.rec.pub.kkem == rec.pub.kkem)
+                c.committed = true;
+    }
+
     /// Global RAM bounds: LRU eviction of whole digest entries (a committed
     /// SGMT record is servable again from the durable log).
     void trim_global() {
@@ -475,10 +523,27 @@ private:
         }
         if (ok)
             ok = ::fsync(fd) == 0;
+        // Index the fresh row AFTER the writes succeed: re-fstat now and
+        // take row_start = post-write size − row_length. (The FIRST fstat's
+        // st_size is the PRE-write size — subtracting row_len from it aims
+        // row_len bytes INTO the previous record, and underflows to ~2^64
+        // on a magic-only file; vx-audit 2026-11-15, P1.) A successful
+        // append wrote exactly (magic-if-empty + row) bytes, so post − len
+        // is the row start. Row = digest(32)+nlen(1)+nick+t_spend+kkem.
+        if (ok) {
+            struct stat st2{};
+            if (::fstat(fd, &st2) == 0) {
+                const size_t row_len = 32 + 1 + rec.nickname.size() + T_COMMIT_SIZE + KEM_PK_SIZE;
+                if (st2.st_size >= 0 && static_cast<uint64_t>(st2.st_size) >= row_len)
+                    durable_index_[digest] = static_cast<uint64_t>(st2.st_size) - row_len;
+            }
+        }
         ::close(fd);
-        if (!ok)
+        if (!ok) {
             std::cerr << "[DksapSidecars] durable log append failed — refusing the commit"
                          " (the dependent block replay must stay possible)\n";
+            return ok;
+        }
         return ok;
     }
 
@@ -508,8 +573,12 @@ private:
         size_t loaded = 0;
         while (loaded < max_records) {
             // Record frame: digest(32) + nlen(1) + nickname(n) + keys(1568).
+            // Index build: every parsed row registers digest→row-start
+            // (the attach-time full walk is the ONLY full parse — after
+            // this, resolve misses are O(1) preads).
             if (off + 32 + 1 > buf.size())
                 break;
+            const size_t row_start = off;
             std::array<uint8_t, 32> digest{};
             std::memcpy(digest.data(), buf.data() + off, 32);
             off += 32;
@@ -533,8 +602,77 @@ private:
                 ++durable_replayed_;
                 ++loaded;
             }
+            durable_index_[digest] = static_cast<uint64_t>(row_start);
         }
         return loaded > 0;
+    }
+
+    // ── Durable digest→offset index (resolved under mutex_) ───────────
+    // Built while the attach-time replay walks the log; extended on every
+    // successful append. A resolve-miss serves ONE pread of a single
+    // record: O(1), no full-file parse, no DoS lever, no honest-starve
+    // (the old memo+rate-limit gate is gone — security review 2026-11-15,
+    // MEDIUM, revised).
+    std::unordered_map<std::array<uint8_t, 32>, uint64_t, Array32Hash> durable_index_;
+
+    // Loads one record by digest from the durable log via the index.
+    // Caller holds mutex_. Returns false when the index has no row for
+    // this digest (log absent/row absent) or the row fails canonical
+    // intake (fail closed).
+    bool load_sgmt_record_indexed(const std::array<uint8_t, 32> &digest, SgmtRecord &out) const {
+        if (!sgmt_log_attached_)
+            return false;
+        auto it = durable_index_.find(digest);
+        if (it == durable_index_.end())
+            return false;
+        const int fd = ::open(sgmt_log_path_.c_str(), O_RDONLY);
+        if (fd < 0)
+            return false;
+        // Row frame at the indexed offset: digest(32) + nlen(1) +
+        // nickname(n) + t_spend(384) + kkem(1184).
+        uint8_t head[32 + 1];
+        bool ok = true;
+        size_t got = 0;
+        while (ok && got < sizeof(head)) {
+            const ssize_t n =
+                ::pread(fd, head + got, sizeof(head) - got, static_cast<off_t>(it->second + got));
+            if (n <= 0) {
+                ok = false;
+                break;
+            }
+            got += static_cast<size_t>(n);
+        }
+        std::array<uint8_t, 32> row_digest{};
+        uint8_t nlen = 0;
+        if (ok) {
+            std::memcpy(row_digest.data(), head, 32);
+            nlen = head[32];
+            if (nlen == 0 || nlen > 32 || row_digest != digest)
+                ok = false;
+        }
+        if (ok) {
+            const size_t rest = size_t(nlen) + T_COMMIT_SIZE + KEM_PK_SIZE;
+            std::vector<uint8_t> buf(rest);
+            size_t got2 = 0;
+            while (ok && got2 < rest) {
+                const ssize_t n = ::pread(fd, buf.data() + got2, rest - got2,
+                                          static_cast<off_t>(it->second + 33 + got2));
+                if (n <= 0) {
+                    ok = false;
+                    break;
+                }
+                got2 += static_cast<size_t>(n);
+            }
+            if (ok) {
+                out.nickname.assign(reinterpret_cast<const char *>(buf.data()), nlen);
+                std::memcpy(out.pub.t_spend.data(), buf.data() + nlen, T_COMMIT_SIZE);
+                std::memcpy(out.pub.kkem.data(), buf.data() + nlen + T_COMMIT_SIZE, KEM_PK_SIZE);
+                if (!detail::unpack12_canonical(out.pub.t_spend))
+                    ok = false; // corrupt row: fail closed
+            }
+        }
+        ::close(fd);
+        return ok;
     }
 
     mutable std::mutex mutex_;

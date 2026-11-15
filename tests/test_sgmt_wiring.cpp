@@ -23,6 +23,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace vx::blockchain;
@@ -707,4 +708,80 @@ TEST(VortexSgmtWiringTest, ReRegistrationDurableUnderBothDigests) {
     EXPECT_EQ(digest_at(8 + row), d2);
 
     fs::remove_all(dir);
+}
+
+// -- 11. (P1 regression, vx-audit 2026-11-15) A FAILED durable append must
+// NOT poison the same-digest dedup: the candidate stays UNCOMMITTED so the
+// next re-commit RETRIES the append. The old order (committed flag set
+// before the append) let a committed-but-undurable candidate make the
+// retry dedup-skip — the block then applied with no log row and the node
+// refused its own history after restart (the exact HIGH class this file's
+// test 10 closes). Also pins the append-time index offset: the row start
+// is POST-write size − row length, so a resolve after an in-session
+// eviction must load the record back from the log byte-identically.
+// Must run AFTER test 10 (it reuses the process-wide attached log path).
+TEST(VortexSgmtWiringTest, CommitAppendFailureNotPoisoned) {
+    namespace fs = std::filesystem;
+    const fs::path dir =
+        fs::temp_directory_path() / ("vx_sgmtw_durable_" + std::to_string(::getpid()));
+    const std::string log_path = (dir / "ledger.sgm").string();
+    // Test 10 attaches this path process-wide and remove_all()s the
+    // directory on exit — recreate the directory and a fresh empty file,
+    // then re-attach (idempotent for the same path; in a standalone run it
+    // performs the attach itself).
+    fs::create_directories(dir);
+    {
+        std::ofstream mk(log_path, std::ios::binary | std::ios::app);
+        ASSERT_TRUE(mk.good());
+    }
+    vx::crypto::dksap::DksapSidecarRegistry::instance().attach_sgmt_durable_log(log_path);
+    auto before = fs::file_size(log_path);
+
+    vx::crypto::dksap::SgmtRecord rec;
+    rec.nickname = "poison_probe";
+    // t_spend MUST be canonical 12-bit packing (the indexed reload
+    // re-validates it and fails closed): all-zero limbs are canonical.
+    // kkem bytes are opaque — patterned to make a mix-up visible.
+    for (size_t i = 0; i < rec.pub.kkem.size(); ++i)
+        rec.pub.kkem[i] = static_cast<uint8_t>(i * 13 + 5);
+    std::array<uint8_t, 32> digest{};
+    for (size_t i = 0; i < digest.size(); ++i)
+        digest[i] = static_cast<uint8_t>(0x70 + i);
+
+    auto &reg = vx::crypto::dksap::DksapSidecarRegistry::instance();
+
+    // Break appends: the log file loses its owner-write bit.
+    ASSERT_EQ(::chmod(log_path.c_str(), 0400), 0);
+    // First commit: the append fails, the commit refuses.
+    EXPECT_FALSE(reg.commit_sgmt_record(digest, rec));
+    // Retry: must RETRY the append (still failing) — NOT dedup-skip to true.
+    EXPECT_FALSE(reg.commit_sgmt_record(digest, rec))
+        << "failed append poisoned the committed flag: the retry dedup-skipped";
+
+    // Heal the file: the next commit retries and succeeds, marking the
+    // candidate committed only now.
+    ASSERT_EQ(::chmod(log_path.c_str(), 0600), 0);
+    EXPECT_TRUE(reg.commit_sgmt_record(digest, rec));
+    EXPECT_TRUE(reg.commit_sgmt_record(digest, rec)); // idempotent re-commit
+
+    // Exactly ONE row reached the disk across all four commits.
+    auto after = fs::file_size(log_path);
+    const size_t row_len =
+        32 + 1 + rec.nickname.size() + rec.pub.t_spend.size() + rec.pub.kkem.size();
+    const size_t magic = (before < 8) ? 8 : 0; // fresh file gets the magic
+    EXPECT_EQ(after, before + magic + row_len)
+        << "expected exactly one durable row for the digest (no poison re-append)";
+
+    // The append-time index points at that row: drop the in-memory entry
+    // (forced eviction) and resolve again — the indexed reload must return
+    // the record byte-identically (resolve against the record's own commit
+    // leaf — the synthetic record is its own honest frame).
+    reg.forget_sgmt_for_test(digest);
+    const auto leaf = vx::crypto::dksap::sgmt_commit(rec.nickname, rec.pub);
+    vx::crypto::dksap::SgmtRecord loaded;
+    ASSERT_TRUE(reg.resolve_sgmt_record(digest, leaf, loaded))
+        << "indexed reload failed — append-time offset miscomputed";
+    EXPECT_EQ(loaded.nickname, rec.nickname);
+    EXPECT_EQ(loaded.pub.t_spend, rec.pub.t_spend);
+    EXPECT_EQ(loaded.pub.kkem, rec.pub.kkem);
 }

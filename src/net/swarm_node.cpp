@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -428,6 +429,10 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
     // Discovery state for THIS connection: one self-announce / one ADDRS
     // per direction; a second ADDRS from the same peer is a flood signal.
     bool addr_seen = false;
+    // PEX 2/2: identity keying. Filled by the first HANDSHAKE (zero +
+    // !known until then — pre-handshake strikes are address-keyed only).
+    std::array<uint8_t, 32> handshaked_id{};
+    bool id_known = false;
     for (;;) {
         WireHeader hdr{};
         std::vector<uint8_t> payload;
@@ -461,8 +466,21 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                 ::close(fd);
                 return;
             }
+            // PEX 2/2: a banned durable identity never gets promoted — the
+            // banlist survived the restart this attacker is counting on.
+            if (id_is_banned(their_id)) {
+                std::cerr << "[Swarm] banned identity, dropping " << label << "\n";
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                peer_fds_.erase(label);
+                ::close(fd);
+                return;
+            }
+            handshaked_id = their_id;
+            id_known = !id_full_zero(their_id);
             {
                 std::lock_guard<std::mutex> lock(peers_mutex_);
+                if (id_known)
+                    id_conn_labels_[their_id] = label;
                 for (auto &peer : peer_table_) {
                     if (peer.address == label) {
                         PeerInfo updated = peer;
@@ -510,6 +528,8 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             // symmetric with the inbound loop.
             if (addr_seen) {
                 report_withhold(label, 20);
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
                 continue;
             }
             addr_seen = true;
@@ -526,13 +546,17 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                     }
                 }
             }
-            if (ingest_addrs(payload, lip, lport) < 0)
+            if (ingest_addrs(payload, lip, lport) < 0) {
                 report_withhold(label, 20); // malformed payload
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
+            }
             continue;
         }
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
             handle_incoming_frame(label,
-                                  std::span<const uint8_t, 65536>(payload.data(), payload.size()));
+                                  std::span<const uint8_t, 65536>(payload.data(), payload.size()),
+                                  id_known ? &handshaked_id : nullptr);
             continue;
         }
         if (type == WireMsgType::PQ_WITNESS &&
@@ -567,6 +591,8 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             const uint8_t nlen = payload[32];
             if (nlen == 0 || nlen > 32 || payload.size() != 32 + 1 + nlen + 384 + 1184) {
                 report_withhold(label, 20);
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
                 continue;
             }
             vx::crypto::dksap::SgmtRecord rec;
@@ -1225,9 +1251,12 @@ bool SwarmNode::send_wire_payloads_to(int fd, WireMsgType type,
 }
 
 void SwarmNode::handle_incoming_frame(const std::string &from_peer,
-                                      const std::span<const uint8_t, 65536> &frame) {
+                                      const std::span<const uint8_t, 65536> &frame,
+                                      const std::array<uint8_t, 32> *id) {
     if (!verify_frame(frame)) {
         ban_peer(from_peer, 100);
+        if (id != nullptr && !id_full_zero(*id))
+            report_id_strike(*id, 100); // PEX 2/2: identity carries the score too
         return;
     }
     if (frame_hook_)
@@ -1393,6 +1422,207 @@ void SwarmNode::load_or_create_node_id(const std::string &data_dir) {
     }
     std::cerr << "[Swarm] node_id create failed (errno " << errno
               << "); running identityless this session\n";
+}
+
+// ── PEX 2/2: node_id-keyed strikes + durable banlist ────────────────────────
+
+void SwarmNode::attach_banlist_path(const std::string &data_dir) {
+    // Self-sufficient attach: create the directory if missing so a ban can
+    // always reach disk. If creation fails, append_banlist_locked warns with
+    // its existing fail-open posture (ban stays in-memory only).
+    std::error_code fs_ec;
+    std::filesystem::create_directories(data_dir, fs_ec);
+    const std::string path = (std::filesystem::path(data_dir) / "banlist").string();
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    if (banlist_attached_) {
+        if (banlist_path_ != path)
+            std::abort(); // single ownership, same as the SGMT durable log
+        return;
+    }
+    banlist_path_ = path;
+    banlist_attached_ = true;
+    // Load: one "<64-hex id> <unix> <reason-code>" row per banned identity.
+    // Fail closed PER LINE (skip + warn): a corrupted banlist must never
+    // take the node down and never silently unban a peer. An absent file
+    // is a first boot: empty list.
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0)
+        return;
+    struct stat st{};
+    std::vector<uint8_t> buf;
+    if (::fstat(fd, &st) == 0 && st.st_size > 0) {
+        buf.resize(static_cast<size_t>(st.st_size));
+        size_t got = 0;
+        while (got < buf.size()) {
+            const ssize_t n =
+                ::pread(fd, buf.data() + got, buf.size() - got, static_cast<off_t>(got));
+            if (n <= 0)
+                break;
+            got += static_cast<size_t>(n);
+        }
+        buf.resize(got);
+    }
+    ::close(fd);
+    auto hexv = [](char c) -> int {
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'a' && c <= 'f')
+            return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+            return c - 'A' + 10;
+        return -1;
+    };
+    size_t off = 0;
+    size_t loaded = 0;
+    while (off < buf.size()) {
+        size_t end = off;
+        while (end < buf.size() && buf[end] != '\n')
+            ++end;
+        // Parse from the LINE START, before advancing past it: reading the
+        // id from the already-advanced cursor both parsed the next line's
+        // bytes and walked off the buffer near EOF (security review
+        // 2026-11-15, MEDIUM: heap out-of-bounds read).
+        const size_t line_start = off;
+        const size_t len = end - off;
+        off = (end < buf.size()) ? end + 1 : end;
+        if (len < 64 || line_start + 64 > buf.size())
+            continue;
+        std::array<uint8_t, 32> id{};
+        bool ok = true;
+        for (size_t i = 0; i < 32; ++i) {
+            const int hi = hexv(static_cast<char>(buf[line_start + i * 2]));
+            const int lo = hexv(static_cast<char>(buf[line_start + i * 2 + 1]));
+            if (hi < 0 || lo < 0) {
+                ok = false;
+                break;
+            }
+            id[i] = static_cast<uint8_t>((hi << 4) | lo);
+        }
+        if (!ok) {
+            std::cerr << "[Swarm] banlist: malformed row skipped\n";
+            continue;
+        }
+        id_rep_[id] = IdReputation{0, true};
+        ++loaded;
+    }
+    if (loaded > 0)
+        std::cout << "[Swarm] banlist: " << loaded << " banned identit(y/ies) loaded\n";
+}
+
+void SwarmNode::report_id_strike(const std::array<uint8_t, 32> &id, int score_increment) {
+    if (id_full_zero(id))
+        return; // old-world announce: nothing durable to key on
+    // DORMANT gate (security review 2026-11-15, HIGH): strikes against
+    // UNAUTHENTICATED ids must not accumulate toward bans or reach the
+    // durable banlist — a spoofer could self-strike a victim's announced
+    // id and durably censor it. Address-keyed strikes (pre-handshake
+    // surface) keep working via report_withhold. Enforcement enables
+    // only where the handshake proves key possession (VX60-SEC KEM-PoP).
+    if (!id_enforcement_enabled_.load())
+        return;
+    std::vector<int> fds_to_drop;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        IdReputation rep;
+        auto it = id_rep_.find(id);
+        if (it != id_rep_.end())
+            rep = it->second;
+        if (rep.banned)
+            return; // already on the durable list
+        rep.dos_score += score_increment;
+        if (rep.dos_score < 100) {
+            id_rep_[id] = rep;
+            trim_id_rep_locked();
+            return;
+        }
+        rep.banned = true;
+        id_rep_[id] = rep;
+        // Durable append. DELIBERATELY fail-open, unlike the SGMT log:
+        // this is DoS response, not consensus state — a full disk must not
+        // wedge the node mid-attack; the ban stays in memory and the
+        // restart gap is bounded by the attacker re-earning 100 points.
+        append_banlist_locked(id);
+        // Drop every live connection that announced this identity.
+        auto lit = id_conn_labels_.find(id);
+        if (lit != id_conn_labels_.end()) {
+            auto fit = peer_fds_.find(lit->second);
+            if (fit != peer_fds_.end()) {
+                // shutdown only: the owning reader/serve thread closes the
+                // fd exactly once (same discipline as health_loop).
+                fds_to_drop.push_back(fit->second);
+                peer_fds_.erase(fit);
+            }
+            id_conn_labels_.erase(lit);
+        }
+    }
+    for (int fd : fds_to_drop)
+        ::shutdown(fd, SHUT_RDWR);
+}
+
+bool SwarmNode::id_is_banned(const std::array<uint8_t, 32> &id) const {
+    if (id_full_zero(id))
+        return false;
+    // DORMANT gate (security review 2026-11-15, HIGH): unauthenticated
+    // ids must never trigger identity-keyed enforcement — a spoofer
+    // announcing a victim's id would otherwise censor it at handshake.
+    // Enforcement enables only where the handshake proves key possession
+    // (VX60-SEC KEM-PoP).
+    if (!id_enforcement_enabled_.load())
+        return false;
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    auto it = id_rep_.find(id);
+    return it != id_rep_.end() && it->second.banned;
+}
+
+void SwarmNode::trim_id_rep_locked() {
+    while (id_rep_.size() > kMaxIdReputation) {
+        bool evicted = false;
+        for (auto it = id_rep_.begin(); it != id_rep_.end(); ++it) {
+            if (!it->second.banned) {
+                id_rep_.erase(it);
+                evicted = true;
+                break;
+            }
+        }
+        if (!evicted)
+            break; // all entries banned: disk-backed, load restores them
+    }
+}
+
+void SwarmNode::append_banlist_locked(const std::array<uint8_t, 32> &id) {
+    if (!banlist_attached_)
+        return;
+    const int fd = ::open(banlist_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) {
+        std::cerr << "[Swarm] banlist open failed (ban stays in-memory only)\n";
+        return;
+    }
+    char row[64 + 32];
+    static const char *hexd = "0123456789abcdef";
+    for (size_t i = 0; i < 32; ++i) {
+        row[i * 2] = hexd[id[i] >> 4];
+        row[i * 2 + 1] = hexd[id[i] & 0xF];
+    }
+    const int n = std::snprintf(row + 64, sizeof(row) - 64, " %lld %d\n",
+                                static_cast<long long>(::time(nullptr)), 100);
+    bool ok = n > 0;
+    size_t put = 0;
+    const size_t total = 64 + static_cast<size_t>(n);
+    while (ok && put < total) {
+        const ssize_t w = ::write(fd, row + put, total - put);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR)
+                continue;
+            ok = false;
+            break;
+        }
+        put += static_cast<size_t>(w);
+    }
+    if (ok)
+        (void)::fsync(fd); // best-effort durability
+    ::close(fd);
+    if (!ok)
+        std::cerr << "[Swarm] banlist append failed (ban stays in-memory only)\n";
 }
 
 bool SwarmNode::add_addr_candidate(uint32_t ip_net, uint16_t port, bool operator_supplied) {
@@ -1658,6 +1888,10 @@ void SwarmNode::serve_connection(int c) {
     // that was connected TO can relay back over the accepted socket.
     std::string peer_label = "loopback";
     bool registered = false;
+    // PEX 2/2: identity keying (filled by the first HANDSHAKE; strikes
+    // before it are address-keyed only).
+    std::array<uint8_t, 32> handshaked_id{};
+    bool id_known = false;
     // Returns true only on the call that actually registered the peer, so
     // callers can fire one-shot connect side effects (retention re-serve)
     // without re-triggering them on every later packet.
@@ -1737,12 +1971,21 @@ void SwarmNode::serve_connection(int c) {
                           << "\n";
                 break;
             }
+            // PEX 2/2: a banned durable identity never gets promoted.
+            if (id_is_banned(their_id)) {
+                std::cerr << "[Swarm] banned identity, dropping " << peer_label << "\n";
+                break;
+            }
+            handshaked_id = their_id;
+            id_known = !id_full_zero(their_id);
             if (promote()) {
                 fire_connected();
                 announce();
             }
             {
                 std::lock_guard<std::mutex> lock(peers_mutex_);
+                if (id_known)
+                    id_conn_labels_[their_id] = peer_label;
                 for (auto &peer : peer_table_) {
                     if (peer.address == peer_label) {
                         PeerInfo updated = peer;
@@ -1771,6 +2014,8 @@ void SwarmNode::serve_connection(int c) {
             }
             if (addr_seen) {
                 report_withhold(peer_label, 20);
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
                 continue;
             }
             addr_seen = true;
@@ -1788,8 +2033,11 @@ void SwarmNode::serve_connection(int c) {
                     }
                 }
             }
-            if (ingest_addrs(payload, lip, lport) < 0)
+            if (ingest_addrs(payload, lip, lport) < 0) {
                 report_withhold(peer_label, 20); // malformed payload
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
+            }
             continue;
         }
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
@@ -1798,7 +2046,8 @@ void SwarmNode::serve_connection(int c) {
                 announce();
             }
             handle_incoming_frame(peer_label,
-                                  std::span<const uint8_t, 65536>(payload.data(), payload.size()));
+                                  std::span<const uint8_t, 65536>(payload.data(), payload.size()),
+                                  id_known ? &handshaked_id : nullptr);
             continue;
         }
         if (type == WireMsgType::PQ_WITNESS &&
@@ -1850,6 +2099,8 @@ void SwarmNode::serve_connection(int c) {
             const uint8_t nlen = payload[32];
             if (nlen == 0 || nlen > 32 || payload.size() != 32 + 1 + nlen + 384 + 1184) {
                 report_withhold(peer_label, 20); // malformed: strict shape
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
                 continue;
             }
             vx::crypto::dksap::SgmtRecord rec;

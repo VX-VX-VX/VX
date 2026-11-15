@@ -271,9 +271,12 @@ public:
     // Get current peer table snapshot
     std::vector<PeerInfo> get_peer_table() const;
 
-    // Handle incoming frame from peer
+    // Handle incoming frame from peer. id (when non-null) is the sender's
+    // announced durable identity: a failed verification scores BOTH keys
+    // (address + identity, PEX 2/2).
     void handle_incoming_frame(const std::string &from_peer,
-                               const std::span<const uint8_t, 65536> &frame);
+                               const std::span<const uint8_t, 65536> &frame,
+                               const std::array<uint8_t, 32> *id = nullptr);
 
     // Register a callback invoked for every verified 64 KiB block frame that
     // arrives over the P2P listener. The node layer (RPC server / main) owns
@@ -411,14 +414,63 @@ public:
     // Durable node identity for the v2 handshake: 32 random bytes created
     // once and persisted at data_dir/node_id (0600, O_EXCL). A peer that
     // announces OUR node_id is ourselves (self-dial through discovery) and
-    // is disconnected on sight. KNOWN GAP (security review 2026-11-11,
-    // open): strike/withhold accounting is STILL keyed by the connection
-    // address, not by the node_id - an attacker rotating source ports
-    // accumulates no strikes, and no durable banlist exists yet. Treat the
-    // node_id-keyed enforcement as designed-but-unwired until it lands.
-    // Must be called once before start(); with no call the node sends a
-    // zero id and self-detection is disabled (48-byte old-world handshake).
+    // is disconnected on sight. Must be called once before start(); with
+    // no call the node sends a zero id and self-detection is disabled
+    // (48-byte old-world handshake).
     void load_or_create_node_id(const std::string &data_dir);
+
+    // ── PEX 2/2: node_id-keyed strikes + durable banlist ─────────
+    // (security review 2026-11-11 gap, closed 2026-11-15) Strikes land on
+    // BOTH keys: the connection label (covers pre-handshake misbehavior,
+    // where no identity is known yet) and the announced 32-byte durable
+    // identity. Rotating source ports no longer launders a score: fresh
+    // ports still announce the SAME identity, and the identity carries the
+    // strikes. A banned identity is dropped at handshake on every future
+    // connection and survives restarts through <data_dir>/banlist (0600).
+    //
+    // DORMANT GATE (security review 2026-11-15, HIGH): the v2 handshake
+    // id is NOT authenticated — a spoofer can announce a victim's id
+    // and self-strike it, turning identity-keyed enforcement into a
+    // censorship primitive. Until identities are authenticated
+    // (VX60-SEC KEM-PoP), ALL identity-keyed ENFORCEMENT is dormant:
+    // report_id_strike is a no-op, id_is_banned is false, nothing is
+    // written to the durable banlist, no connection is dropped by id.
+    // Address-keyed strikes keep working (pre-handshake surface). The
+    // gate flips ON only where the handshake proves key possession.
+
+    // Attach the durable banlist. Must be called once, before start(); an
+    // absent file is an empty banlist (first boot). Load is fail-closed
+    // per line: a malformed row is skipped with a warning, never fatal and
+    // never a silent unban. Rows are DATA while dormant: they load into
+    // the in-memory reputation map but enforce nothing until the gate
+    // is enabled.
+    void attach_banlist_path(const std::string &data_dir);
+
+    // Score a protocol violation against the announced identity, in
+    // ADDITION to the address-keyed call the site already makes. A zero id
+    // (old-world announce) carries no identity to key on: no-op. Crossing
+    // 100 bans the identity durably and drops every live connection that
+    // announced it. NO-OP while identity enforcement is dormant
+    // (unauthenticated ids must never trigger durable bans).
+    void report_id_strike(const std::array<uint8_t, 32> &id, int score_increment);
+
+    // True when the identity is on the durable banlist AND identity
+    // enforcement is enabled. Always false while dormant.
+    bool id_is_banned(const std::array<uint8_t, 32> &id) const;
+
+    // Dormant-gate control. VX60-SEC (KEM-PoP handshake) enables identity
+    // enforcement after proving key possession; tests use the _for_test
+    // seam. Default: OFF (dormant).
+    void enable_id_enforcement() {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        id_enforcement_enabled_ = true;
+    }
+    bool id_enforcement_enabled() const noexcept {
+        return id_enforcement_enabled_.load();
+    }
+    void set_id_enforcement_for_test(bool enabled) {
+        id_enforcement_enabled_.store(enabled);
+    }
 
     const std::array<uint8_t, 32> &node_id() const noexcept {
         return node_id_;
@@ -492,6 +544,29 @@ private:
 
     // Durable node identity (v2 handshake); zero = unknown/old-world.
     std::array<uint8_t, 32> node_id_{};
+
+    // ── PEX 2/2: identity-keyed reputation (guarded by peers_mutex_) ──
+    struct IdReputation {
+        int dos_score = 0;
+        bool banned = false;
+    };
+    // Bounded: non-banned entries are evictable past the cap (a score that
+    // never reached 100 has no durable meaning); BANNED entries are never
+    // evicted — they are disk-backed and a memory eviction would let a
+    // banned peer re-handshake until the next restart.
+    static constexpr size_t kMaxIdReputation = 8192;
+    std::map<std::array<uint8_t, 32>, IdReputation> id_rep_;
+    // The connection label each handshaked identity announced from (latest
+    // wins); feeds the ban-time fd drop.
+    std::map<std::array<uint8_t, 32>, std::string> id_conn_labels_;
+    std::string banlist_path_;
+    bool banlist_attached_ = false;
+    // DORMANT gate: identity-keyed enforcement OFF until the handshake
+    // authenticates ids (VX60-SEC KEM-PoP). Atomic: flips from RPC/init
+    // threads while readers poll id_is_banned on their own threads.
+    std::atomic<bool> id_enforcement_enabled_{false};
+    void trim_id_rep_locked();
+    void append_banlist_locked(const std::array<uint8_t, 32> &id);
 
     // The endpoint advertised to peers. ip stays 0 when unbound.
     uint32_t self_listen_ip_ = 0;
