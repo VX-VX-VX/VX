@@ -115,42 +115,16 @@ inline void absorb_phase(uint8_t state[200], const uint8_t *data, size_t len, ui
     size_t pad_len = kAeadRate - (total % kAeadRate);
     if (pad_len == 0)
         pad_len = kAeadRate;
-    // Pad bytes: 0x01, zeros, 0x80 (pad_len >= 2 always: total%rate==0
-    // gives pad_len==rate; total%rate==rate-1 gives pad_len==1 — IMPOSSIBLE
-    // only if… assert it: pad10*1 needs >= 2 bytes).
-    // (total % rate) == rate-1 ⇒ pad_len == 1: the 0x01 and 0x80 merge —
-    // the Python oracle's formula would emit a 1-byte pad, which cannot
-    // encode both marks. The oracle's alignment guard (pad_len==0 → rate)
-    // never hits rate-1 totals in the KAT set; both sides MUST refuse
-    // such a phase length — guarded below by the caller-visible contract
-    // that every phase stream here is well-formed (init/AD/final lengths
-    // are attacker-controlled for AD! Handle it properly):
-    if (pad_len == 1) {
-        // 0x01 and 0x80 merge into 0x81 (standard multi-rate padding, same
-        // rule FIPS 202 uses when the pad byte and the final byte meet).
-        const uint8_t merged = static_cast<uint8_t>(0x01 | 0x80);
-        // Emit: stream bytes so far occupy (total % rate) == rate-1 slots of
-        // the current block; the single pad byte 0x81 completes it.
-        uint8_t block[kAeadRate];
-        std::memset(block, 0, sizeof(block));
-        size_t off = 0;
-        block[off++] = domain;
-        if (extra_len > 0) {
-            std::memcpy(block + off, extra, extra_len);
-            off += extra_len;
-        }
-        if (len > 0) {
-            std::memcpy(block + off, data, len);
-            off += len;
-        }
-        block[off] = merged; // off == rate-1
-        for (size_t i = 0; i < kAeadRate; ++i)
-            state[i] ^= block[i];
-        keccak_f1600(state);
-        return;
-    }
-    // General case: process (total + pad_len) bytes in rate blocks,
-    // drawing from domain/extra/data then the pad.
+    // Pad bytes: 0x01, zeros, 0x80 — and when the pad collapses to a single
+    // byte (total % rate == rate-1), the 0x01 and 0x80 marks MERGE into
+    // 0x81 (the standard multi-rate rule, same as FIPS 202 padding). The
+    // merged case is handled IN THE GENERAL LOOP below as the one-byte
+    // pad. A separate merged fast-path branch previously memcpy'd
+    // extra/data into a single-rate block assuming total == rate-1 —
+    // a stack smash for any multi-block merged phase (security review
+    // 2026-11-15, CRITICAL: AD of 270 bytes = total 271 = rate + (rate-1)
+    // → 270 bytes memcpy'd into a 136-byte buffer). KAT vectors
+    // ad_len=270/406 pin the merged multi-block path on both sides.
     const size_t stream_total = total + pad_len;
     uint8_t block[kAeadRate];
     for (size_t base = 0; base < stream_total; base += kAeadRate) {
@@ -167,7 +141,9 @@ inline void absorb_phase(uint8_t state[200], const uint8_t *data, size_t len, ui
                     byte = data[pos - 1 - extra_len];
             } else {
                 const size_t pad_pos = pos - total; // 0 .. pad_len-1
-                byte = pad_pos == 0 ? 0x01 : (pad_pos == pad_len - 1 ? 0x80 : 0x00);
+                byte = (pad_pos == 0 && pad_len == 1)
+                           ? 0x81 // merged 0x01|0x80
+                           : (pad_pos == 0 ? 0x01 : (pad_pos == pad_len - 1 ? 0x80 : 0x00));
             }
             block[i] = byte;
         }

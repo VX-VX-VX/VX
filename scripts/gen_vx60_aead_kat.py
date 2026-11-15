@@ -245,6 +245,13 @@ def main():
     add("ad_merged_pad", k, n, bytes(range(134)), b"x")
     add("ad_full_pad_block", k, n, bytes(range(135)), b"x")
     add("ad_merged_pad_no_pt", k, n, bytes(range(134)), b"")
+    # Multi-block MERGED pad pins (security review 2026-11-15, CRITICAL):
+    # ad_len=270 → AD-phase total 271 = rate + (rate-1) → merged 0x81 pad on
+    # the SECOND block; ad_len=406 → total 407 = 2*rate + (rate-1) → third
+    # block. These only pass when the merged pad is handled inside the
+    # general block loop (a single-block fast path cannot reach them).
+    add("ad_merged_multiblock_270", k, n, bytes((i * 7 + 3) % 256 for i in range(270)), b"payload")
+    add("ad_merged_multiblock_406", k, n, bytes((i * 11 + 9) % 256 for i in range(406)), b"payload")
 
     # emit header
     out = []
