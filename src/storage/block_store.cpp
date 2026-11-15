@@ -476,6 +476,27 @@ bool BlockStore::append_block(const BlockFrame &frame) {
         tip_hash(ctx.expected_prev_hash);
         const RawBlock *tip = get_block(count_ - 1);
         ctx.prev_timestamp = tip ? tip->header.timestamp : 0;
+        // MTP-11: median stamp over the last min(11, count_) frames. With
+        // count_ < 2 the median is left zero (the monotone check alone
+        // covers the young chain).
+        if (count_ >= 2) {
+            uint64_t stamps[11];
+            const size_t n = count_ < 11 ? (size_t)count_ : 11;
+            for (size_t i = 0; i < n; ++i) {
+                const RawBlock *blk = get_block(count_ - 1 - i);
+                stamps[i] = blk ? blk->header.timestamp : 0;
+            }
+            for (size_t i = 1; i < n; ++i) { // insertion sort over ≤11 items
+                const uint64_t key = stamps[i];
+                size_t j = i;
+                while (j > 0 && stamps[j - 1] > key) {
+                    stamps[j] = stamps[j - 1];
+                    --j;
+                }
+                stamps[j] = key;
+            }
+            ctx.median_time_past = stamps[n / 2];
+        }
     }
     ctx.now_unix = static_cast<uint64_t>(std::time(nullptr));
     // ASERT retarget (BACKLOG 0.9 remainder): the gate demands the height's

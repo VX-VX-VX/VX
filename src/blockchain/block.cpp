@@ -110,6 +110,13 @@ bool validate_block(const RawBlock& raw, const BlockIntakeContext& ctx,
     //    (Genesis never passes through this gate — the store seeds it
     //    directly — so height 0 needs no special case.)
     if (raw.header.timestamp < ctx.prev_timestamp) return fail("timestamp older than the tip");
+    // MTP-11 (security review 2026-11-15, HIGH): the stamped timestamp must
+    // also clear the median of the last 11 blocks. A single hostile miner
+    // cannot stall the whole window's clock; a sustained stall requires
+    // advancing the median, which costs real block production — the
+    // time-warp lever against the ASERT curve loses its free lunch.
+    if (ctx.median_time_past != 0 && raw.header.timestamp < ctx.median_time_past)
+        return fail("timestamp below the median of the last 11 blocks");
     if (raw.header.timestamp > ctx.now_unix + 300) return fail("timestamp too far in the future");
 
     // 7. PoGW: the full-frame commitment must carry the required work.

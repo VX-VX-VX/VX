@@ -3,6 +3,7 @@
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/blockchain/emission.hpp"
+#include "vx/blockchain/vesting.hpp"
 #include "vx/blockchain/genesis.hpp"
 #include "vx/core/ct_equal.hpp"
 #include "vx/core/u128.hpp"
@@ -227,6 +228,18 @@ public:
             if (is_sgmtleaf_receiver && amount != 0) {
                 res.error =
                     "tx " + std::to_string(i) + ": SGMTLEAF registration must carry zero amount";
+                return res;
+            }
+            // Registration fee (owner-directed 2026-11-15): a nickname
+            // registration costs 1 VX of FEE — the general fee split
+            // (50% producer / 50% TDI-burn) then burns half. Self-dealing
+            // spam (a miner registering thousands of nicknames in its own
+            // blocks) nets 0.5 VX cost per name: 10 million spam names
+            // burn 5 million VX — economically prohibitive, and the
+            // RAM-pressure vector on the durable index stays closed.
+            // Fee is denominated in atoms (u32 cap ≈ 42.9 VX — ample).
+            if (is_sgmtleaf_receiver && fee < blockchain::SGMT_REGISTRATION_FEE_ATOMS) {
+                res.error = "tx " + std::to_string(i) + ": SGMTLEAF registration fee below 1 VX";
                 return res;
             }
             uint8_t stealth_pad_check[32];
@@ -463,6 +476,32 @@ public:
                     res.error = "tx " + std::to_string(i) + ": insufficient funds";
                     return res;
                 }
+                // Founder-vesting gate: the genesis allocation may leave the
+                // founder address only along the unlock schedule (cliff 6
+                // months, linear 36 months). Enforced as a locked floor on
+                // the balance AFTER this debit: incoming funds beyond the
+                // allocation (e.g. fees earned by mining from this address)
+                // stay freely spendable — the floor binds the ALLOCATION,
+                // not the account. Empty address = gate disabled.
+                if (founder_vesting_address_ != Address{} && sender == founder_vesting_address_) {
+                    const U128 locked =
+                        U128(blockchain::FOUNDER_ALLOCATION_ATOMS) -
+                        blockchain::founder_unlocked_atoms(block.header().block_height);
+                    if (balance - total_cost < locked) {
+                        // Zero-DIV: the refusal message carries raw ATOMS —
+                        // no division on any gate-reachable path (even the
+                        // error string), so an objdump of the consensus
+                        // object shows no div/idiv and no __div* relocation.
+                        res.error =
+                            "tx " + std::to_string(i) +
+                            ": founder allocation locked by the vesting schedule (unlocked " +
+                            std::to_string(
+                                blockchain::founder_unlocked_atoms(block.header().block_height)
+                                    .lo) +
+                            " atoms at height " + std::to_string(block.header().block_height) + ")";
+                        return res;
+                    }
+                }
                 // Accumulate the debit NOW (checked add). Real debit sums
                 // are bounded by total supply (~2.6e14 atomics), far below
                 // 2^64; anything larger is refused instead of wrapping.
@@ -614,13 +653,17 @@ public:
         uint8_t frame_hash[32];
         blockchain::VortexSponge256::compute(block.bytes().data(), blockchain::BLOCK_SIZE_BYTES,
                                              frame_hash);
-        const U128 schedule_reward = U128(blockchain::block_reward_atoms(frame_hash));
+        // Supply-epoch decay (owner-directed 2026-11-15): the reward halves per
+        // billion VX MINED — issued BEFORE this block decides the epoch, so the
+        // recomputation is deterministic for every node.
+        const U128 schedule_reward =
+            U128(blockchain::block_reward_atoms(frame_hash, issued_supply_.lo));
 
         U128 total_fees{0};
         for (uint32_t i = 0; i < n; ++i) {
             total_fees = total_fees + fees[i];
         }
-        U128 burned = total_fees / U128(2);
+        U128 burned = total_fees >> 1;           // Zero-DIV: shift, never a runtime divide
         U128 miner_reward = total_fees - burned; // Handles odd division
 
         U128 block_issuance{0};
@@ -963,6 +1006,14 @@ public:
 
     /// Cumulative ISSUED supply (all coinbase credits minus fee-share
     /// re-credits) — the quantity the 7,000,000,000 VX cap bounds.
+    /// Bind the founder-vesting gate to a concrete address (genesis-config
+    /// input; empty address disables the gate). Idempotent.
+    void set_founder_vesting_address(const Address &a) noexcept {
+        founder_vesting_address_ = a;
+    }
+    const Address &founder_vesting_address() const noexcept {
+        return founder_vesting_address_;
+    }
     U128 issued_supply() const noexcept {
         return issued_supply_;
     }
@@ -1069,6 +1120,11 @@ private:
     // Cumulative issuance under the 7,000,000,000 VX hard cap. Mutated
     // only after a block fully validates (transactional, like balances).
     U128 issued_supply_{0};
+    // Founder-vesting gate (owner-directed 2026-11-15): the genesis
+    // allocation address is spendable only along the unlock schedule.
+    // Empty (all-zero) address = disabled — the pre-genesis-config default
+    // keeps the gate vacuum-true (never fires), never dead code.
+    Address founder_vesting_address_{};
     uint64_t next_height_ = 0;
 };
 

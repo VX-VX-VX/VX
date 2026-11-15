@@ -359,6 +359,11 @@ struct BlockIntakeContext {
     uint64_t expected_height;
     uint8_t  expected_prev_hash[32];
     uint64_t prev_timestamp;   // tip's timestamp (genesis ts for height 1)
+    // Median timestamp of the last 11 blocks (MTP-11, the standard
+    // time-warp mitigation): a stamped timestamp must be >= this median.
+    // Zero = not computed (fewer than 2 blocks in the chain — the monotone
+    // check against prev_timestamp covers that case alone).
+    uint64_t median_time_past = 0;
     uint64_t now_unix;         // caller's wall clock
     uint64_t difficulty_bits;  // required leading zero bits of the full-frame hash
 };

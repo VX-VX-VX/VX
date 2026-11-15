@@ -29,6 +29,9 @@
 using namespace vx::blockchain;
 using vx::core::U128;
 
+// Registration fee per the 2026-11-15 consensus commit: 1 VX in atoms.
+constexpr uint32_t SGMT_REG_FEE_TEST_ATOMS = 100'000'000u;
+
 namespace {
 std::string hex_root(const uint8_t *r) {
     static const char *d = "0123456789abcdef";
@@ -250,7 +253,7 @@ TEST(VortexSgmtWiringTest, RegistrationAppliesAndSquats) {
     BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
     Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, 0);
     vx::crypto::dksap::make_sgmtleaf_receiver(reg.leaf.data(), tx.receiver_nfa);
-    tx_set_fee(tx, 1000);
+    tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
     {
         vx::crypto::pq::PqSignatureWitness w{};
         ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, &w));
@@ -293,7 +296,7 @@ TEST(VortexSgmtWiringTest, SquattingIsPermanent) {
         BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
         Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, reg_nonce);
         vx::crypto::dksap::make_sgmtleaf_receiver(r.leaf.data(), tx.receiver_nfa);
-        tx_set_fee(tx, 1000);
+        tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
         if (!vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, nullptr))
             return std::string("sign failed");
         if (!register_sgmt_sidecar(tx, r.acc.pub, r.nickname))
@@ -342,7 +345,7 @@ TEST(VortexSgmtWiringTest, SubstitutedRecordRefused) {
     BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
     Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, 0);
     vx::crypto::dksap::make_sgmtleaf_receiver(reg.leaf.data(), tx.receiver_nfa);
-    tx_set_fee(tx, 1000);
+    tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
     {
         vx::crypto::pq::PqSignatureWitness w{};
         ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, &w));
@@ -373,7 +376,7 @@ TEST(VortexSgmtWiringTest, MissingSidecarRefused) {
     BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
     Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, 0);
     vx::crypto::dksap::make_sgmtleaf_receiver(reg.leaf.data(), tx.receiver_nfa);
-    tx_set_fee(tx, 1000);
+    tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
     {
         vx::crypto::pq::PqSignatureWitness w{};
         ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, &w));
@@ -419,7 +422,7 @@ TEST(VortexSgmtWiringTest, StealthTransferAndRadarHit) {
         BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
         Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, 0);
         vx::crypto::dksap::make_sgmtleaf_receiver(reg.leaf.data(), tx.receiver_nfa);
-        tx_set_fee(tx, 1000);
+        tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
         {
             vx::crypto::pq::PqSignatureWitness w{};
             ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, &w));
@@ -445,7 +448,7 @@ TEST(VortexSgmtWiringTest, StealthTransferAndRadarHit) {
     BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
     Transaction tx = make_tx(sender.addr, addr_of("STEALTH"), 500'000'000u, 1);
     vx::crypto::dksap::make_stealth_receiver(bundle.pstealth.data(), tx.receiver_nfa);
-    tx_set_fee(tx, 1000);
+    tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
     {
         vx::crypto::pq::PqSignatureWitness w{};
         ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, &w));
@@ -579,7 +582,7 @@ TEST(VortexSgmtWiringTest, BogusCandidateCannotDisplace) {
     BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
     Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, 0);
     vx::crypto::dksap::make_sgmtleaf_receiver(reg.leaf.data(), tx.receiver_nfa);
-    tx_set_fee(tx, 1000);
+    tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
     {
         vx::crypto::pq::PqSignatureWitness w{};
         ASSERT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, &w));
@@ -671,7 +674,7 @@ TEST(VortexSgmtWiringTest, ReRegistrationDurableUnderBothDigests) {
         BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
         Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, reg_nonce);
         vx::crypto::dksap::make_sgmtleaf_receiver(reg.leaf.data(), tx.receiver_nfa);
-        tx_set_fee(tx, 1000);
+        tx_set_fee(tx, SGMT_REG_FEE_TEST_ATOMS);
         EXPECT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, nullptr));
         EXPECT_TRUE(register_sgmt_sidecar(tx, reg.acc.pub, reg.nickname));
         EXPECT_TRUE(b.add_transaction(tx));
@@ -784,4 +787,26 @@ TEST(VortexSgmtWiringTest, CommitAppendFailureNotPoisoned) {
     EXPECT_EQ(loaded.nickname, rec.nickname);
     EXPECT_EQ(loaded.pub.t_spend, rec.pub.t_spend);
     EXPECT_EQ(loaded.pub.kkem, rec.pub.kkem);
+}
+
+// Registration fee gate (owner-directed 2026-11-15): a nickname
+// registration paying less than 1 VX of fee is refused outright — the
+// anti-squat price, halved into the standard 50/50 producer/TDI-burn split.
+TEST(VortexSgmtWiringTest, RegistrationFeeBelowOneVxRefused) {
+    WiringChain c("vx_sgmtw_feegate");
+    Registration reg("feegate");
+    PqAccount sender = c.fund_new_account("VX_SGMTW_FEEGATE_SK", 4'000'000'000u);
+
+    BlockBuilder b = next_block(*c.store, static_cast<uint64_t>(std::time(nullptr)));
+    Transaction tx = make_tx(sender.addr, addr_of("SGMTLEAF"), 0, 0);
+    vx::crypto::dksap::make_sgmtleaf_receiver(reg.leaf.data(), tx.receiver_nfa);
+    tx_set_fee(tx, 1000); // deliberately below the 1 VX (1e8 atoms) gate
+    EXPECT_TRUE(vx::crypto::pq::pq_sign_transaction(tx, sender.sk, nullptr, nullptr, nullptr));
+    EXPECT_TRUE(register_sgmt_sidecar(tx, reg.acc.pub, reg.nickname));
+    EXPECT_TRUE(b.add_transaction(tx));
+    const BlockFrame f = sealed_frame(*c.store, *c.ledger, b);
+    const auto res = c.ledger->apply_block(BlockView(f));
+    EXPECT_FALSE(res.ok) << "a sub-1-VX registration fee must be refused";
+    EXPECT_NE(res.error.find("SGMTLEAF registration fee below 1 VX"), std::string::npos)
+        << res.error;
 }

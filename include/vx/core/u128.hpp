@@ -69,6 +69,37 @@ struct U128 {
         return U128{0, 0};
     }
 
+    // 128×128 → low 128 bits (mod 2^128). Used by the vesting schedule
+    // math (elapsed × allocation); the high limb product beyond 2^128 is
+    // correctly dropped by modular arithmetic.
+    constexpr U128 operator*(U128 o) const noexcept {
+        const unsigned __int128 low = (unsigned __int128)lo * o.lo;
+        const unsigned __int128 cross = (unsigned __int128)hi * o.lo + (unsigned __int128)lo * o.hi;
+        const unsigned __int128 p = low + (cross << 64);
+        return U128{(uint64_t)p, (uint64_t)(p >> 64)};
+    }
+
+    // Zero-DIV discipline: halving a u128 is a shift, never a runtime
+    // divide (the ledger fee split and vesting math route through this).
+    constexpr U128 operator>>(unsigned n) const noexcept {
+        if (n == 0)
+            return *this;
+        if (n >= 128)
+            return U128{};
+        if (n >= 64)
+            return U128{0, hi >> (n - 64)};
+        return U128{(lo >> n) | (hi << (64 - n)), hi >> n};
+    }
+    constexpr U128 operator<<(unsigned n) const noexcept {
+        if (n == 0)
+            return *this;
+        if (n >= 128)
+            return U128{};
+        if (n >= 64)
+            return U128{0, lo << (n - 64)};
+        return U128{lo << n, (hi << n) | (lo >> (64 - n))};
+    }
+
     constexpr U128 operator/(uint64_t d) const noexcept {
         uint64_t rem;
         return div64(*this, d, rem);

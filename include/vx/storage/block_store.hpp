@@ -67,7 +67,22 @@ public:
     /// sit at the anchor. The height-0 genesis frame is the anchor and is
     /// exempt from the gate (it is seeded directly, never appended).
     uint64_t pogw_bits_for_height(uint64_t height) const noexcept {
-        return consensus::asert_pogw_bits(retarget_, height);
+        // Time-ASERT (owner-directed 2026-11-15): the difficulty follows
+        // the REAL hashrate so the 5 s pulse holds forever. The deviation
+        // needs two timestamps every node reads identically from its own
+        // frames: the PARENT of the queried height (block h−1) and the
+        // ANCHOR — the first MINED block (height 1; the fixed genesis
+        // stamp must not anchor the clock, or every testnet restart
+        // explodes the deviation). Heights ≤ 2 sit at the anchor.
+        if (height <= 2 || count_ < 2)
+            return consensus::asert_pogw_bits(retarget_.anchor_bits, height, 0, 0);
+        const blockchain::RawBlock *parent = get_block(height - 1);
+        const blockchain::RawBlock *first = get_block(1);
+        if (parent == nullptr || first == nullptr)
+            return consensus::asert_pogw_bits(retarget_.anchor_bits, height, 0, 0);
+        return consensus::asert_pogw_bits(retarget_.anchor_bits, height,
+                                          (int64_t)parent->header.timestamp,
+                                          (int64_t)first->header.timestamp);
     }
 
     /// Live-intake difficulty this store enforces: the ASERT bits for the

@@ -56,22 +56,42 @@ namespace vx::consensus {
 inline constexpr uint64_t POGW_MIN_BITS = 1;
 inline constexpr uint64_t POGW_MAX_BITS = 64;
 
-/// Mainnet retarget parameters. The nominal block interval is 5 s
-/// (PoGWMiner::target_block_time_), so the half-life is 2 days expressed in
-/// blocks: 2 * 24 * 3600 / 5 = 34560 blocks per target doubling.
-inline constexpr uint64_t POGW_HALF_LIFE_BLOCKS = 34560;
+/// ── TIME-ASERT (owner-directed 2026-11-15; consensus commit) ─────────────
+///
+/// The previous retarget was an unconditional HEIGHT ratchet: the target
+/// doubled every 34560 blocks forever, regardless of hashrate — a liveness
+/// mine (a hashrate exodus froze the chain: difficulty kept doubling) and
+/// a lie in the emission math. The replacement is a true time-based ASERT
+/// around the FIXED 5-second pulse: the difficulty tracks the real
+/// hashrate so blocks keep arriving on target forever (the pulse is what
+/// GQC finalization, DKSAP confirmation UX and the 0.2.x contract layer
+/// live on — it is never traded away to slow emission; the emission
+/// schedule bends via the supply-epoch reward decay in emission.hpp).
+///
+///   bits = anchor − round_ties(dev / TAU),
+///   dev = (t_parent − t_anchor) − (h − 2) × TARGET_BLOCK_SECONDS
+///
+/// (The MINUS: our difficulty is measured in required leading-zero BITS —
+/// the inverse of Bitcoin's target VALUE. Fast blocks make dev negative,
+/// so −round(negative) adds bits: harder. A lagging chain subtracts.)
+///
+/// Blocks arriving ahead of schedule raise the difficulty; a lagging
+/// chain lowers it — self-correcting in BOTH directions, so a hashrate
+/// winter eases mining instead of freezing the chain. Division by the
+/// compile-time constants folds into multiply-high+shift (zero runtime
+/// div; objdump-verified by the retarget test).
+inline constexpr uint64_t POGW_TARGET_BLOCK_SECONDS = 5;
+inline constexpr uint64_t POGW_TAU_SECONDS = 172800; // 2-day time half-life
 
 /// Retarget parameters. All nodes on one chain MUST use the same values;
 /// the anchor lives in the genesis frame, which is shared by construction
 /// (every node reconstructs the same genesis deterministically), so the
 /// difficulty needs no consensus exchange whatsoever.
 struct PogwRetargetParams {
-    uint64_t anchor_bits;       // genesis/anchor difficulty in leading zero bits
-    uint64_t half_life_blocks;  // blocks per target doubling
+    uint64_t anchor_bits; // genesis/anchor difficulty in leading zero bits
 };
 
-inline constexpr PogwRetargetParams POGW_MAINNET_RETARGET{
-    blockchain::DEFAULT_POGW_DIFFICULTY_BITS, POGW_HALF_LIFE_BLOCKS};
+inline constexpr PogwRetargetParams POGW_MAINNET_RETARGET{blockchain::DEFAULT_POGW_DIFFICULTY_BITS};
 
 // -- Retarget parameter lock (BACKLOG 0.9 review finding F2) ------------------
 //
@@ -85,57 +105,100 @@ inline constexpr PogwRetargetParams POGW_MAINNET_RETARGET{
 // asserted (static_assert here, EXPECT in the retarget test). Changing a
 // parameter MUST be a deliberate, announced consensus change that updates
 // both pins in the same commit — never a drive-by edit.
-inline constexpr uint64_t retarget_fingerprint(uint64_t anchor_bits,
-                                               uint64_t half_life_blocks) noexcept {
+inline constexpr uint64_t retarget_fingerprint(uint64_t anchor_bits, uint64_t tau_seconds,
+                                               uint64_t target_block_seconds) noexcept {
     uint64_t h = 1469598103934665603ull; // FNV-1a 64
-    for (int i = 0; i < 8; ++i) {
-        h ^= (anchor_bits >> (8 * i)) & 0xffull;
-        h *= 1099511628211ull;
-    }
-    for (int i = 0; i < 8; ++i) {
-        h ^= (half_life_blocks >> (8 * i)) & 0xffull;
-        h *= 1099511628211ull;
-    }
+    const uint64_t words[3] = {anchor_bits, tau_seconds, target_block_seconds};
+    for (const uint64_t w : words)
+        for (int i = 0; i < 8; ++i) {
+            h ^= (w >> (8 * i)) & 0xffull;
+            h *= 1099511628211ull;
+        }
     return h;
 }
 
 inline constexpr uint64_t POGW_RETARGET_FINGERPRINT = retarget_fingerprint(
-    POGW_MAINNET_RETARGET.anchor_bits, POGW_MAINNET_RETARGET.half_life_blocks);
+    POGW_MAINNET_RETARGET.anchor_bits, POGW_TAU_SECONDS, POGW_TARGET_BLOCK_SECONDS);
 
-static_assert(POGW_RETARGET_FINGERPRINT == 0xc45e282bf67c611aull,
-              "consensus-critical: ASERT anchor/half-life changed - this forks "
+static_assert(POGW_RETARGET_FINGERPRINT == 0xd59af7a8dd8ca2f9ull,
+              "consensus-critical: ASERT anchor/tau/pulse changed - this forks "
               "every peer silently; announce the change and update the "
               "fingerprint pin in the same commit");
 
-/// ASERT bits for height h (anchor fixed at genesis, height 0). Pure and
-/// deterministic, overflow-safe for any uint64_t height and half-life.
-inline uint64_t asert_pogw_bits(const PogwRetargetParams& p, uint64_t height) noexcept {
-    // Clamp the anchor into the protocol lattice first.
-    uint64_t anchor = p.anchor_bits;
-    if (anchor < POGW_MIN_BITS) anchor = POGW_MIN_BITS;
-    if (anchor > POGW_MAX_BITS) anchor = POGW_MAX_BITS;
-    const uint64_t half_life = p.half_life_blocks == 0 ? 1 : p.half_life_blocks;
+/// Time-ASERT bits for a block at `height`, given its PARENT's timestamp
+/// and the ANCHOR timestamp — the stamp of the FIRST MINED block (height
+/// 1), which is the clock the 5-second pulse is measured against. The
+/// height-0 genesis stamp is deliberately NOT the anchor: it is a fixed
+/// deterministic constant, and a chain resumed long after its genesis
+/// would explode the deviation at every restart. Height 1's stamp is
+/// chain data every node holds, and a long mining pause correctly eases
+/// the difficulty (liveness), never freezes it. Pure and deterministic
+/// from (height, parent ts, anchor ts) — no wire representation, no
+/// stored state. Division by the compile-time TAU folds into
+/// multiply-high+shift (zero hardware div; the test objdump-verifies).
+inline uint64_t asert_pogw_bits(uint64_t anchor_bits, uint64_t height, int64_t parent_ts,
+                                int64_t anchor_ts) noexcept {
+    uint64_t anchor = anchor_bits;
+    if (anchor < POGW_MIN_BITS)
+        anchor = POGW_MIN_BITS;
+    if (anchor > POGW_MAX_BITS)
+        anchor = POGW_MAX_BITS;
 
-    // Genesis itself and the first mined block sit exactly at the anchor.
-    if (height <= 1) return anchor;
+    // Heights 0-2 sit at the anchor: the deviation is not yet measurable
+    // (fewer than two on-schedule intervals between height 1 and the parent).
+    if (height <= 2)
+        return anchor;
 
-    // Exponent numerator (h - anchor_height - 1) with anchor_height = 0.
-    const uint64_t shift = height - 1;
-    const uint64_t q = shift / half_life;
-    // Saturated ceiling: every further bit increment is clamped anyway, and
-    // this guard also covers heights near 2^64 without any multiplication.
-    if (q >= POGW_MAX_BITS) return POGW_MAX_BITS;
+    // Absurd heights: (height-2)*5s would overflow the int64 deviation
+    // arithmetic. Nothing real gets near this; clamp at the lattice top.
+    if (height > (1ull << 59))
+        return POGW_MAX_BITS;
 
-    // Round-to-nearest (ties up) of shift / half_life, no overflow: r < half_life.
-    const uint64_t r = shift % half_life;
-    uint64_t delta = q;
-    if (r >= (half_life >> 1) + (half_life & 1)) ++delta;
+    // Time deviation: actual elapsed since the first mined block minus the
+    // elapsed an on-target chain would have produced over (height-2)
+    // intervals. Signed: a lagging chain eases, a fast chain tightens.
+    //
+    // STRICT int64 with saturating overflow guards — NOT __int128 (security
+    // review 2026-11-15, HIGH + fork-review P1): a __int128 deviation
+    // divided by a constant is lowered by GCC into a libgcc __divmodti4
+    // CALL whose internals contain a hardware divide — the Zero-DIV law is
+    // violated by the RELOCATION, not by any instruction in this TU. Both
+    // stamps are sanity-bounded at intake (monotone, <= now+300s), so int64
+    // is sufficient; the guards make even a hostile (pre-bounds) value
+    // saturate instead of wrapping.
+    int64_t elapsed;
+    if (__builtin_sub_overflow(parent_ts, anchor_ts, &elapsed))
+        elapsed = parent_ts > anchor_ts ? INT64_MAX : INT64_MIN;
+    const int64_t expected =
+        (height - 2) > (uint64_t)(INT64_MAX / (int64_t)POGW_TARGET_BLOCK_SECONDS)
+            ? INT64_MAX
+            : (int64_t)((height - 2) * POGW_TARGET_BLOCK_SECONDS);
+    int64_t dev;
+    if (__builtin_sub_overflow(elapsed, expected, &dev))
+        dev = elapsed > expected ? INT64_MAX : INT64_MIN;
 
-    // delta <= q + 1 <= POGW_MAX_BITS, so the sum cannot wrap.
-    uint64_t bits = anchor + delta;
-    if (bits > POGW_MAX_BITS) bits = POGW_MAX_BITS;
-    if (bits < POGW_MIN_BITS) bits = POGW_MIN_BITS;
-    return bits;
+    // delta = round-to-nearest of dev / TAU, ties away from zero. Division
+    // by the COMPILE-TIME TAU constant folds into multiply-high+shift —
+    // zero hardware divide, zero __div* relocations (the retarget test
+    // objdump-verifies both).
+    int64_t q = dev / (int64_t)POGW_TAU_SECONDS;
+    const int64_t r = dev % (int64_t)POGW_TAU_SECONDS;
+    if (r >= (int64_t)POGW_TAU_SECONDS / 2)
+        ++q;
+    else if (r <= -(int64_t)POGW_TAU_SECONDS / 2)
+        --q;
+    if (q > (int64_t)POGW_MAX_BITS)
+        q = (int64_t)POGW_MAX_BITS;
+    if (q < -(int64_t)POGW_MAX_BITS)
+        q = -(int64_t)POGW_MAX_BITS;
+
+    // Clamp into the protocol lattice.
+    int64_t bits = (int64_t)anchor - q;
+    if (bits < (int64_t)POGW_MIN_BITS)
+        return POGW_MIN_BITS;
+    if (bits > (int64_t)POGW_MAX_BITS)
+        return POGW_MAX_BITS;
+    return (uint64_t)bits;
 }
 
 } // namespace vx::consensus

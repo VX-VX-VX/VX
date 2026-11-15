@@ -635,11 +635,11 @@ TEST(VortexDocumentedGapsTest, CoinbaseEntitlementEnforced) {
     EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos) << err;
 }
 
-// The cap is load-bearing: with the issued counter one VX short of
-// 7,000,000,000, nothing larger than the headroom can be issued; the final
-// partial reward closes the cap exactly; afterwards not one more atom of
-// issuance can ever enter state (zero-amount coinbases stay legal so fee
-// redistribution survives the closed cap).
+// The cap is load-bearing — and under the supply-epoch decay (owner-
+// directed 2026-11-15) it is a HORIZON, not a date: near the cap the
+// Zeno tail halves the reward faster than the headroom shrinks, so a
+// legitimate claim can never close the cap exactly; at the cap nothing
+// mints; zero-amount coinbases stay legal so fee redistribution survives.
 TEST(VortexDocumentedGapsTest, SupplyCapHardStopsIssuance) {
     using vx::blockchain::ATOMS_PER_VX;
     const std::time_t ts = std::time(nullptr);
@@ -648,28 +648,42 @@ TEST(VortexDocumentedGapsTest, SupplyCapHardStopsIssuance) {
     const Address recv = addr_of("NFA_EMISSION_MINER_B_000000000000000000");
     std::string err;
 
-    // The exact floor reward is under every hash: it always mints.
-    ASSERT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err)) << err;
     const U128 cap(vx::blockchain::max_supply_atoms());
     const U128 leave = U128(1ULL * ATOMS_PER_VX);
+    ASSERT_TRUE(apply_coinbase_block(ledger, 50ULL * ATOMS_PER_VX, recv, &err)) << err;
     ledger.adjust_issued_supply(cap - leave - ledger.issued_supply(), true);
 
-    // A 2 VX claim is under the 50 VX floor for every hash, so the
-    // entitlement check passes and the refusal below is purely the cap.
-    EXPECT_FALSE(apply_coinbase_block(ledger, 2ULL * ATOMS_PER_VX, recv, &err, 0, nullptr, ts))
-        << "issuance beyond the 7,000,000,000 VX cap was accepted!";
-    EXPECT_NE(err.find("supply cap exceeded"), std::string::npos)
-        << "expected the supply-cap refusal, got: " << err;
-
-    EXPECT_TRUE(apply_coinbase_block(ledger, 1ULL * ATOMS_PER_VX, recv, &err, 0, nullptr, ts))
-        << err;
-    EXPECT_EQ(ledger.issued_supply(), cap) << "the final partial reward must close the cap exactly";
-
-    EXPECT_TRUE(apply_coinbase_block(ledger, 0, recv, &err, 0, nullptr, ts)) << err;
+    // One VX of headroom left: the Zeno epoch here is deep enough that the
+    // atom-domain shift has already floored the reward to 0 — the LAST few
+    // VX of the schedule are practically unmineable (the shift reaches zero
+    // once the headroom drops under ~7.5 VX of remaining headroom, epoch 33
+    // for the 50 VX tier). The cap is therefore DOUBLY unreachable: the
+    // Zeno walk diverges in time AND the shift floor ends emission first.
+    const uint64_t epoch_reward =
+        (50ULL * ATOMS_PER_VX) >> vx::blockchain::supply_epoch((cap - leave).lo);
+    EXPECT_EQ(epoch_reward, 0u) << "the shift floor must end emission before the cap closes";
+    EXPECT_LT(ledger.issued_supply(), cap)
+        << "the cap stays strictly unclosed — it is a horizon, not a date";
+    // Any positive claim near the cap is refused by the ENTITLEMENT gate
+    // (reward 0 at this depth); the zero-amount coinbase stays legal so
+    // fee redistribution survives.
     EXPECT_FALSE(apply_coinbase_block(ledger, 1, recv, &err, 0, nullptr, ts));
-    EXPECT_NE(err.find("supply cap exceeded"), std::string::npos) << err;
-    EXPECT_EQ(ledger.issued_supply(), cap)
-        << "nothing may move the issued counter after the cap closed";
+    EXPECT_NE(err.find("coinbase exceeds emission entitlement"), std::string::npos) << err;
+    EXPECT_TRUE(apply_coinbase_block(ledger, 0, recv, &err, 0, nullptr, ts)) << err;
+    EXPECT_EQ(ledger.issued_supply(), cap - leave)
+        << "nothing may move the issued counter once emission has ended";
+
+    // The cap branch itself stays wired for the paths OUTSIDE the coinbase
+    // entitlement ordering (legacy genesis mints): force the counter to the
+    // deepest legal non-capped point where the entitlement still exceeds
+    // the headroom is impossible by construction — so pin the structural
+    // invariant instead: issued + epoch_reward <= cap holds at every depth.
+    for (uint64_t back = 1; back <= 40; ++back) {
+        const U128 mined = cap - leave - U128(back * 100'000'000ULL);
+        const uint64_t r = (50ULL * ATOMS_PER_VX) >> vx::blockchain::supply_epoch(mined.lo);
+        EXPECT_LE(mined.lo + r, vx::blockchain::max_supply_atoms())
+            << "entitlement crossed the cap at headroom " << back * 100'000'000;
+    }
 }
 
 // The reward depends on the block's hash, not on its height: there is no
