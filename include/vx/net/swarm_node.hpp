@@ -557,8 +557,13 @@ private:
     static constexpr size_t kMaxIdReputation = 8192;
     std::map<std::array<uint8_t, 32>, IdReputation> id_rep_;
     // The connection label each handshaked identity announced from (latest
-    // wins); feeds the ban-time fd drop.
+    // wins); feeds the ban-time fd drop. Populated ONLY while identity
+    // enforcement is enabled (dormant needs no labels — unauthenticated ids
+    // must not consume memory), capped, and erased when the owning
+    // connection tears down (security review 2026-11-15, MEDIUM: an
+    // ungated/uncapped map let unauthenticated handshakes grow memory).
     std::map<std::array<uint8_t, 32>, std::string> id_conn_labels_;
+    static constexpr size_t kMaxIdConnLabels = kMaxIdReputation;
     std::string banlist_path_;
     bool banlist_attached_ = false;
     // DORMANT gate: identity-keyed enforcement OFF until the handshake

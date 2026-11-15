@@ -433,6 +433,17 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
     // !known until then — pre-handshake strikes are address-keyed only).
     std::array<uint8_t, 32> handshaked_id{};
     bool id_known = false;
+    bool handshake_seen = false;
+    // Erase this connection's id→label entry (only when it still maps to
+    // THIS label — a newer connection for the same id owns the slot now).
+    auto erase_id_label = [&](const std::string &lbl) {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        for (auto it = id_conn_labels_.begin(); it != id_conn_labels_.end(); ++it)
+            if (it->second == lbl) {
+                id_conn_labels_.erase(it);
+                break;
+            }
+    };
     for (;;) {
         WireHeader hdr{};
         std::vector<uint8_t> payload;
@@ -454,6 +465,7 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             bool lvalid = false, is_self = false;
             if (!parse_handshake_payload(payload, height, work, tip, node_id_, is_self, their_id,
                                          lip, lport, lvalid)) {
+                erase_id_label(label);
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_fds_.erase(label);
                 ::close(fd);
@@ -461,15 +473,32 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             }
             if (is_self) {
                 std::cerr << "[Swarm] self-dial detected via node_id, dropping " << label << "\n";
+                erase_id_label(label);
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_fds_.erase(label);
                 ::close(fd);
                 return;
             }
+            // A second HANDSHAKE on a live connection is a protocol
+            // violation AND an identity-laundering vector: swapping the
+            // announced id mid-connection would move later strikes onto a
+            // fresh identity. Address-keyed strike only — the NEW id is
+            // unverified and never attributed (security review
+            // 2026-11-15, MEDIUM).
+            if (handshake_seen) {
+                report_withhold(label, 20);
+                erase_id_label(label);
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                peer_fds_.erase(label);
+                ::close(fd);
+                return;
+            }
+            handshake_seen = true;
             // PEX 2/2: a banned durable identity never gets promoted — the
             // banlist survived the restart this attacker is counting on.
             if (id_is_banned(their_id)) {
                 std::cerr << "[Swarm] banned identity, dropping " << label << "\n";
+                erase_id_label(label);
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_fds_.erase(label);
                 ::close(fd);
@@ -479,8 +508,15 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             id_known = !id_full_zero(their_id);
             {
                 std::lock_guard<std::mutex> lock(peers_mutex_);
-                if (id_known)
+                // Label cache: gated on enforcement (dormant ids must not
+                // consume memory), capped (arbitrary eviction — best-effort
+                // ban-time drop, not consensus state).
+                if (id_known && id_enforcement_enabled_.load(std::memory_order_relaxed)) {
+                    if (id_conn_labels_.size() >= kMaxIdConnLabels &&
+                        !id_conn_labels_.contains(their_id))
+                        id_conn_labels_.erase(id_conn_labels_.begin());
                     id_conn_labels_[their_id] = label;
+                }
                 for (auto &peer : peer_table_) {
                     if (peer.address == label) {
                         PeerInfo updated = peer;
@@ -619,6 +655,7 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
         }
         break; // unexpected message type: drop the connection
     }
+    erase_id_label(label); // connection teardown: free the id→label slot
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         peer_fds_.erase(label);
@@ -1892,6 +1929,15 @@ void SwarmNode::serve_connection(int c) {
     // before it are address-keyed only).
     std::array<uint8_t, 32> handshaked_id{};
     bool id_known = false;
+    bool handshake_seen = false;
+    auto erase_id_label = [&](const std::string &lbl) {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        for (auto it = id_conn_labels_.begin(); it != id_conn_labels_.end(); ++it)
+            if (it->second == lbl) {
+                id_conn_labels_.erase(it);
+                break;
+            }
+    };
     // Returns true only on the call that actually registered the peer, so
     // callers can fire one-shot connect side effects (retention re-serve)
     // without re-triggering them on every later packet.
@@ -1971,6 +2017,13 @@ void SwarmNode::serve_connection(int c) {
                           << "\n";
                 break;
             }
+            // Second HANDSHAKE on a live connection: protocol violation +
+            // identity-laundering vector (see the reader-loop twin).
+            if (handshake_seen) {
+                report_withhold(peer_label, 20);
+                break;
+            }
+            handshake_seen = true;
             // PEX 2/2: a banned durable identity never gets promoted.
             if (id_is_banned(their_id)) {
                 std::cerr << "[Swarm] banned identity, dropping " << peer_label << "\n";
@@ -1984,8 +2037,14 @@ void SwarmNode::serve_connection(int c) {
             }
             {
                 std::lock_guard<std::mutex> lock(peers_mutex_);
-                if (id_known)
+                // Label cache: gated on enforcement + capped (see the
+                // reader-loop twin for the rationale).
+                if (id_known && id_enforcement_enabled_.load(std::memory_order_relaxed)) {
+                    if (id_conn_labels_.size() >= kMaxIdConnLabels &&
+                        !id_conn_labels_.contains(their_id))
+                        id_conn_labels_.erase(id_conn_labels_.begin());
                     id_conn_labels_[their_id] = peer_label;
+                }
                 for (auto &peer : peer_table_) {
                     if (peer.address == peer_label) {
                         PeerInfo updated = peer;
@@ -2134,6 +2193,7 @@ void SwarmNode::serve_connection(int c) {
         break;
     }
     if (registered) {
+        erase_id_label(peer_label); // teardown: free the id→label slot
         std::lock_guard<std::mutex> lock(peers_mutex_);
         peer_fds_.erase(peer_label);
         for (auto it = peer_table_.begin(); it != peer_table_.end(); ++it) {

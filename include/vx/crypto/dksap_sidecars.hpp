@@ -200,7 +200,7 @@ public:
         }
         sgmt_log_path_ = path;
         sgmt_log_attached_ = true;
-        replay_sgmt_durable_tail(kSgmtMemCap);
+        replay_sgmt_durable_tail();
     }
 
     // ── Candidate model (security review 2026-11-15) ────────────────────────
@@ -547,7 +547,15 @@ private:
         return ok;
     }
 
-    bool replay_sgmt_durable_tail(size_t max_records) {
+    // Whole-log replay at attach. TWO separate concerns (security review
+    // 2026-11-15, MEDIUM — availability regression): (a) the durable
+    // digest→offset INDEX must cover EVERY parsed row of the log — a row
+    // outside a candidate cap would be unresolvable forever (the node
+    // would refuse its own history beyond the cap); (b) the in-memory
+    // CANDIDATE set is capped at kSgmtMemCap — once full, the walk keeps
+    // parsing + indexing in index-only mode (LRU eviction can always
+    // pull a row back through the index later). Both in one pass, O(N).
+    bool replay_sgmt_durable_tail() {
         if (!sgmt_log_attached_)
             return false;
         const int fd = ::open(sgmt_log_path_.c_str(), O_RDONLY);
@@ -571,11 +579,10 @@ private:
             return false;
         size_t off = 8;
         size_t loaded = 0;
-        while (loaded < max_records) {
+        for (;;) {
             // Record frame: digest(32) + nlen(1) + nickname(n) + keys(1568).
-            // Index build: every parsed row registers digest→row-start
-            // (the attach-time full walk is the ONLY full parse — after
-            // this, resolve misses are O(1) preads).
+            // Index build: EVERY parsed row registers digest→row-start
+            // (no record cap on the index — see the function comment).
             if (off + 32 + 1 > buf.size())
                 break;
             const size_t row_start = off;
@@ -598,7 +605,10 @@ private:
                 break; // corrupt record: the replay stops, the log is rebuildable
             // Replayed records are COMMITTED candidates — they were
             // fsync'd only after the leaf gate passed on the original node.
-            if (insert_candidate(digest, rec, /*committed=*/true)) {
+            // Past the candidate cap: index-only mode (trim_global would
+            // thrash if we kept inserting; the index keeps every row
+            // servable — see the function comment).
+            if (sgmt_.size() < kSgmtMemCap && insert_candidate(digest, rec, /*committed=*/true)) {
                 ++durable_replayed_;
                 ++loaded;
             }

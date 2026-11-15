@@ -1147,3 +1147,68 @@ TEST(VortexSwarmP2PTest, OldWorldZeroIdNeverBanned) {
     EXPECT_TRUE(::stat((dir + "/banlist").c_str(), &st) != 0);
     node.emergency_stop();
 }
+
+// A SECOND HANDSHAKE on a live connection is a protocol violation and an
+// identity-laundering vector (swap the announced id mid-connection so the
+// later strikes land on a fresh identity). The server must close the
+// connection and NEVER adopt the new id (security review 2026-11-15,
+// MEDIUM).
+TEST(VortexSwarmP2PTest, SecondHandshakeDropsConnection) {
+    vx::net::SwarmNode server;
+    const std::string data_dir = "/tmp/vx_pex_handshake2_" + std::to_string(getpid());
+    ::mkdir(data_dir.c_str(), 0700);
+    server.load_or_create_node_id(data_dir);
+    const uint16_t port = free_tcp_port();
+    ASSERT_TRUE(server.bind_p2p_listener(port));
+    server.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons(port);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+
+    // First HANDSHAKE: accepted (the server answers with its own).
+    const uint32_t loop_net = htonl(INADDR_LOOPBACK);
+    std::array<uint8_t, 32> id_a{};
+    id_a[0] = 0xF1;
+    WireHeader hs = vx::net::SwarmNode::make_header(WireMsgType::HANDSHAKE, 87, 1);
+    auto p = v2_handshake_payload(id_a, loop_net, 1234, true);
+    hs.crc32c = vx::net::compute_wire_crc32c(p.data(), static_cast<uint32_t>(p.size()));
+    ASSERT_EQ(::send(fd, &hs, sizeof(hs), 0), static_cast<ssize_t>(sizeof(hs)));
+    ASSERT_EQ(::send(fd, p.data(), static_cast<ssize_t>(p.size()), 0),
+              static_cast<ssize_t>(p.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // SECOND HANDSHAKE with a DIFFERENT id: connection must be dropped.
+    std::array<uint8_t, 32> id_b{};
+    id_b[0] = 0xF2;
+    WireHeader hs2 = vx::net::SwarmNode::make_header(WireMsgType::HANDSHAKE, 87, 2);
+    auto p2 = v2_handshake_payload(id_b, loop_net, 4321, true);
+    hs2.crc32c = vx::net::compute_wire_crc32c(p2.data(), static_cast<uint32_t>(p2.size()));
+    ASSERT_EQ(::send(fd, &hs2, sizeof(hs2), 0), static_cast<ssize_t>(sizeof(hs2)));
+    ASSERT_EQ(::send(fd, p2.data(), static_cast<ssize_t>(p2.size()), 0),
+              static_cast<ssize_t>(p2.size()));
+
+    // The server closes the socket. The client's receive buffer still
+    // holds the server's own handshake/PONG replies — drain them first:
+    // TCP delivers buffered data BEFORE the FIN, so EOF appears only
+    // after the drain (a single 1-byte peek would misread it as alive).
+    bool closed = false;
+    for (int i = 0; i < 100 && !closed; ++i) {
+        uint8_t buf[4096];
+        const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n == 0)
+            closed = true; // clean EOF after the drain
+        else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+            closed = true; // reset — also a drop
+        else
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(closed) << "second HANDSHAKE must drop the connection";
+    ::close(fd);
+    server.emergency_stop();
+}
