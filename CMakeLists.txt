@@ -336,6 +336,16 @@ add_executable(test_vx60_aead_kat tests/test_vx60_aead_kat.cpp)
 target_link_libraries(test_vx60_aead_kat PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexVx60AeadKatTest COMMAND test_vx60_aead_kat)
 
+# VX60-SEC M2: transport identity (sponge-derived node_id, fail-closed load).
+add_executable(test_vx60_identity tests/test_vx60_identity.cpp)
+target_link_libraries(test_vx60_identity PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexVx60IdentityTest COMMAND test_vx60_identity)
+
+# VX60-SEC M2: handshake state machine (WARM/COLD, transcript, KEM-PoP).
+add_executable(test_vx60_sec_handshake tests/test_vx60_sec_handshake.cpp)
+target_link_libraries(test_vx60_sec_handshake PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexVx60SecHandshakeTest COMMAND test_vx60_sec_handshake)
+
 # ML-KEM-768 (FIPS 203) — the DKSAP stealth track's KEM, ACVP-KAT-gated.
 add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)
 target_link_libraries(test_ml_kem_kat PRIVATE vx_core gtest gtest_main)
