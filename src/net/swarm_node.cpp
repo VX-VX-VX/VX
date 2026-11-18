@@ -858,6 +858,9 @@ bool SwarmNode::sec_seal_out(int fd, const WireHeader &ad_hdr, std::vector<uint8
     if (it == sec_channels_.end())
         return false; // no channel: legacy passthrough
     SecChannel &ch = it->second;
+    // M3: RAW_BLOCK_64K bodies are PUBLIC consensus data — MAC-only mode
+    // (no encryption, CPU-free authentication; the whitebook §4.4 split).
+    const bool mac_only = ad_hdr.msg_type == static_cast<uint8_t>(WireMsgType::RAW_BLOCK_64K);
     const auto nonce = ch.keys.packet_nonce(ch.am_initiator, ch.send_ctr);
     std::array<uint8_t, vx60::kAeadTagSize> tag{};
     // AD = the 24-byte WireHeader with the CRC field ZEROED (the CRC is a
@@ -867,13 +870,22 @@ bool SwarmNode::sec_seal_out(int fd, const WireHeader &ad_hdr, std::vector<uint8
     // into another type or re-framed without the AEAD tag failing.
     WireHeader ad = ad_hdr;
     ad.crc32c = 0;
-    vx60::aead_seal(ch.keys.key.data(), nonce.data(), reinterpret_cast<const uint8_t *>(&ad),
-                    sizeof(ad), payload.data(), payload.size(), tag.data());
+    if (mac_only)
+        vx60::aead_mac(ch.keys.key.data(), nonce.data(), reinterpret_cast<const uint8_t *>(&ad),
+                       sizeof(ad), payload.data(), payload.size(), tag.data());
+    else
+        vx60::aead_seal(ch.keys.key.data(), nonce.data(), reinterpret_cast<const uint8_t *>(&ad),
+                        sizeof(ad), payload.data(), payload.size(), tag.data());
     // The 32-byte AEAD tag rides AFTER the ciphertext; send_packet accounts
     // for the growth in its local header copy (payload_len += vx60::kAeadTagSize)
     // and recomputes the CRC over the sealed representation.
     payload.insert(payload.end(), tag.begin(), tag.end());
     ++ch.send_ctr;
+    // M3 key evolution: the TOTAL packet count (send + recv — symmetric on
+    // both ends by construction) crossing the threshold rotates the epoch
+    // on both sides at the same packet boundary. No wire frames needed.
+    if ((ch.send_ctr + ch.recv_ctr) % vx60::VX60_REKEY_PACKETS == 0)
+        ch.keys = vx60::derive_next_epoch(ch.keys);
     return true;
 }
 
@@ -892,14 +904,28 @@ bool SwarmNode::sec_open_in(int fd, const WireHeader &ad_hdr, std::vector<uint8_
     const auto nonce = ch.keys.packet_nonce(!ch.am_initiator, ch.recv_ctr);
     WireHeader ad = ad_hdr;
     ad.crc32c = 0; // the same zeroed-CRC AD the sealer used
-    if (!vx60::aead_open(ch.keys.key.data(), nonce.data(), reinterpret_cast<const uint8_t *>(&ad),
-                         sizeof(ad), payload.data(), ct_len, tag)) {
+    const bool mac_only = ad_hdr.msg_type == static_cast<uint8_t>(WireMsgType::RAW_BLOCK_64K);
+    bool ok;
+    if (mac_only) {
+        std::array<uint8_t, vx60::kAeadTagSize> expect{};
+        vx60::aead_mac(ch.keys.key.data(), nonce.data(), reinterpret_cast<const uint8_t *>(&ad),
+                       sizeof(ad), payload.data(), ct_len, expect.data());
+        ok = vx::core::ct_equal(expect.data(), tag, vx60::kAeadTagSize);
+    } else {
+        ok = vx60::aead_open(ch.keys.key.data(), nonce.data(),
+                             reinterpret_cast<const uint8_t *>(&ad), sizeof(ad), payload.data(),
+                             ct_len, tag);
+    }
+    if (!ok) {
         // A failed open NEVER advances the counter: TCP is ordered, so a
         // mismatch means tampering — the caller drops the connection.
         return false;
     }
     payload.resize(ct_len);
     ++ch.recv_ctr;
+    // M3 key evolution: the same symmetric trigger as the seal side.
+    if ((ch.send_ctr + ch.recv_ctr) % vx60::VX60_REKEY_PACKETS == 0)
+        ch.keys = vx60::derive_next_epoch(ch.keys);
     return true;
 }
 

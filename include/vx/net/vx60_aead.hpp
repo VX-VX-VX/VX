@@ -229,4 +229,31 @@ inline bool aead_open(const uint8_t key[kAeadKeySize], const uint8_t nonce[kAead
     return false;
 }
 
+/// MAC-only mode (M3, whitebook §4.4): authentication WITHOUT encryption,
+/// for PUBLIC consensus data (RAW_BLOCK_64K bodies). The same keyed duplex,
+/// but the message is absorbed AS PLAINTEXT under the 0x05 domain (the
+/// 0x04 ciphertext domain stays exclusive to aead_seal/open — no
+/// cross-mode forgery). The tag covers the AD and the full body.
+inline void aead_mac(const uint8_t key[kAeadKeySize], const uint8_t nonce[kAeadNonceSize],
+                     const uint8_t *ad, size_t ad_len, const uint8_t *msg, size_t msg_len,
+                     uint8_t tag[kAeadTagSize]) noexcept {
+    uint8_t state[200]{};
+    detail::absorb_phase(state, key, kAeadKeySize, 0x01, nonce, kAeadNonceSize);
+    detail::absorb_phase(state, ad, ad_len, 0x02);
+    // 0x05 = the MAC domain: absorb the PLAINTEXT body (no keystream).
+    for (size_t off = 0; off < msg_len; off += kAeadRate) {
+        const size_t n = (msg_len - off < kAeadRate) ? msg_len - off : kAeadRate;
+        for (size_t i = 0; i < n; ++i)
+            state[i] ^= msg[off + i];
+        detail::keccak_f1600(state);
+    }
+    const uint8_t len_dom[8] = {
+        uint8_t(msg_len),       uint8_t(msg_len >> 8),  uint8_t(msg_len >> 16),
+        uint8_t(msg_len >> 24), uint8_t(msg_len >> 32), uint8_t(msg_len >> 40),
+        uint8_t(msg_len >> 48), uint8_t(msg_len >> 56),
+    };
+    detail::absorb_phase(state, nullptr, 0, 0x08, len_dom, sizeof(len_dom));
+    std::memcpy(tag, state, kAeadTagSize);
+}
+
 } // namespace vx::net::vx60

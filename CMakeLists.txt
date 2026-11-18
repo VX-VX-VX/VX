@@ -346,6 +346,11 @@ add_executable(test_vx60_sec_handshake tests/test_vx60_sec_handshake.cpp)
 target_link_libraries(test_vx60_sec_handshake PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexVx60SecHandshakeTest COMMAND test_vx60_sec_handshake)
 
+# VX60-SEC M3: key evolution (KDF-chain rekey) + MAC-only block mode.
+add_executable(test_vx60_sec_rekey tests/test_vx60_sec_rekey.cpp)
+target_link_libraries(test_vx60_sec_rekey PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexVx60SecRekeyTest COMMAND test_vx60_sec_rekey)
+
 # ML-KEM-768 (FIPS 203) — the DKSAP stealth track's KEM, ACVP-KAT-gated.
 add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)
 target_link_libraries(test_ml_kem_kat PRIVATE vx_core gtest gtest_main)

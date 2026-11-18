@@ -90,10 +90,19 @@ inline void pk_seal_keys(const vx::crypto::mlkem::SharedSecret &ss_ephem, uint8_
 /// from one sponge over the domain tag, BOTH shared secrets, and the
 /// transcript hash. A transcript mismatch on either side yields different
 /// keys — the session dies before any payload moves.
+/// M3 key evolution: after VX60_REKEY_PACKETS packets in TOTAL (both
+/// directions summed — symmetric on both sides by construction), both
+/// peers derive the next epoch's keys from the old ones. No wire frames:
+/// the rotation point is identical on both ends, counters reset per epoch,
+/// and fresh nonces come from fresh bases. (Full PFS rekey with fresh KEM
+/// material is the M4 rotation track.)
+inline constexpr uint64_t VX60_REKEY_PACKETS = 8192;
+
 struct SessionKeys {
     std::array<uint8_t, 32> key{};
     std::array<uint8_t, 16> nonce_c{}; // initiator → responder base
     std::array<uint8_t, 16> nonce_s{}; // responder → initiator base
+    uint64_t epoch = 0;
 
     /// Per-packet AEAD nonce: base ‖ counter (64-bit LE, monotonic per
     /// direction). Counter exhaustion = fail-closed drop (M3 wiring).
@@ -119,6 +128,28 @@ inline SessionKeys derive_session_keys(const vx::crypto::mlkem::SharedSecret &ss
     std::memcpy(k.key.data(), out, 32);
     std::memcpy(k.nonce_c.data(), out + 32, 16);
     std::memcpy(k.nonce_s.data(), out + 48, 16);
+    return k;
+}
+
+/// The next epoch's keys: domain-separated sponge chain over the old key
+/// material and the epoch number. Compromising epoch N's key does NOT
+/// reveal epoch N-1 (one-way sponge chain); the fresh bases retire all
+/// epoch-N nonces.
+inline SessionKeys derive_next_epoch(const SessionKeys &old) noexcept {
+    vx::blockchain::VortexSponge256 s;
+    sponge_absorb_bytes(s, "VX60-SEC-REKEY-V1", 16);
+    sponge_absorb_bytes(s, old.key.data(), 32);
+    sponge_absorb_bytes(s, old.nonce_c.data(), 16);
+    sponge_absorb_bytes(s, old.nonce_s.data(), 16);
+    const uint64_t next = old.epoch + 1;
+    sponge_absorb_bytes(s, &next, 8);
+    SessionKeys k;
+    uint8_t out[64];
+    s.finalize(out);
+    std::memcpy(k.key.data(), out, 32);
+    std::memcpy(k.nonce_c.data(), out + 32, 16);
+    std::memcpy(k.nonce_s.data(), out + 48, 16);
+    k.epoch = next;
     return k;
 }
 
