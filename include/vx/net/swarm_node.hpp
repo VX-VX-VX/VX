@@ -12,6 +12,7 @@
 
 #include "vx/blockchain/block.hpp"
 #include "vx/crypto/pq_signature.hpp"
+#include "vx/net/vx60_sec.hpp"
 
 #include <array>
 #include <atomic>
@@ -76,6 +77,14 @@ enum class WireMsgType : uint8_t {
     // pass the leaf gate.
     DKSAP_SGMT_REG = 0x0E,
     DKSAP_STEALTH = 0x0F,
+    // VX60-SEC M2 (owner-directed 2026-11-15): the encrypted-transport
+    // upgrade. 0x10-0x12 are the handshake frames; 0x13 is RESERVED for the
+    // M4 key rotation — receiving it is a protocol violation for now
+    // (strike + drop, never silently ignored).
+    SEC_CLIENT_HELLO = 0x10,
+    SEC_SERVER_HELLO = 0x11,
+    SEC_PK_RESPONSE = 0x12,
+    SEC_KEM_ROTATE = 0x13,
 };
 
 // Wire flags
@@ -418,6 +427,16 @@ public:
     // no call the node sends a zero id and self-detection is disabled
     // (48-byte old-world handshake).
     void load_or_create_node_id(const std::string &data_dir);
+    void load_vx60_identity(const std::string &data_dir);
+
+    /// The VX60-SEC transport node_id (sponge of the static ML-KEM pk).
+    /// Zero until load_or_create_node_id() loads the transport identity.
+    const std::array<uint8_t, 32> &vx60_node_id() const noexcept {
+        return vx60_id_.node_id;
+    }
+    bool vx60_ready() const noexcept {
+        return vx60_id_loaded_;
+    }
 
     // ── PEX 2/2: node_id-keyed strikes + durable banlist ─────────
     // (security review 2026-11-11 gap, closed 2026-11-15) Strikes land on
@@ -462,8 +481,9 @@ public:
     // enforcement after proving key possession; tests use the _for_test
     // seam. Default: OFF (dormant).
     void enable_id_enforcement() {
-        std::lock_guard<std::mutex> lock(peers_mutex_);
-        id_enforcement_enabled_ = true;
+        // The flag is atomic: callers may already hold peers_mutex_ (the
+        // SEC channel-creation path) — no lock here, ever.
+        id_enforcement_enabled_.store(true, std::memory_order_relaxed);
     }
     bool id_enforcement_enabled() const noexcept {
         return id_enforcement_enabled_.load();
@@ -544,6 +564,42 @@ private:
 
     // Durable node identity (v2 handshake); zero = unknown/old-world.
     std::array<uint8_t, 32> node_id_{};
+
+    // ── VX60-SEC M2: encrypted transport ─────────────────────────────────
+    // The transport identity loads beside the legacy node_id (in
+    // load_or_create_node_id); a load failure runs the transport
+    // identityless (logged) rather than wedging the node.
+    vx60::TransportIdentity vx60_id_{};
+    bool vx60_id_loaded_ = false;
+    // Per-connection encrypted channels keyed by fd (guarded by
+    // peers_mutex_). am_initiator selects the nonce direction: the
+    // INITIATOR of the SEC upgrade seals with nonce_c, the responder with
+    // nonce_s.
+    struct SecChannel {
+        vx60::SessionKeys keys{};
+        uint64_t send_ctr = 0;
+        uint64_t recv_ctr = 0;
+        bool am_initiator = false;
+    };
+    std::map<int, SecChannel> sec_channels_;
+    // Transport-pk cache: node_id -> static pk of PROVEN SEC peers (fills
+    // on every successful handshake; WARM reuses it, first contact = COLD).
+    std::map<std::array<uint8_t, 32>, vx::crypto::mlkem::PublicKey> vx60_pk_cache_;
+    // Peers that answered the SEC upgrade with a strike/drop (do not speak
+    // SEC): skip the upgrade for them this session so legacy peers are not
+    // strike-poisoned by the migration probe.
+    std::set<std::array<uint8_t, 32>> no_sec_peers_;
+    // Node-wide enforcement flip: once any SEC session proves a peer
+    // identity, identity-keyed enforcement wakes (the PEX dormant gate).
+    bool sec_enforcement_armed_ = false;
+
+    /// Seals the outgoing payload in place for a secured fd. Returns false
+    /// (payload untouched) when no channel exists — legacy passthrough.
+    bool sec_seal_out(int fd, const WireHeader &ad_hdr, std::vector<uint8_t> &payload);
+    /// Opens the incoming payload in place. Returns false on any counter/
+    /// tag failure (fail-closed: the caller drops the connection); returns
+    /// true without touching the payload when the fd has no channel.
+    bool sec_open_in(int fd, const WireHeader &ad_hdr, std::vector<uint8_t> &payload);
 
     // ── PEX 2/2: identity-keyed reputation (guarded by peers_mutex_) ──
     struct IdReputation {

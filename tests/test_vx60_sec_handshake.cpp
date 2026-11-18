@@ -45,7 +45,7 @@ struct IdFixture {
 TEST(Vx60SecHandshakeTest, WarmHandshakeKeysMatch) {
     IdFixture srv_id("vx_sec_warm_srv");
     ServerHandshake server;
-    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk);
+    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk, srv_id.id.node_id);
 
     ClientHandshake client;
     std::string err;
@@ -87,7 +87,7 @@ TEST(Vx60SecHandshakeTest, WarmHandshakeKeysMatch) {
 TEST(Vx60SecHandshakeTest, ColdHandshakeKeysMatch) {
     IdFixture srv_id("vx_sec_cold_srv");
     ServerHandshake server;
-    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk);
+    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk, srv_id.id.node_id);
 
     ClientHandshake client;
     std::string err;
@@ -95,10 +95,14 @@ TEST(Vx60SecHandshakeTest, ColdHandshakeKeysMatch) {
 
     std::vector<uint8_t> server_hello;
     ASSERT_TRUE(server.begin_from_client_hello(client.my_hello, server_hello, err)) << err;
-    ASSERT_EQ(server_hello.size(), 1 + kServerColdSize);
+    ASSERT_EQ(server_hello.size(), kServerColdSize);
 
     // The client knows the peer's node_id from ADDRS/seeds.
-    ASSERT_TRUE(client.finish_cold_pk_received(server_hello, srv_id.id.node_id, err)) << err;
+    // The transport id is known here (the test pinned it) and the legacy
+    // id must match what the server announced.
+    ASSERT_TRUE(
+        client.finish_cold_pk_received(server_hello, srv_id.id.node_id, srv_id.id.node_id, err))
+        << err;
     ASSERT_TRUE(client.have_keys);
 
     // The response rides back and completes the server side.
@@ -116,7 +120,7 @@ TEST(Vx60SecHandshakeTest, ColdMitmPkSubstitutionRefused) {
     IdFixture srv_b("vx_sec_mitm_b"); // the MITM's own identity (B in place of A)
 
     ServerHandshake attacker; // B answers where the client expects A
-    attacker.set_static_keys(srv_b.id.static_ek, srv_b.id.static_dk);
+    attacker.set_static_keys(srv_b.id.static_ek, srv_b.id.static_dk, srv_b.id.node_id);
 
     ClientHandshake client;
     std::string err;
@@ -127,7 +131,10 @@ TEST(Vx60SecHandshakeTest, ColdMitmPkSubstitutionRefused) {
     // The client expects A's node_id (from ADDRS/seed); B's sealed pk opens
     // fine (the AEAD key is this connection's ss_ephem — B did encapsulate
     // under the client's ek_I) but fails the sponge check.
-    EXPECT_FALSE(client.finish_cold_pk_received(server_hello, srv_a.id.node_id, err));
+    // A MITM relays B's sealed pk where the client dialed A: BOTH the
+    // sponge pin and the legacy-id binding die.
+    EXPECT_FALSE(
+        client.finish_cold_pk_received(server_hello, srv_a.id.node_id, srv_a.id.node_id, err));
     EXPECT_NE(err.find("does not hash to the expected node_id"), std::string::npos) << err;
     EXPECT_FALSE(client.have_keys);
 }
@@ -136,7 +143,7 @@ TEST(Vx60SecHandshakeTest, ColdMitmPkSubstitutionRefused) {
 TEST(Vx60SecHandshakeTest, TranscriptTamperKillsSession) {
     IdFixture srv_id("vx_sec_tamper_srv");
     ServerHandshake server;
-    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk);
+    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk, srv_id.id.node_id);
 
     ClientHandshake client;
     std::string err;
@@ -151,10 +158,11 @@ TEST(Vx60SecHandshakeTest, TranscriptTamperKillsSession) {
     ParsedClientHello ch;
     ASSERT_TRUE(parse_client_hello(client.my_hello, ch));
     auto tampered = client.my_hello;
-    tampered[2 + 600] ^= 0x01;
+    tampered[1 + 1184 + 100] ^= 0x01; // inside ct_static: parses fine,
+                                      // decaps diverges (implicit rejection)
     std::vector<uint8_t> server_hello_t;
     ServerHandshake server_t;
-    server_t.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk);
+    server_t.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk, srv_id.id.node_id);
     ASSERT_TRUE(server_t.begin_from_client_hello(tampered, server_hello_t, err)) << err;
     ASSERT_TRUE(server_t.have_keys);
 
@@ -192,7 +200,7 @@ TEST(Vx60SecHandshakeTest, KemPopRequiresTheStaticKey) {
     // And the REAL server (holding dk_static) derives the SAME keys as the
     // client — the PoP property in the positive direction.
     ServerHandshake server;
-    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk);
+    server.set_static_keys(srv_id.id.static_ek, srv_id.id.static_dk, srv_id.id.node_id);
     std::vector<uint8_t> server_hello;
     ASSERT_TRUE(server.begin_from_client_hello(client.my_hello, server_hello, err)) << err;
     ASSERT_TRUE(client.finish_warm(server_hello, err)) << err;
@@ -203,10 +211,9 @@ TEST(Vx60SecHandshakeTest, KemPopRequiresTheStaticKey) {
 TEST(Vx60SecHandshakeTest, FrameParsersStrict) {
     ParsedClientHello ch;
     EXPECT_FALSE(parse_client_hello({}, ch));
-    EXPECT_FALSE(parse_client_hello({0x09}, ch));                           // wrong wire type
     EXPECT_FALSE(parse_client_hello(std::vector<uint8_t>(2300, 0x10), ch)); // wrong size
     std::vector<uint8_t> cold_bad = build_client_hello_cold({});
-    cold_bad[1] = 0x07; // valid size, invalid flag
+    cold_bad[0] = 0x07; // valid size, invalid flag
     EXPECT_FALSE(parse_client_hello(cold_bad, ch));
 
     ParsedServerHello sh;
@@ -216,7 +223,9 @@ TEST(Vx60SecHandshakeTest, FrameParsersStrict) {
     EXPECT_FALSE(parse_server_hello(warm, sh));
     vx::crypto::mlkem::Ciphertext ct{};
     EXPECT_FALSE(parse_pk_response({}, ct));
-    EXPECT_FALSE(parse_pk_response(std::vector<uint8_t>(1088, 0x12), ct)); // missing type byte
+    EXPECT_FALSE(parse_pk_response(std::vector<uint8_t>(1087, 0x12), ct)); // short
+    // The wire TYPE rides in the header: the parser is type-agnostic by design.
+    EXPECT_TRUE(parse_pk_response(std::vector<uint8_t>(1088, 0x12), ct));
 }
 
 // ── Session counters: per-direction nonces differ, counters advance ─────────

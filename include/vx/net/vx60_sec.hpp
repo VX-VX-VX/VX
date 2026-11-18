@@ -58,12 +58,12 @@ inline constexpr uint8_t kHsFlagCold = 0x02;
 //   CLIENT_HELLO COLD: flags(1) ‖ ek_I(1184)                   = 1185
 //   SERVER_HELLO WARM: flags(1) ‖ ct_ephem(1088)               = 1089
 //   SERVER_HELLO COLD: flags(1) ‖ ct_ephem ‖ nonce(16) ‖
-//                      sealed_pk(1184) ‖ tag(32)               = 2321
+//                      sealed(pk ‖ legacy_id)(1216) ‖ tag(32) = 2353
 //   PK_RESPONSE:       ct_static(1088)                          = 1088
 inline constexpr size_t kHelloWarmSize = 1 + 1184 + 1088;
 inline constexpr size_t kHelloColdSize = 1 + 1184;
 inline constexpr size_t kServerWarmSize = 1 + 1088;
-inline constexpr size_t kServerColdSize = 1 + 1088 + 16 + 1184 + 32;
+inline constexpr size_t kServerColdSize = 1 + 1088 + 16 + 1184 + 32 + 32;
 inline constexpr size_t kPkResponseSize = 1088;
 
 // ── Domain-separated key material ───────────────────────────────────────────
@@ -143,8 +143,7 @@ inline std::vector<uint8_t>
 build_client_hello_warm(const vx::crypto::mlkem::PublicKey &ek_I,
                         const vx::crypto::mlkem::Ciphertext &ct_static) {
     std::vector<uint8_t> out;
-    out.reserve(1 + kHelloWarmSize);
-    out.push_back(kSecClientHello);
+    out.reserve(kHelloWarmSize);
     out.push_back(kHsFlagWarm);
     out.insert(out.end(), ek_I.begin(), ek_I.end());
     out.insert(out.end(), ct_static.begin(), ct_static.end());
@@ -154,8 +153,7 @@ build_client_hello_warm(const vx::crypto::mlkem::PublicKey &ek_I,
 /// CLIENT_HELLO, COLD flavor: [0x10] ‖ [0x02] ‖ ek_I.
 inline std::vector<uint8_t> build_client_hello_cold(const vx::crypto::mlkem::PublicKey &ek_I) {
     std::vector<uint8_t> out;
-    out.reserve(1 + kHelloColdSize);
-    out.push_back(kSecClientHello);
+    out.reserve(kHelloColdSize);
     out.push_back(kHsFlagCold);
     out.insert(out.end(), ek_I.begin(), ek_I.end());
     return out;
@@ -164,8 +162,7 @@ inline std::vector<uint8_t> build_client_hello_cold(const vx::crypto::mlkem::Pub
 /// SERVER_HELLO WARM: [0x11] ‖ [0x01] ‖ ct_ephem.
 inline std::vector<uint8_t> build_server_hello_warm(const vx::crypto::mlkem::Ciphertext &ct_ephem) {
     std::vector<uint8_t> out;
-    out.reserve(1 + kServerWarmSize);
-    out.push_back(kSecServerHello);
+    out.reserve(kServerWarmSize);
     out.push_back(kHsFlagWarm);
     out.insert(out.end(), ct_ephem.begin(), ct_ephem.end());
     return out;
@@ -175,16 +172,22 @@ inline std::vector<uint8_t> build_server_hello_warm(const vx::crypto::mlkem::Cip
 inline std::vector<uint8_t>
 build_server_hello_cold(const vx::crypto::mlkem::Ciphertext &ct_ephem,
                         const vx::crypto::mlkem::PublicKey &static_ek,
+                        const std::array<uint8_t, 32> &legacy_node_id,
                         const vx::crypto::mlkem::SharedSecret &ss_ephem) {
     uint8_t key[32], nonce[16];
     pk_seal_keys(ss_ephem, key, nonce);
     std::vector<uint8_t> out;
-    out.reserve(1 + kServerColdSize);
-    out.push_back(kSecServerHello);
+    out.reserve(kServerColdSize);
     out.push_back(kHsFlagCold);
     out.insert(out.end(), ct_ephem.begin(), ct_ephem.end());
     out.insert(out.end(), nonce, nonce + 16);
-    std::vector<uint8_t> plain(static_ek.begin(), static_ek.end());
+    // Sealed blob = the static pk BOUND to the server's legacy node_id:
+    // the client verifies the binding against the id the legacy handshake
+    // announced — a MITM's re-sealed pk cannot claim the victim's id.
+    std::vector<uint8_t> plain;
+    plain.reserve(1184 + 32);
+    plain.insert(plain.end(), static_ek.begin(), static_ek.end());
+    plain.insert(plain.end(), legacy_node_id.begin(), legacy_node_id.end());
     std::array<uint8_t, kAeadTagSize> tag{};
     vx60::aead_seal(key, nonce, nullptr, 0, plain.data(), plain.size(), tag.data());
     out.insert(out.end(), plain.begin(), plain.end());
@@ -195,8 +198,7 @@ build_server_hello_cold(const vx::crypto::mlkem::Ciphertext &ct_ephem,
 /// PK_RESPONSE: [0x12] ‖ ct_static.
 inline std::vector<uint8_t> build_pk_response(const vx::crypto::mlkem::Ciphertext &ct_static) {
     std::vector<uint8_t> out;
-    out.reserve(1 + kPkResponseSize);
-    out.push_back(kSecPkResponse);
+    out.reserve(kPkResponseSize);
     out.insert(out.end(), ct_static.begin(), ct_static.end());
     return out;
 }
@@ -209,20 +211,20 @@ struct ParsedClientHello {
     std::optional<vx::crypto::mlkem::Ciphertext> ct_static;
 };
 
+// The wire TYPE rides in the 24-byte WireHeader (the swarm dispatch); the
+// payload carries the FLAG byte first. Parsers validate size + flag only.
 inline bool parse_client_hello(const std::vector<uint8_t> &raw, ParsedClientHello &out) noexcept {
-    if (raw.empty() || raw[0] != kSecClientHello)
-        return false;
-    if (raw.size() == 1 + kHelloWarmSize && raw[1] == kHsFlagWarm) {
-        std::memcpy(out.ek_I.data(), raw.data() + 2, 1184);
+    if (raw.size() == kHelloWarmSize && raw[0] == kHsFlagWarm) {
+        std::memcpy(out.ek_I.data(), raw.data() + 1, 1184);
         out.ct_static.emplace();
-        std::memcpy(out.ct_static->data(), raw.data() + 2 + 1184, 1088);
-        out.flags = raw[1];
+        std::memcpy(out.ct_static->data(), raw.data() + 1 + 1184, 1088);
+        out.flags = raw[0];
         return true;
     }
-    if (raw.size() == 1 + kHelloColdSize && raw[1] == kHsFlagCold) {
-        std::memcpy(out.ek_I.data(), raw.data() + 2, 1184);
+    if (raw.size() == kHelloColdSize && raw[0] == kHsFlagCold) {
+        std::memcpy(out.ek_I.data(), raw.data() + 1, 1184);
         out.ct_static.reset();
-        out.flags = raw[1];
+        out.flags = raw[0];
         return true;
     }
     return false;
@@ -231,28 +233,26 @@ inline bool parse_client_hello(const std::vector<uint8_t> &raw, ParsedClientHell
 struct ParsedServerHello {
     uint8_t flags{};
     vx::crypto::mlkem::Ciphertext ct_ephem{};
-    // COLD only: the sealed static pk + AEAD nonce + tag.
-    std::optional<vx::crypto::mlkem::PublicKey> sealed_pk;
+    // COLD only: the sealed blob (pk ‖ legacy_id = 1216) + AEAD nonce + tag.
+    std::optional<std::array<uint8_t, 1216>> sealed_blob;
     std::array<uint8_t, 16> seal_nonce{};
     std::array<uint8_t, 32> seal_tag{};
 };
 
 inline bool parse_server_hello(const std::vector<uint8_t> &raw, ParsedServerHello &out) noexcept {
-    if (raw.empty() || raw[0] != kSecServerHello)
-        return false;
-    if (raw.size() == 1 + kServerWarmSize && raw[1] == kHsFlagWarm) {
-        out.flags = raw[1];
-        std::memcpy(out.ct_ephem.data(), raw.data() + 2, 1088);
-        out.sealed_pk.reset();
+    if (raw.size() == kServerWarmSize && raw[0] == kHsFlagWarm) {
+        out.flags = raw[0];
+        std::memcpy(out.ct_ephem.data(), raw.data() + 1, 1088);
+        out.sealed_blob.reset();
         return true;
     }
-    if (raw.size() == 1 + kServerColdSize && raw[1] == kHsFlagCold) {
-        out.flags = raw[1];
-        std::memcpy(out.ct_ephem.data(), raw.data() + 2, 1088);
-        std::memcpy(out.seal_nonce.data(), raw.data() + 2 + 1088, 16);
-        out.sealed_pk.emplace();
-        std::memcpy(out.sealed_pk->data(), raw.data() + 2 + 1088 + 16, 1184);
-        std::memcpy(out.seal_tag.data(), raw.data() + 2 + 1088 + 16 + 1184, 32);
+    if (raw.size() == kServerColdSize && raw[0] == kHsFlagCold) {
+        out.flags = raw[0];
+        std::memcpy(out.ct_ephem.data(), raw.data() + 1, 1088);
+        std::memcpy(out.seal_nonce.data(), raw.data() + 1 + 1088, 16);
+        out.sealed_blob.emplace();
+        std::memcpy(out.sealed_blob->data(), raw.data() + 1 + 1088 + 16, 1216);
+        std::memcpy(out.seal_tag.data(), raw.data() + 1 + 1088 + 16 + 1216, 32);
         return true;
     }
     return false;
@@ -260,9 +260,9 @@ inline bool parse_server_hello(const std::vector<uint8_t> &raw, ParsedServerHell
 
 inline bool parse_pk_response(const std::vector<uint8_t> &raw,
                               vx::crypto::mlkem::Ciphertext &ct_static) noexcept {
-    if (raw.size() != 1 + kPkResponseSize || raw[0] != kSecPkResponse)
+    if (raw.size() != kPkResponseSize)
         return false;
-    std::memcpy(ct_static.data(), raw.data() + 1, 1088);
+    std::memcpy(ct_static.data(), raw.data(), 1088);
     return true;
 }
 
@@ -276,6 +276,7 @@ struct ClientHandshake {
     vx::crypto::mlkem::SharedSecret ss_static{};
     std::vector<uint8_t> my_hello;
     std::vector<uint8_t> pk_response;
+    vx::crypto::mlkem::PublicKey peer_pk{}; // the VERIFIED static pk of the peer
     SessionKeys keys{};
     bool have_keys = false;
 
@@ -295,6 +296,7 @@ struct ClientHandshake {
             return false;
         }
         ss_static = ss;
+        peer_pk = r_static_ek;
         my_hello = build_client_hello_warm(ek_I, ct_static);
         return true;
     }
@@ -330,10 +332,11 @@ struct ClientHandshake {
     /// Returns the PK_RESPONSE frame the caller sends next.
     bool finish_cold_pk_received(const std::vector<uint8_t> &server_hello_raw,
                                  const std::array<uint8_t, 32> &expected_node_id,
+                                 const std::array<uint8_t, 32> &expected_legacy_id,
                                  std::string &err) {
         ParsedServerHello sh;
         if (!parse_server_hello(server_hello_raw, sh) || sh.flags != kHsFlagCold ||
-            !sh.sealed_pk.has_value()) {
+            !sh.sealed_blob.has_value()) {
             err = "vx60 client: server hello parse/flag failure (cold)";
             return false;
         }
@@ -343,18 +346,34 @@ struct ClientHandshake {
         // the 32-byte tag rides at the frame tail (extracted by the parser).
         uint8_t key[32], nonce[16];
         pk_seal_keys(ss_ephem, key, nonce);
-        std::vector<uint8_t> plain(sh.sealed_pk->begin(), sh.sealed_pk->end());
+        std::vector<uint8_t> plain(sh.sealed_blob->begin(), sh.sealed_blob->end());
         if (!vx60::aead_open(key, nonce, nullptr, 0, plain.data(), plain.size(),
                              sh.seal_tag.data())) {
             err = "vx60 client: sealed pk failed AEAD open";
             return false;
         }
         // The opened pk must hash to the node_id the network gave us — the
-        // MITM's substituted pk fails the sponge check here.
+        // MITM's substituted pk fails the sponge check here. A ZERO
+        // expected id = trust-on-first-use: the AEAD seal itself proves the
+        // pk came from THIS connection's responder (a MITM cannot forge
+        // the seal without ss_ephem), and the id gets pinned on success.
+        // The sealed blob = pk(1184) ‖ legacy_id(32).
         vx::crypto::mlkem::PublicKey r_pk{};
         std::memcpy(r_pk.data(), plain.data(), 1184);
-        if (node_id_for(r_pk) != expected_node_id) {
+        std::array<uint8_t, 32> legacy_id{};
+        std::memcpy(legacy_id.data(), plain.data() + 1184, 32);
+        const bool tofu = expected_node_id == std::array<uint8_t, 32>{};
+        if (!tofu && node_id_for(r_pk) != expected_node_id) {
             err = "vx60 client: pk does not hash to the expected node_id (MITM or stale)";
+            return false;
+        }
+        // The legacy-id binding: the pk inside the sealed blob must belong
+        // to the identity the legacy handshake announced — a MITM's own pk
+        // (re-sealed under this connection's ss_ephem) carries ITS legacy
+        // id, not the victim's, and dies here.
+        const bool legacy_tofu = expected_legacy_id == std::array<uint8_t, 32>{};
+        if (!legacy_tofu && legacy_id != expected_legacy_id) {
+            err = "vx60 client: sealed legacy_id mismatch (MITM relay)";
             return false;
         }
         // Encapsulate under the VERIFIED pk.
@@ -370,6 +389,7 @@ struct ClientHandshake {
             return false;
         }
         ss_static = ss;
+        peer_pk = r_pk;
         pk_response = build_pk_response(ct_static);
         const auto tx = transcript_hash(my_hello, server_hello_raw, pk_response);
         keys = derive_session_keys(ss_ephem, ss_static, tx);
@@ -395,10 +415,14 @@ struct ServerHandshake {
     SessionKeys keys{};
     bool have_keys = false;
 
+    std::array<uint8_t, 32> legacy_node_id_{};
+
     void set_static_keys(const vx::crypto::mlkem::PublicKey &ek,
-                         const vx::crypto::mlkem::SecretKey &dk) noexcept {
+                         const vx::crypto::mlkem::SecretKey &dk,
+                         const std::array<uint8_t, 32> &legacy_node_id) noexcept {
         static_ek = ek;
         static_dk = dk;
+        legacy_node_id_ = legacy_node_id;
     }
 
     /// Parse the CLIENT_HELLO and answer: WARM decaps immediately; COLD
@@ -436,7 +460,8 @@ struct ServerHandshake {
             have_keys = true;
         } else {
             // Seal our static pk under the ss_ephem-derived AEAD and send it.
-            server_hello = build_server_hello_cold(ss_ephem_ct_, static_ek, ss_ephem);
+            server_hello =
+                build_server_hello_cold(ss_ephem_ct_, static_ek, legacy_node_id_, ss_ephem);
             ss_ephem_saved_ = ss_ephem;
             my_hello_stored_ = client_hello_raw;
         }

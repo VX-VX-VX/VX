@@ -169,8 +169,10 @@ bool wire_header_plausible(const WireHeader &h) noexcept {
         return false;
     const uint8_t t = h.msg_type;
     // 0x0D = ADDRS (peer discovery, one-shot push after the v2 handshake);
-    // 0x0E still fails closed.
-    return t >= 0x01 && t <= 0x0D;
+    // 0x0E still fails closed. 0x10-0x12 = the VX60-SEC handshake frames
+    // (M2, owner-directed); 0x13 (KEM_ROTATE) stays outside the gate until
+    // M4 wires it — an out-of-range type dies at the plausibility gate.
+    return (t >= 0x01 && t <= 0x0D) || (t >= 0x10 && t <= 0x12);
 }
 
 WireHeader SwarmNode::make_header(WireMsgType type, uint32_t payload_len, uint64_t nonce,
@@ -434,6 +436,10 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
     std::array<uint8_t, 32> handshaked_id{};
     bool id_known = false;
     bool handshake_seen = false;
+    // VX60-SEC M2: the dialer is the SEC upgrade INITIATOR (one attempt per
+    // connection; the no-SEC mark spares legacy peers from probe strikes).
+    bool sec_tried = false, sec_established = false;
+    std::optional<vx60::ClientHandshake> sec_client;
     // Erase this connection's id→label entry (only when it still maps to
     // THIS label — a newer connection for the same id owns the slot now).
     auto erase_id_label = [&](const std::string &lbl) {
@@ -468,6 +474,7 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                 erase_id_label(label);
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_fds_.erase(label);
+                sec_channels_.erase(fd);
                 ::close(fd);
                 return;
             }
@@ -476,6 +483,7 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                 erase_id_label(label);
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_fds_.erase(label);
+                sec_channels_.erase(fd);
                 ::close(fd);
                 return;
             }
@@ -490,6 +498,7 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                 erase_id_label(label);
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_fds_.erase(label);
+                sec_channels_.erase(fd);
                 ::close(fd);
                 return;
             }
@@ -501,6 +510,7 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                 erase_id_label(label);
                 std::lock_guard<std::mutex> lock(peers_mutex_);
                 peer_fds_.erase(label);
+                sec_channels_.erase(fd);
                 ::close(fd);
                 return;
             }
@@ -556,6 +566,42 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                     peer_table_.insert(peer);
                 }
             }
+            // VX60-SEC M2 upgrade probe: one attempt, right after the
+            // legacy handshake. WARM on a cached (proven) pk, COLD on
+            // first contact.
+            if (!sec_tried && id_known && vx60_id_loaded_ && !id_full_zero(their_id)) {
+                bool skip = false;
+                {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    skip = no_sec_peers_.contains(their_id) || sec_channels_.contains(fd);
+                }
+                if (!skip) {
+                    sec_tried = true;
+                    sec_client.emplace();
+                    std::string sec_err;
+                    std::optional<vx::crypto::mlkem::PublicKey> cached_pk;
+                    {
+                        std::lock_guard<std::mutex> lock(peers_mutex_);
+                        auto pit = vx60_pk_cache_.find(their_id);
+                        if (pit != vx60_pk_cache_.end())
+                            cached_pk = pit->second;
+                    }
+                    const bool ok = cached_pk ? sec_client->begin_warm(*cached_pk, sec_err)
+                                              : sec_client->begin_cold(sec_err);
+                    if (ok) {
+                        WireHeader h =
+                            make_header(WireMsgType::SEC_CLIENT_HELLO,
+                                        static_cast<uint32_t>(sec_client->my_hello.size()),
+                                        session_nonce_.fetch_add(1));
+                        h.crc32c = compute_wire_crc32c(sec_client->my_hello.data(),
+                                                       sec_client->my_hello.size());
+                        send_packet(fd, h, sec_client->my_hello.data());
+                    } else {
+                        std::cerr << "[Swarm] vx60 upgrade begin failed: " << sec_err << "\n";
+                        sec_client.reset();
+                    }
+                }
+            }
             continue;
         }
         if (type == WireMsgType::ADDRS) {
@@ -588,6 +634,99 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                     report_id_strike(handshaked_id, 20);
             }
             continue;
+        }
+        // ── VX60-SEC M2 dispatch (the dialer is the SEC client) ─────────
+        if (type == WireMsgType::SEC_SERVER_HELLO) {
+            if (!sec_client.has_value() || sec_established) {
+                // Unsolicited server hello: protocol violation.
+                report_withhold(label, 20);
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
+                erase_id_label(label);
+                {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    peer_fds_.erase(label);
+                    sec_channels_.erase(fd);
+                }
+                ::close(fd);
+                return;
+            }
+            std::string sec_err;
+            bool done = false;
+            if (sec_client->mode == vx60::kHsFlagWarm) {
+                done = sec_client->finish_warm(payload, sec_err);
+            } else {
+                // COLD: the transport id is TOFU on first contact (zero =
+                // skip the sponge pin), but the LEGACY id is known from the
+                // handshake — the sealed blob must carry it, or the peer is
+                // a relay (MITM), and the session dies.
+                const std::array<uint8_t, 32> no_expect{};
+                done =
+                    sec_client->finish_cold_pk_received(payload, no_expect, handshaked_id, sec_err);
+            }
+            if (!done) {
+                std::cerr << "[Swarm] vx60 handshake failed: " << sec_err << "\n";
+                // Crypto faults (AEAD/sponge/legacy-binding failures) are
+                // TAMPERING — strike, never a downgrade mark. Only a
+                // parse/flag failure (a peer that does not speak SEC) gets
+                // the no-SEC mark; otherwise an attacker forces session
+                // downgrade at will.
+                const bool crypto_fault = sec_err.find("AEAD") != std::string::npos ||
+                                          sec_err.find("does not hash") != std::string::npos ||
+                                          sec_err.find("legacy_id mismatch") != std::string::npos;
+                if (crypto_fault && id_known)
+                    report_id_strike(handshaked_id, 100);
+                if (!crypto_fault && id_known) {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    no_sec_peers_.insert(handshaked_id);
+                }
+                erase_id_label(label);
+                {
+                    std::lock_guard<std::mutex> lock(peers_mutex_);
+                    peer_fds_.erase(label);
+                    sec_channels_.erase(fd);
+                }
+                ::close(fd);
+                return;
+            }
+            if (sec_client->mode == vx60::kHsFlagCold) {
+                // Send the PK_RESPONSE to complete the server side.
+                WireHeader h = make_header(WireMsgType::SEC_PK_RESPONSE,
+                                           static_cast<uint32_t>(sec_client->pk_response.size()),
+                                           session_nonce_.fetch_add(1));
+                h.crc32c = compute_wire_crc32c(sec_client->pk_response.data(),
+                                               sec_client->pk_response.size());
+                send_packet(fd, h, sec_client->pk_response.data());
+            }
+            // Channel live: arm the encrypted transport + enforcement.
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                sec_channels_[fd] = {sec_client->keys, 0, 0, /*am_initiator=*/true};
+                if (!sec_enforcement_armed_) {
+                    sec_enforcement_armed_ = true;
+                    id_enforcement_enabled_.store(true, std::memory_order_relaxed);
+                }
+                if (!id_full_zero(handshaked_id))
+                    vx60_pk_cache_[handshaked_id] = sec_client->peer_pk;
+            }
+            sec_established = true;
+            std::cout << "[Swarm] vx60 SEC session established ("
+                      << (sec_client->mode == vx60::kHsFlagWarm ? "warm" : "cold/tofu") << ")\n";
+            continue;
+        }
+        if (type == WireMsgType::SEC_PK_RESPONSE || type == WireMsgType::SEC_KEM_ROTATE) {
+            // Wrong direction on the dialer (0x12) / reserved for M4 (0x13).
+            report_withhold(label, 20);
+            if (id_known)
+                report_id_strike(handshaked_id, 20);
+            erase_id_label(label);
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                peer_fds_.erase(label);
+                sec_channels_.erase(fd);
+            }
+            ::close(fd);
+            return;
         }
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
             handle_incoming_frame(label,
@@ -655,10 +794,18 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
         }
         break; // unexpected message type: drop the connection
     }
+    // VX60-SEC: an upgrade probe that never established marks the peer
+    // no-SEC (it struck/dropped the probe): the migration must not poison
+    // legacy peers with repeated strikes on every reconnect.
+    if (sec_tried && !sec_established && id_known) {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        no_sec_peers_.insert(handshaked_id);
+    }
     erase_id_label(label); // connection teardown: free the id→label slot
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         peer_fds_.erase(label);
+        sec_channels_.erase(fd);
     }
     ::close(fd);
 }
@@ -695,25 +842,102 @@ void SwarmNode::disconnect_from_peer(const PeerInfo &peer) {
         if (it->second >= 0)
             ::close(it->second);
         peer_fds_.erase(it);
+        sec_channels_.erase(it->second);
     }
 }
 
 // ── Wire send / recv ────────────────────────────────────────────────────────
 
+// ── VX60-SEC M2: per-connection payload encryption ──────────────────────────
+
+bool SwarmNode::sec_seal_out(int fd, const WireHeader &ad_hdr, std::vector<uint8_t> &payload) {
+    // Empty payloads seal too (a tag-only packet): an unauthenticated empty
+    // PING would be an injection hole into a secured channel.
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    auto it = sec_channels_.find(fd);
+    if (it == sec_channels_.end())
+        return false; // no channel: legacy passthrough
+    SecChannel &ch = it->second;
+    const auto nonce = ch.keys.packet_nonce(ch.am_initiator, ch.send_ctr);
+    std::array<uint8_t, vx60::kAeadTagSize> tag{};
+    // AD = the 24-byte WireHeader with the CRC field ZEROED (the CRC is a
+    // plaintext-layer check over the sealed bytes; binding it in the AD
+    // would desynchronize seal vs open since the CRC is written after the
+    // seal). Type/len/nonce ARE bound: a sealed packet cannot be re-cut
+    // into another type or re-framed without the AEAD tag failing.
+    WireHeader ad = ad_hdr;
+    ad.crc32c = 0;
+    vx60::aead_seal(ch.keys.key.data(), nonce.data(), reinterpret_cast<const uint8_t *>(&ad),
+                    sizeof(ad), payload.data(), payload.size(), tag.data());
+    // The 32-byte AEAD tag rides AFTER the ciphertext; send_packet accounts
+    // for the growth in its local header copy (payload_len += vx60::kAeadTagSize)
+    // and recomputes the CRC over the sealed representation.
+    payload.insert(payload.end(), tag.begin(), tag.end());
+    ++ch.send_ctr;
+    return true;
+}
+
+bool SwarmNode::sec_open_in(int fd, const WireHeader &ad_hdr, std::vector<uint8_t> &payload) {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    auto it = sec_channels_.find(fd);
+    if (it == sec_channels_.end())
+        return true; // no channel: legacy passthrough (nothing to verify)
+    SecChannel &ch = it->second;
+    if (payload.size() < vx60::kAeadTagSize)
+        return false;
+    const size_t ct_len = payload.size() - vx60::kAeadTagSize;
+    const uint8_t *tag = payload.data() + ct_len;
+    // The PEER's direction: an initiator receives responder-sealed packets
+    // (nonce_s), a responder receives client-sealed ones (nonce_c).
+    const auto nonce = ch.keys.packet_nonce(!ch.am_initiator, ch.recv_ctr);
+    WireHeader ad = ad_hdr;
+    ad.crc32c = 0; // the same zeroed-CRC AD the sealer used
+    if (!vx60::aead_open(ch.keys.key.data(), nonce.data(), reinterpret_cast<const uint8_t *>(&ad),
+                         sizeof(ad), payload.data(), ct_len, tag)) {
+        // A failed open NEVER advances the counter: TCP is ordered, so a
+        // mismatch means tampering — the caller drops the connection.
+        return false;
+    }
+    payload.resize(ct_len);
+    ++ch.recv_ctr;
+    return true;
+}
+
 uint64_t SwarmNode::send_packet(int fd, const WireHeader &hdr, const uint8_t *payload) {
     if (fd < 0)
         return 0;
 
-    // Header goes out with crc32c already filled by the caller.
-    ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-    if (n != static_cast<ssize_t>(sizeof(hdr)))
+    // VX60-SEC: a secured fd seals the payload; the tag rides after the
+    // ciphertext, so the LOCAL header copy grows by vx60::kAeadTagSize and the
+    // CRC is recomputed over the sealed representation. Legacy fds send
+    // the caller's header/payload untouched (the caller's CRC stands).
+    WireHeader h2 = hdr;
+    std::vector<uint8_t> sealed;
+    // A nullptr payload = a zero-length one (PING/PONG): it STILL seals —
+    // a tag-only packet authenticates an empty frame, otherwise an
+    // attacker could inject unauthenticated empties into a secured channel.
+    if (payload || hdr.payload_len == 0) {
+        if (payload)
+            sealed.assign(payload, payload + hdr.payload_len);
+        // The AD header carries the FINAL (sealed) length: the tag adds 32.
+        h2.payload_len = static_cast<uint32_t>(sealed.size() + vx60::kAeadTagSize);
+        if (sec_seal_out(fd, h2, sealed)) {
+            h2.crc32c = compute_wire_crc32c(sealed.data(), sealed.size());
+            payload = sealed.data();
+        } else {
+            h2.payload_len = hdr.payload_len; // legacy passthrough: restore
+        }
+    }
+
+    ssize_t n = ::send(fd, &h2, sizeof(h2), MSG_NOSIGNAL);
+    if (n != static_cast<ssize_t>(sizeof(h2)))
         return 0;
 
-    uint64_t total = sizeof(hdr);
-    if (hdr.payload_len > 0 && payload) {
+    uint64_t total = sizeof(h2);
+    if (h2.payload_len > 0 && payload) {
         size_t off = 0;
-        while (off < hdr.payload_len) {
-            n = ::send(fd, payload + off, hdr.payload_len - off, MSG_NOSIGNAL);
+        while (off < h2.payload_len) {
+            n = ::send(fd, payload + off, h2.payload_len - off, MSG_NOSIGNAL);
             if (n <= 0) {
                 if (n < 0 && (errno == EINTR))
                     continue;
@@ -764,6 +988,14 @@ bool SwarmNode::recv_packet(int fd, WireHeader &hdr, std::vector<uint8_t> &paylo
 
     // Hardware CRC32C verification — drop silently on mismatch, keep connection.
     if (compute_wire_crc32c(payload.data(), payload.size()) != hdr.crc32c) {
+        corrupted_packets_dropped_.fetch_add(1);
+        return false;
+    }
+
+    // VX60-SEC: a secured fd opens the payload (the CRC above covered the
+    // SEALED representation as received). A failed open NEVER advances the
+    // receive counter and drops the connection — tampering, not glitch.
+    if (!sec_open_in(fd, hdr, payload)) {
         corrupted_packets_dropped_.fetch_add(1);
         return false;
     }
@@ -1270,19 +1502,11 @@ bool SwarmNode::send_wire_payloads_to(int fd, WireMsgType type,
         WireHeader hdr =
             make_header(type, static_cast<uint32_t>(payload.size()), session_nonce_.fetch_add(1));
         hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
-        ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-        if (n != static_cast<ssize_t>(sizeof(hdr)))
+        // Delegates to send_packet: a secured fd seals here (the tag grows
+        // the local header copy and the CRC is recomputed over the sealed
+        // representation); legacy fds send as-is.
+        if (send_packet(fd, hdr, payload.data()) == 0)
             return false;
-        size_t off = 0;
-        while (off < payload.size()) {
-            n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR)
-                    continue;
-                return false;
-            }
-            off += static_cast<size_t>(n);
-        }
     }
     return true;
 }
@@ -1402,9 +1626,32 @@ bool SwarmNode::bind_p2p_listener(uint16_t port) {
 // discovery floor - a 128-entry candidate list can never become a dial
 // storm (<= 1 outbound per 5 s).
 
+void SwarmNode::load_vx60_identity(const std::string &data_dir) {
+    if (vx60_id_loaded_)
+        return; // already loaded (explicit call order guard)
+    // ── VX60-SEC M2: the transport identity loads beside the legacy id. A
+    // load failure runs the transport identityless (logged) — the node
+    // keeps serving legacy peers; regeneration is an operator decision.
+    std::string vx60_err;
+    if (vx60::TransportIdentityStore::load_or_create(data_dir, vx60_id_, vx60_err)) {
+        vx60_id_loaded_ = true;
+        std::string id_hex;
+        static const char *hd = "0123456789abcdef";
+        for (const uint8_t b : vx60_id_.node_id) {
+            id_hex.push_back(hd[b >> 4]);
+            id_hex.push_back(hd[b & 0xF]);
+        }
+        std::cout << "[Swarm] vx60 transport identity loaded (node_id " << id_hex << ")\n";
+    } else {
+        std::cout << "[Swarm] vx60 transport identity UNAVAILABLE (" << vx60_err
+                  << "); running SEC-less this session\n";
+    }
+}
+
 void SwarmNode::load_or_create_node_id(const std::string &data_dir) {
     if (node_id_ != std::array<uint8_t, 32>{})
         return; // already loaded (explicit call order guard)
+    load_vx60_identity(data_dir);
     std::array<uint8_t, 32> id{};
     const std::filesystem::path file = std::filesystem::path(data_dir) / "node_id";
     std::error_code ec;
@@ -1588,6 +1835,7 @@ void SwarmNode::report_id_strike(const std::array<uint8_t, 32> &id, int score_in
                 // fd exactly once (same discipline as health_loop).
                 fds_to_drop.push_back(fit->second);
                 peer_fds_.erase(fit);
+                sec_channels_.erase(fit->second);
             }
             id_conn_labels_.erase(lit);
         }
@@ -1930,6 +2178,10 @@ void SwarmNode::serve_connection(int c) {
     std::array<uint8_t, 32> handshaked_id{};
     bool id_known = false;
     bool handshake_seen = false;
+    // VX60-SEC M2: the acceptor is the SEC RESPONDER (frames arrive from
+    // the dialer's upgrade probe).
+    std::optional<vx60::ServerHandshake> sec_server;
+    bool sec_established = false;
     auto erase_id_label = [&](const std::string &lbl) {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         for (auto it = id_conn_labels_.begin(); it != id_conn_labels_.end(); ++it)
@@ -1995,7 +2247,11 @@ void SwarmNode::serve_connection(int c) {
             }
             WireHeader pong = make_header(WireMsgType::PONG, 0, session_nonce_.fetch_add(1));
             pong.crc32c = compute_wire_crc32c(nullptr, 0);
-            ::send(c, &pong, sizeof(pong), MSG_NOSIGNAL);
+            // Route through send_packet: a secured fd seals (tag-only for
+            // the empty payload); legacy fds send as-is. A raw ::send here
+            // would bypass the encryption and leak an unauthenticated
+            // packet into a secured channel.
+            send_packet(c, pong, nullptr);
             continue;
         }
         if (type == WireMsgType::HANDSHAKE) {
@@ -2099,6 +2355,79 @@ void SwarmNode::serve_connection(int c) {
             }
             continue;
         }
+        // ── VX60-SEC M2 dispatch (the acceptor is the SEC responder) ────
+        if (type == WireMsgType::SEC_CLIENT_HELLO) {
+            if (!vx60_id_loaded_ || sec_server.has_value() || sec_established) {
+                // No identity (legacy node) / re-handshake on a secured
+                // connection: both are protocol violations.
+                report_withhold(peer_label, 20);
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
+                break;
+            }
+            sec_server.emplace();
+            sec_server->set_static_keys(vx60_id_.static_ek, vx60_id_.static_dk, node_id_);
+            std::string sec_err;
+            std::vector<uint8_t> server_hello;
+            if (!sec_server->begin_from_client_hello(payload, server_hello, sec_err)) {
+                std::cerr << "[Swarm] vx60 server handshake failed: " << sec_err << "\n";
+                sec_server.reset();
+                report_withhold(peer_label, 20);
+                break;
+            }
+            WireHeader h = make_header(WireMsgType::SEC_SERVER_HELLO,
+                                       static_cast<uint32_t>(server_hello.size()),
+                                       session_nonce_.fetch_add(1));
+            h.crc32c = compute_wire_crc32c(server_hello.data(), server_hello.size());
+            send_packet(c, h, server_hello.data()); // no channel yet: passthrough
+            if (sec_server->mode == vx60::kHsFlagWarm) {
+                // WARM: keys ready now.
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                sec_channels_[c] = {sec_server->keys, 0, 0, /*am_initiator=*/false};
+                if (!sec_enforcement_armed_) {
+                    sec_enforcement_armed_ = true;
+                    id_enforcement_enabled_.store(true, std::memory_order_relaxed);
+                }
+                sec_established = true;
+                sec_server.reset();
+                std::cout << "[Swarm] vx60 SEC session established (warm, inbound)\n";
+            }
+            continue;
+        }
+        if (type == WireMsgType::SEC_PK_RESPONSE) {
+            if (!sec_server.has_value() || sec_established) {
+                report_withhold(peer_label, 20);
+                if (id_known)
+                    report_id_strike(handshaked_id, 20);
+                break;
+            }
+            std::string sec_err;
+            if (!sec_server->finish_cold(payload, sec_err)) {
+                std::cerr << "[Swarm] vx60 cold finish failed: " << sec_err << "\n";
+                sec_server.reset();
+                report_withhold(peer_label, 20);
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(peers_mutex_);
+                sec_channels_[c] = {sec_server->keys, 0, 0, /*am_initiator=*/false};
+                if (!sec_enforcement_armed_) {
+                    sec_enforcement_armed_ = true;
+                    id_enforcement_enabled_.store(true, std::memory_order_relaxed);
+                }
+            }
+            sec_established = true;
+            sec_server.reset();
+            std::cout << "[Swarm] vx60 SEC session established (cold, inbound)\n";
+            continue;
+        }
+        if (type == WireMsgType::SEC_SERVER_HELLO || type == WireMsgType::SEC_KEM_ROTATE) {
+            // Wrong direction on the acceptor / reserved for M4.
+            report_withhold(peer_label, 20);
+            if (id_known)
+                report_id_strike(handshaked_id, 20);
+            break;
+        }
         if (type == WireMsgType::RAW_BLOCK_64K && payload.size() == 65536) {
             if (promote()) {
                 fire_connected();
@@ -2196,6 +2525,7 @@ void SwarmNode::serve_connection(int c) {
         erase_id_label(peer_label); // teardown: free the id→label slot
         std::lock_guard<std::mutex> lock(peers_mutex_);
         peer_fds_.erase(peer_label);
+        sec_channels_.erase(c);
         for (auto it = peer_table_.begin(); it != peer_table_.end(); ++it) {
             if (it->address == peer_label) {
                 peer_table_.erase(it);
@@ -2245,6 +2575,7 @@ void SwarmNode::health_loop() {
                     if (fd_it != peer_fds_.end()) {
                         banned_fds.push_back(fd_it->second);
                         peer_fds_.erase(fd_it);
+                        sec_channels_.erase(fd_it->second);
                     }
                     it = peer_table_.erase(it);
                 } else {

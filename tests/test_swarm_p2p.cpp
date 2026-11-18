@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <filesystem>
 #include <sys/stat.h>
 #include <cstring>
 #include <thread>
@@ -1211,4 +1212,149 @@ TEST(VortexSwarmP2PTest, SecondHandshakeDropsConnection) {
     EXPECT_TRUE(closed) << "second HANDSHAKE must drop the connection";
     ::close(fd);
     server.emergency_stop();
+}
+
+// ── VX60-SEC M2 integration: the encrypted-transport upgrade over a real ────
+// socket. Flow: legacy v2 handshake → the dialer's SEC probe (COLD) →
+// sealed pk → PK_RESPONSE → the channel goes AEAD → an empty PING arrives
+// as a tag-only sealed packet and the PONG comes back sealed. The node-wide
+// enforcement flip (the PEX dormant gate closing) is pinned on the server.
+TEST(VortexSwarmP2PTest, Vx60SecUpgradeOverRealSocket) {
+    vx::net::SwarmNode server;
+    const std::string dir = "/tmp/vx_sec_upgrade_" + std::to_string(getpid());
+    ::mkdir(dir.c_str(), 0700);
+    server.load_or_create_node_id(dir); // loads the transport identity too
+    ASSERT_TRUE(server.vx60_ready());
+    EXPECT_FALSE(server.id_enforcement_enabled()) << "dormant before any SEC session";
+
+    const uint16_t port = free_tcp_port();
+    ASSERT_TRUE(server.bind_p2p_listener(port));
+    server.start();
+
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(fd, 0);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sa.sin_port = htons(port);
+    ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+
+    // Legacy v2 handshake with a nonzero id (the server needs id_known to
+    // accept the peer into its table before the SEC dance).
+    const std::array<uint8_t, 32> peer_id = test_id(0x61);
+    {
+        WireHeader hs = vx::net::SwarmNode::make_header(WireMsgType::HANDSHAKE, 87, 1);
+        auto p = v2_handshake_payload(peer_id, htonl(INADDR_LOOPBACK), port, true);
+        hs.crc32c = vx::net::compute_wire_crc32c(p.data(), (uint32_t)p.size());
+        ASSERT_EQ(::send(fd, &hs, sizeof(hs), 0), (ssize_t)sizeof(hs));
+        ASSERT_EQ(::send(fd, p.data(), (ssize_t)p.size(), 0), (ssize_t)p.size());
+    }
+
+    // The SEC upgrade: COLD (first contact — no pk cache).
+    vx::net::vx60::ClientHandshake client;
+    std::string sec_err;
+    ASSERT_TRUE(client.begin_cold(sec_err)) << sec_err;
+    {
+        WireHeader h = vx::net::SwarmNode::make_header(WireMsgType::SEC_CLIENT_HELLO,
+                                                       (uint32_t)client.my_hello.size(), 2);
+        h.crc32c =
+            vx::net::compute_wire_crc32c(client.my_hello.data(), (uint32_t)client.my_hello.size());
+        ASSERT_EQ(::send(fd, &h, sizeof(h), 0), (ssize_t)sizeof(h));
+        ASSERT_EQ(::send(fd, client.my_hello.data(), (ssize_t)client.my_hello.size(), 0),
+                  (ssize_t)client.my_hello.size());
+    }
+
+    // SERVER_HELLO (the sealed static pk), unframed by any channel yet.
+    WireHeader rh{};
+    std::vector<uint8_t> payload;
+    bool got_hello = false;
+    for (int i = 0; i < 100 && !got_hello; ++i) {
+        if (!read_packet(fd, rh, payload))
+            break;
+        if (rh.msg_type == (uint8_t)WireMsgType::SEC_SERVER_HELLO)
+            got_hello = true;
+    }
+    ASSERT_TRUE(got_hello) << "the server must answer the SEC probe";
+
+    // Finish the COLD client side (TOFU on the transport id; the LEGACY id
+    // is known — the server announced it in the v2 handshake — and the
+    // sealed blob must carry it).
+    std::array<uint8_t, 32> server_legacy_id{};
+    {
+        int nfd = ::open((dir + "/node_id").c_str(), O_RDONLY);
+        ASSERT_GE(nfd, 0);
+        ASSERT_EQ(::read(nfd, server_legacy_id.data(), 32), 32);
+        ::close(nfd);
+    }
+    ASSERT_TRUE(client.finish_cold_pk_received(payload, {}, server_legacy_id, sec_err)) << sec_err;
+
+    // PK_RESPONSE completes the server side.
+    {
+        WireHeader h = vx::net::SwarmNode::make_header(WireMsgType::SEC_PK_RESPONSE,
+                                                       (uint32_t)client.pk_response.size(), 3);
+        h.crc32c = vx::net::compute_wire_crc32c(client.pk_response.data(),
+                                                (uint32_t)client.pk_response.size());
+        ASSERT_EQ(::send(fd, &h, sizeof(h), 0), (ssize_t)sizeof(h));
+        ASSERT_EQ(::send(fd, client.pk_response.data(), (ssize_t)client.pk_response.size(), 0),
+                  (ssize_t)client.pk_response.size());
+    }
+
+    // The channel is live: an EMPTY PING must arrive as a tag-only sealed
+    // packet, and the PONG must come back sealed under the server direction.
+    WireHeader ping = vx::net::SwarmNode::make_header(WireMsgType::PING, 0, 4);
+    {
+        // An empty plaintext seals to a TAG-ONLY wire packet (32 bytes):
+        // the zero-length payload is authenticated without leaking any
+        // content, and the header's payload_len must say 32, not 0.
+        std::vector<uint8_t> empty;
+        std::array<uint8_t, vx::net::vx60::kAeadTagSize> tag{};
+        // The AD must match the transport's rule: the FINAL header framing
+        // (payload_len = 32 = the tag-only wire size) with the CRC zeroed.
+        ping.payload_len = (uint32_t)vx::net::vx60::kAeadTagSize;
+        WireHeader ad = ping;
+        ad.crc32c = 0;
+        vx::net::vx60::session_seal(client.keys, /*from_client=*/true, 0,
+                                    reinterpret_cast<const uint8_t *>(&ad), sizeof(ad),
+                                    empty.data(), empty.size(), tag.data());
+        std::vector<uint8_t> wire(empty);
+        wire.insert(wire.end(), tag.begin(), tag.end());
+        ping.crc32c = vx::net::compute_wire_crc32c(wire.data(), (uint32_t)wire.size());
+        ASSERT_EQ(::send(fd, &ping, sizeof(ping), 0), (ssize_t)sizeof(ping));
+        ASSERT_EQ(::send(fd, wire.data(), (ssize_t)wire.size(), 0), (ssize_t)wire.size());
+    }
+
+    bool got_pong = false;
+    std::vector<uint8_t> pong_plain;
+    for (int i = 0; i < 100 && !got_pong; ++i) {
+        WireHeader h2{};
+        std::vector<uint8_t> p2;
+        if (!read_packet(fd, h2, p2))
+            break;
+        if (h2.msg_type != (uint8_t)WireMsgType::PONG)
+            continue;
+        // The server sealed it: open with the client's view (from_client=false
+        // = the responder's direction), counter 0.
+        ASSERT_GE(p2.size(), vx::net::vx60::kAeadTagSize);
+        const size_t ct_len = p2.size() - vx::net::vx60::kAeadTagSize;
+        std::vector<uint8_t> ct(p2.begin(), p2.begin() + ct_len);
+        const uint8_t *tag = p2.data() + ct_len; // the tag rides the tail
+        // AD = the received header with the CRC zeroed (same rule as the
+        // sealer — the CRC is a plaintext-layer check over the sealed bytes).
+        WireHeader ad = h2;
+        ad.crc32c = 0;
+        ASSERT_TRUE(vx::net::vx60::session_open(client.keys, /*from_client=*/false, 0,
+                                                reinterpret_cast<const uint8_t *>(&ad), sizeof(ad),
+                                                ct.data(), ct.size(), tag))
+            << "the PONG must be sealed under the negotiated keys";
+        pong_plain = ct;
+        got_pong = true;
+    }
+    ASSERT_TRUE(got_pong) << "the secured PING must be answered with a PONG";
+
+    // The enforcement flip: the PEX dormant gate closed node-wide.
+    EXPECT_TRUE(server.id_enforcement_enabled());
+
+    ::close(fd);
+    server.emergency_stop();
+    std::filesystem::remove_all(dir);
 }
