@@ -351,6 +351,11 @@ add_executable(test_vx60_sec_rekey tests/test_vx60_sec_rekey.cpp)
 target_link_libraries(test_vx60_sec_rekey PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexVx60SecRekeyTest COMMAND test_vx60_sec_rekey)
 
+# SVA-8192 «Sovereign Vault»: cold-custody address class crypto core.
+add_executable(test_sva_vault tests/test_sva_vault.cpp)
+target_link_libraries(test_sva_vault PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexSvaVaultTest COMMAND test_sva_vault)
+
 # ML-KEM-768 (FIPS 203) — the DKSAP stealth track's KEM, ACVP-KAT-gated.
 add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)
 target_link_libraries(test_ml_kem_kat PRIVATE vx_core gtest gtest_main)
