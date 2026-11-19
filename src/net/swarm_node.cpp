@@ -672,12 +672,21 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                 // parse/flag failure (a peer that does not speak SEC) gets
                 // the no-SEC mark; otherwise an attacker forces session
                 // downgrade at will.
+                // Hygiene 2a (owner-directed 19.11): version asymmetry.
+                // A peer that claims a NEWER version than ours is not at
+                // fault — neutral drop, no strike, no no-sec mark.
+                // A peer that claims an OLDER version is pulling the
+                // downgrade lever — strike + drop.
+                const bool ver_newer = sec_err.find("version newer") != std::string::npos;
+                const bool ver_older = sec_err.find("version older") != std::string::npos;
                 const bool crypto_fault = sec_err.find("AEAD") != std::string::npos ||
                                           sec_err.find("does not hash") != std::string::npos ||
                                           sec_err.find("legacy_id mismatch") != std::string::npos;
-                if (crypto_fault && id_known)
+                if (ver_older && id_known)
                     report_id_strike(handshaked_id, 100);
-                if (!crypto_fault && id_known) {
+                if (crypto_fault && !ver_older && id_known)
+                    report_id_strike(handshaked_id, 100);
+                if (!crypto_fault && !ver_newer && !ver_older && id_known) {
                     std::lock_guard<std::mutex> lock(peers_mutex_);
                     no_sec_peers_.insert(handshaked_id);
                 }
@@ -2212,6 +2221,43 @@ void SwarmNode::serve_connection(int c) {
     struct timeval snd_tv{5, 0};
     ::setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 
+    // Hygiene 2b (owner-directed 19.11): per-IP connection cap, checked on
+    // the accept path BEFORE any packet handling — an IP flooding with
+    // connections cannot reach the handshake state machines. Over the cap
+    // = instant close, no strike, no withhold. The slot is released by an
+    // RAII guard at function exit (all teardown paths covered).
+    uint32_t peer_ip = 0;
+    bool ip_tracked = false;
+    {
+        sockaddr_in sa{};
+        socklen_t sl = sizeof(sa);
+        if (::getpeername(c, reinterpret_cast<sockaddr *>(&sa), &sl) == 0) {
+            peer_ip = sa.sin_addr.s_addr;
+            ip_tracked = true;
+            std::lock_guard<std::mutex> lock(peers_mutex_);
+            if (active_per_ip_[peer_ip] >= kMaxConnsPerIp) {
+                ::close(c);
+                return;
+            }
+            ++active_per_ip_[peer_ip];
+        }
+    }
+    struct IpSlotGuard {
+        SwarmNode *self;
+        uint32_t ip;
+        bool tracked;
+        ~IpSlotGuard() {
+            if (!tracked)
+                return;
+            std::lock_guard<std::mutex> lock(self->peers_mutex_);
+            auto it = self->active_per_ip_.find(ip);
+            if (it != self->active_per_ip_.end() && it->second > 0) {
+                if (--it->second == 0)
+                    self->active_per_ip_.erase(it);
+            }
+        }
+    } ip_guard{this, peer_ip, ip_tracked};
+
     // Serve one connection until EOF: PING -> PONG, RAW_BLOCK_64K ->
     // handle_incoming_frame (CRC32C already verified inside recv_packet).
     // Anything else is an unexpected message type; the connection is
@@ -2421,7 +2467,16 @@ void SwarmNode::serve_connection(int c) {
             if (!sec_server->begin_from_client_hello(payload, server_hello, sec_err)) {
                 std::cerr << "[Swarm] vx60 server handshake failed: " << sec_err << "\n";
                 sec_server.reset();
-                report_withhold(peer_label, 20);
+                // Hygiene 2a: version asymmetry. A client claiming an OLDER
+                // version pulls the downgrade lever → strike. A NEWER client
+                // is not at fault → neutral drop, no withhold, no strike.
+                if (sec_err.find("version older") != std::string::npos) {
+                    if (id_known)
+                        report_id_strike(handshaked_id, 100);
+                    report_withhold(peer_label, 20);
+                } else if (sec_err.find("version newer") == std::string::npos) {
+                    report_withhold(peer_label, 20);
+                }
                 break;
             }
             WireHeader h = make_header(WireMsgType::SEC_SERVER_HELLO,

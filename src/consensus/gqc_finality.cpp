@@ -128,6 +128,7 @@ GaloisQuorumCert GqcFinality::finalize_block(uint64_t block_height,
     // Cement: no rollback may ever cross below this checkpoint again.
     undo_.lock_finalized_height(block_height);
     finalized_height_ = block_height;
+    last_finalize_time_ = std::chrono::steady_clock::now();
     cert.certified = true;
     return cert;
 }

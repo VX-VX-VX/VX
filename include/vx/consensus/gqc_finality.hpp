@@ -16,6 +16,7 @@
 #include "vx/state/undo_engine.hpp"
 #include "vx/storage/block_store.hpp"
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -53,6 +54,21 @@ public:
 
     uint64_t finalized_checkpoint_height() const noexcept { return finalized_height_; }
 
+    /// Hygiene 2v (owner-directed 19.11): health-RPC observability.
+    /// Seconds since the last successful finalize (0 = never finalized).
+    uint64_t finalize_age_sec() const noexcept {
+        if (last_finalize_time_ == std::chrono::steady_clock::time_point{})
+            return 0;
+        return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                                last_finalize_time_)
+            .count();
+    }
+
+    /// Highest height with collected shares still pending a quorum (0 = none).
+    uint64_t pending_quorum_height() const noexcept {
+        return share_pools_.empty() ? 0 : share_pools_.rbegin()->first;
+    }
+
     /// Collect one GF(2^8) share for (height, hash) from a validator.
     void collect_share(uint64_t block_height,
                        const std::array<uint8_t, 32>& block_hash,
@@ -85,6 +101,8 @@ private:
     state::UndoEngine& undo_;
     storage::BlockStore& store_;
     uint64_t finalized_height_ = 0;
+    // epoch = never finalized (health RPC, hygiene 2v).
+    std::chrono::steady_clock::time_point last_finalize_time_{};
     // (height, hash) -> validator_id -> share
     // Shares are pooled per (height, block hash) — keying by height alone
     // let votes for DIFFERENT blocks at the same height mix into one

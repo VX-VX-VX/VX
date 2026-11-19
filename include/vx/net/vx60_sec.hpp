@@ -34,7 +34,6 @@
 #include "vx/net/vx60_identity.hpp"
 #include "vx/net/vx60_aead.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
-#include "vx/core/ct_equal.hpp"
 
 #include <array>
 #include <cstddef>
@@ -53,17 +52,25 @@ inline constexpr uint8_t kSecKemRotate = 0x13; // reserved for M4: strike + drop
 inline constexpr uint8_t kHsFlagWarm = 0x01;
 inline constexpr uint8_t kHsFlagCold = 0x02;
 
+// SEC protocol version (hygiene 2a, owner-directed 19.11): the hello payload
+// carries [flag, version(u32 LE), ...]. Rules (downgrade protection):
+//   version < ours → strike + drop (an old build claiming older than ours is
+//   the classic lever to force a legacy/no-SEC downgrade);
+//   version > ours → neutral drop, NO strike (a newer build is not the
+//   peer's fault — it just cannot interop with us yet).
+inline constexpr uint32_t kSecProtoVer = 1;
+
 // Frame sizes (fixed; parsed strictly, no trailing slack):
-//   CLIENT_HELLO WARM: flags(1) ‖ ek_I(1184) ‖ ct_static(1088) = 2273
-//   CLIENT_HELLO COLD: flags(1) ‖ ek_I(1184)                   = 1185
-//   SERVER_HELLO WARM: flags(1) ‖ ct_ephem(1088)               = 1089
-//   SERVER_HELLO COLD: flags(1) ‖ ct_ephem ‖ nonce(16) ‖
-//                      sealed(pk ‖ legacy_id)(1216) ‖ tag(32) = 2353
+//   CLIENT_HELLO WARM: flags(1) ‖ ver(4) ‖ ek_I(1184) ‖ ct_static(1088) = 2277
+//   CLIENT_HELLO COLD: flags(1) ‖ ver(4) ‖ ek_I(1184)                   = 1189
+//   SERVER_HELLO WARM: flags(1) ‖ ver(4) ‖ ct_ephem(1088)               = 1093
+//   SERVER_HELLO COLD: flags(1) ‖ ver(4) ‖ ct_ephem ‖ nonce(16) ‖
+//                      sealed(pk ‖ legacy_id)(1216) ‖ tag(32)          = 2357
 //   PK_RESPONSE:       ct_static(1088)                          = 1088
-inline constexpr size_t kHelloWarmSize = 1 + 1184 + 1088;
-inline constexpr size_t kHelloColdSize = 1 + 1184;
-inline constexpr size_t kServerWarmSize = 1 + 1088;
-inline constexpr size_t kServerColdSize = 1 + 1088 + 16 + 1184 + 32 + 32;
+inline constexpr size_t kHelloWarmSize = 5 + 1184 + 1088;
+inline constexpr size_t kHelloColdSize = 5 + 1184;
+inline constexpr size_t kServerWarmSize = 5 + 1088;
+inline constexpr size_t kServerColdSize = 5 + 1088 + 16 + 1216 + 32;
 inline constexpr size_t kPkResponseSize = 1088;
 
 // ── Domain-separated key material ───────────────────────────────────────────
@@ -169,37 +176,43 @@ inline std::array<uint8_t, 32> transcript_hash(const std::vector<uint8_t> &a,
 
 // ── Frame builders (raw bytes, exact sizes) ─────────────────────────────────
 
-/// CLIENT_HELLO, WARM flavor: [0x10] ‖ [0x01] ‖ ek_I ‖ ct_static.
+/// CLIENT_HELLO, WARM flavor: [0x10] ‖ ver(4) ‖ ek_I ‖ ct_static.
 inline std::vector<uint8_t>
 build_client_hello_warm(const vx::crypto::mlkem::PublicKey &ek_I,
                         const vx::crypto::mlkem::Ciphertext &ct_static) {
     std::vector<uint8_t> out;
     out.reserve(kHelloWarmSize);
     out.push_back(kHsFlagWarm);
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<uint8_t>(kSecProtoVer >> (8 * i)));
     out.insert(out.end(), ek_I.begin(), ek_I.end());
     out.insert(out.end(), ct_static.begin(), ct_static.end());
     return out;
 }
 
-/// CLIENT_HELLO, COLD flavor: [0x10] ‖ [0x02] ‖ ek_I.
+/// CLIENT_HELLO, COLD flavor: [0x10] ‖ ver(4) ‖ ek_I.
 inline std::vector<uint8_t> build_client_hello_cold(const vx::crypto::mlkem::PublicKey &ek_I) {
     std::vector<uint8_t> out;
     out.reserve(kHelloColdSize);
     out.push_back(kHsFlagCold);
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<uint8_t>(kSecProtoVer >> (8 * i)));
     out.insert(out.end(), ek_I.begin(), ek_I.end());
     return out;
 }
 
-/// SERVER_HELLO WARM: [0x11] ‖ [0x01] ‖ ct_ephem.
+/// SERVER_HELLO WARM: [0x11] ‖ ver(4) ‖ ct_ephem.
 inline std::vector<uint8_t> build_server_hello_warm(const vx::crypto::mlkem::Ciphertext &ct_ephem) {
     std::vector<uint8_t> out;
     out.reserve(kServerWarmSize);
     out.push_back(kHsFlagWarm);
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<uint8_t>(kSecProtoVer >> (8 * i)));
     out.insert(out.end(), ct_ephem.begin(), ct_ephem.end());
     return out;
 }
 
-/// SERVER_HELLO COLD: [0x11] ‖ [0x02] ‖ ct_ephem ‖ AEAD-sealed static pk.
+/// SERVER_HELLO COLD: [0x11] ‖ ver(4) ‖ ct_ephem ‖ AEAD-sealed static pk.
 inline std::vector<uint8_t>
 build_server_hello_cold(const vx::crypto::mlkem::Ciphertext &ct_ephem,
                         const vx::crypto::mlkem::PublicKey &static_ek,
@@ -210,6 +223,8 @@ build_server_hello_cold(const vx::crypto::mlkem::Ciphertext &ct_ephem,
     std::vector<uint8_t> out;
     out.reserve(kServerColdSize);
     out.push_back(kHsFlagCold);
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<uint8_t>(kSecProtoVer >> (8 * i)));
     out.insert(out.end(), ct_ephem.begin(), ct_ephem.end());
     out.insert(out.end(), nonce, nonce + 16);
     // Sealed blob = the static pk BOUND to the server's legacy node_id:
@@ -238,22 +253,42 @@ inline std::vector<uint8_t> build_pk_response(const vx::crypto::mlkem::Ciphertex
 
 struct ParsedClientHello {
     uint8_t flags{};
+    // Filled on size+flag match even when the version check fails, so the
+    // caller can distinguish "older" (strike) from "newer" (neutral drop).
+    uint32_t version{};
+    // True when the frame size+flag matched (version was actually read).
+    // Without it, version==0 is indistinguishable from "parse never got far
+    // enough" — and a zero version must map to "older" (strike), not to a
+    // generic parse failure (that would recreate the downgrade lever).
+    bool size_matched{};
     vx::crypto::mlkem::PublicKey ek_I{};
     std::optional<vx::crypto::mlkem::Ciphertext> ct_static;
 };
 
 // The wire TYPE rides in the 24-byte WireHeader (the swarm dispatch); the
-// payload carries the FLAG byte first. Parsers validate size + flag only.
+// payload carries the FLAG byte first, then the version (u32 LE).
+// Parsers validate size + flag; a different version fails the parse with
+// out.version set, so the caller applies the asymmetric rule (hygiene 2a):
+// peer version < ours → strike + drop (downgrade lever);
+// peer version > ours → neutral drop, no strike (not the peer's fault).
 inline bool parse_client_hello(const std::vector<uint8_t> &raw, ParsedClientHello &out) noexcept {
     if (raw.size() == kHelloWarmSize && raw[0] == kHsFlagWarm) {
-        std::memcpy(out.ek_I.data(), raw.data() + 1, 1184);
+        out.size_matched = true;
+        std::memcpy(&out.version, raw.data() + 1, 4);
+        if (out.version != kSecProtoVer)
+            return false;
+        std::memcpy(out.ek_I.data(), raw.data() + 5, 1184);
         out.ct_static.emplace();
-        std::memcpy(out.ct_static->data(), raw.data() + 1 + 1184, 1088);
+        std::memcpy(out.ct_static->data(), raw.data() + 5 + 1184, 1088);
         out.flags = raw[0];
         return true;
     }
     if (raw.size() == kHelloColdSize && raw[0] == kHsFlagCold) {
-        std::memcpy(out.ek_I.data(), raw.data() + 1, 1184);
+        out.size_matched = true;
+        std::memcpy(&out.version, raw.data() + 1, 4);
+        if (out.version != kSecProtoVer)
+            return false;
+        std::memcpy(out.ek_I.data(), raw.data() + 5, 1184);
         out.ct_static.reset();
         out.flags = raw[0];
         return true;
@@ -263,6 +298,10 @@ inline bool parse_client_hello(const std::vector<uint8_t> &raw, ParsedClientHell
 
 struct ParsedServerHello {
     uint8_t flags{};
+    // Filled on size+flag match even when the version check fails.
+    uint32_t version{};
+    // See ParsedClientHello::size_matched.
+    bool size_matched{};
     vx::crypto::mlkem::Ciphertext ct_ephem{};
     // COLD only: the sealed blob (pk ‖ legacy_id = 1216) + AEAD nonce + tag.
     std::optional<std::array<uint8_t, 1216>> sealed_blob;
@@ -272,18 +311,26 @@ struct ParsedServerHello {
 
 inline bool parse_server_hello(const std::vector<uint8_t> &raw, ParsedServerHello &out) noexcept {
     if (raw.size() == kServerWarmSize && raw[0] == kHsFlagWarm) {
+        out.size_matched = true;
+        std::memcpy(&out.version, raw.data() + 1, 4);
+        if (out.version != kSecProtoVer)
+            return false;
         out.flags = raw[0];
-        std::memcpy(out.ct_ephem.data(), raw.data() + 1, 1088);
+        std::memcpy(out.ct_ephem.data(), raw.data() + 5, 1088);
         out.sealed_blob.reset();
         return true;
     }
     if (raw.size() == kServerColdSize && raw[0] == kHsFlagCold) {
+        out.size_matched = true;
+        std::memcpy(&out.version, raw.data() + 1, 4);
+        if (out.version != kSecProtoVer)
+            return false;
         out.flags = raw[0];
-        std::memcpy(out.ct_ephem.data(), raw.data() + 1, 1088);
-        std::memcpy(out.seal_nonce.data(), raw.data() + 1 + 1088, 16);
+        std::memcpy(out.ct_ephem.data(), raw.data() + 5, 1088);
+        std::memcpy(out.seal_nonce.data(), raw.data() + 5 + 1088, 16);
         out.sealed_blob.emplace();
-        std::memcpy(out.sealed_blob->data(), raw.data() + 1 + 1088 + 16, 1216);
-        std::memcpy(out.seal_tag.data(), raw.data() + 1 + 1088 + 16 + 1216, 32);
+        std::memcpy(out.sealed_blob->data(), raw.data() + 5 + 1088 + 16, 1216);
+        std::memcpy(out.seal_tag.data(), raw.data() + 5 + 1088 + 16 + 1216, 32);
         return true;
     }
     return false;
@@ -346,7 +393,11 @@ struct ClientHandshake {
     bool finish_warm(const std::vector<uint8_t> &server_hello_raw, std::string &err) {
         ParsedServerHello sh;
         if (!parse_server_hello(server_hello_raw, sh) || sh.flags != kHsFlagWarm) {
-            err = "vx60 client: server hello parse/flag failure";
+            if (sh.size_matched && sh.version != kSecProtoVer)
+                err = sh.version < kSecProtoVer ? "vx60 client: server hello version older"
+                                                : "vx60 client: server hello version newer";
+            else
+                err = "vx60 client: server hello parse/flag failure";
             return false;
         }
         vx::crypto::mlkem::SharedSecret ss_ephem;
@@ -368,7 +419,11 @@ struct ClientHandshake {
         ParsedServerHello sh;
         if (!parse_server_hello(server_hello_raw, sh) || sh.flags != kHsFlagCold ||
             !sh.sealed_blob.has_value()) {
-            err = "vx60 client: server hello parse/flag failure (cold)";
+            if (sh.size_matched && sh.version != kSecProtoVer)
+                err = sh.version < kSecProtoVer ? "vx60 client: server hello version older"
+                                                : "vx60 client: server hello version newer";
+            else
+                err = "vx60 client: server hello parse/flag failure (cold)";
             return false;
         }
         vx::crypto::mlkem::SharedSecret ss_ephem;
@@ -464,7 +519,11 @@ struct ServerHandshake {
                                  std::vector<uint8_t> &server_hello_out, std::string &err) {
         ParsedClientHello ch;
         if (!parse_client_hello(client_hello_raw, ch)) {
-            err = "vx60 server: client hello parse failure";
+            if (ch.size_matched && ch.version != kSecProtoVer)
+                err = ch.version < kSecProtoVer ? "vx60 server: client hello version older"
+                                                : "vx60 server: client hello version newer";
+            else
+                err = "vx60 server: client hello parse failure";
             return false;
         }
         mode = ch.flags;

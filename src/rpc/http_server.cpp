@@ -1147,6 +1147,8 @@ HttpResponse HttpServer::dispatch(const HttpRequest& req) {
 
     // ── GQC finality / pipeline / stealth / vault / HTLC swap ─────────────
     if (req.method == "GET"  && req.path == "/api/consensus/finality_status") return handle_consensus_finality_status(req);
+    if (req.method == "GET" && req.path == "/api/consensus/health")
+        return handle_consensus_health(req);
     if (req.method == "POST" && req.path == "/api/consensus/finalize_gqc") return handle_consensus_finalize_gqc(req);
     if (req.method == "GET"  && req.path == "/api/mempool/pipeline_benchmark") return handle_mempool_pipeline_benchmark(req);
     if (req.method == "POST" && req.path == "/api/zk/stealth_envelope") return handle_zk_stealth_envelope(req);
@@ -3458,6 +3460,35 @@ HttpResponse HttpServer::handle_consensus_finality_status(const HttpRequest& req
         << "\"deep_reorg_protection\":true,"
         << "\"rollback_below_checkpoint\":\"ERR_FINALIZED_BY_GQC\","
         << "\"quorum\":\"2/3 GF(2^8) Shamir shares\"}";
+    return HttpResponse::json(200, oss.str());
+}
+
+// ── GET /api/consensus/health (hygiene 2v, owner-directed 19.11) ────────────
+// Read-only health summary for monitoring: finality progress vs the chain
+// tip, the pending-quorum watermark, and the age of the last finalize.
+HttpResponse HttpServer::handle_consensus_health(const HttpRequest &req) {
+    (void)req;
+    std::lock_guard<std::mutex> lock(state_mutex_);
+
+    const uint64_t height = store_.chain_height();
+    const uint64_t tip = (height > 0) ? height - 1 : 0;
+    uint8_t hash32[32] = {};
+    if (height > 0)
+        store_.tip_hash(hash32);
+    const uint64_t finalized = gqc_finality_->finalized_checkpoint_height();
+    const uint64_t pending = gqc_finality_->pending_quorum_height();
+    const uint64_t age = gqc_finality_->finalize_age_sec();
+    const uint64_t lag = (height > finalized) ? height - finalized : 0;
+
+    std::ostringstream oss;
+    oss << "{"
+        << "\"ok\":true,"
+        << "\"last_finalize_height\":" << finalized << ","
+        << "\"pending_quorum_height\":" << pending << ","
+        << "\"tip_height\":" << tip << ","
+        << "\"tip_hash\":\"" << hex_bytes(hash32, 32) << "\","
+        << "\"finalize_age_sec\":" << age << ","
+        << "\"blocks_pending_finality\":" << lag << "}";
     return HttpResponse::json(200, oss.str());
 }
 

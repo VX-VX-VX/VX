@@ -324,6 +324,7 @@ private:
 
     // ── GQC finality / pipeline / stealth / vault / HTLC swap ─────────────
     HttpResponse handle_consensus_finality_status(const HttpRequest& req);
+    HttpResponse handle_consensus_health(const HttpRequest &req);
     HttpResponse handle_consensus_finalize_gqc(const HttpRequest& req);
     HttpResponse handle_mempool_pipeline_benchmark(const HttpRequest& req);
     HttpResponse handle_zk_stealth_envelope(const HttpRequest& req);

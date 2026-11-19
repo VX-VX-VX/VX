@@ -400,3 +400,18 @@ TEST(VortexRpcAuthTest, UnreadableTokenFileFailsClosed) {
     EXPECT_EQ(env.server->route(request("POST", "/api/transfer", "{}", "anything")).status_code,
               401);
 }
+
+// ── Hygiene 2v (owner-directed 19.11): GQC health RPC ───────────────────────
+// Read-only summary: open without a token, and the fields must be present
+// and consistent (tip vs finalized checkpoint).
+TEST(VortexRpcAuthTest, ConsensusHealthEndpoint) {
+    const auto env = make_server("health", nullptr, nullptr, nullptr);
+    const auto res = env.server->route(request("GET", "/api/consensus/health", ""));
+    EXPECT_EQ(res.status_code, 200);
+    EXPECT_NE(res.body.find("\"last_finalize_height\""), std::string::npos);
+    EXPECT_NE(res.body.find("\"pending_quorum_height\""), std::string::npos);
+    EXPECT_NE(res.body.find("\"tip_height\""), std::string::npos);
+    EXPECT_NE(res.body.find("\"tip_hash\""), std::string::npos);
+    EXPECT_NE(res.body.find("\"finalize_age_sec\""), std::string::npos);
+    EXPECT_NE(res.body.find("\"blocks_pending_finality\""), std::string::npos);
+}

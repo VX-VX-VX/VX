@@ -243,3 +243,47 @@ TEST(Vx60SecHandshakeTest, PacketNonceDirectionAndCounter) {
         EXPECT_EQ(nc0[i], 0xAA) << "the base is the high half";
     }
 }
+
+// ── Hygiene 2a: protocol version asymmetry (owner-directed 19.11) ───────────
+// peer version < ours → strike + drop (downgrade lever);
+// peer version > ours → neutral drop, no strike.
+TEST(Vx60SecHandshakeTest, VersionAsymmetryOlderStrikesNewerNeutral) {
+    ParsedClientHello ch;
+
+    // An OLDER client hello (version 0) parses structurally (size+flag OK)
+    // but fails the version check, and the parser records the peer's version.
+    auto cold_old = build_client_hello_cold({});
+    cold_old[1] = 0x00;
+    cold_old[2] = 0x00;
+    cold_old[3] = 0x00;
+    cold_old[4] = 0x00; // version 0 < kSecProtoVer
+    EXPECT_FALSE(parse_client_hello(cold_old, ch));
+    EXPECT_EQ(ch.version, 0u);
+    EXPECT_LT(ch.version, kSecProtoVer) << "older → strike+drop";
+
+    // A NEWER client hello (version 2) also fails, but as "newer".
+    auto cold_new = build_client_hello_cold({});
+    cold_new[1] = 0x02;
+    cold_new[2] = 0x00;
+    cold_new[3] = 0x00;
+    cold_new[4] = 0x00; // version 2 > kSecProtoVer
+    EXPECT_FALSE(parse_client_hello(cold_new, ch));
+    EXPECT_EQ(ch.version, 2u);
+    EXPECT_GT(ch.version, kSecProtoVer) << "newer → neutral drop";
+
+    // The current version parses fine.
+    auto cold_ok = build_client_hello_cold({});
+    EXPECT_TRUE(parse_client_hello(cold_ok, ch));
+    EXPECT_EQ(ch.version, kSecProtoVer);
+
+    // Server hello: same asymmetry on the dialer side.
+    ParsedServerHello sh;
+    auto warm_old = build_server_hello_warm({});
+    warm_old[1] = 0x00;
+    warm_old[2] = 0x00;
+    warm_old[3] = 0x00;
+    warm_old[4] = 0x00;
+    EXPECT_FALSE(parse_server_hello(warm_old, sh));
+    EXPECT_EQ(sh.version, 0u);
+    EXPECT_LT(sh.version, kSecProtoVer);
+}

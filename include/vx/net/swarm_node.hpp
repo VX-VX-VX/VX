@@ -582,6 +582,11 @@ private:
         bool am_initiator = false;
     };
     std::map<int, SecChannel> sec_channels_;
+    // Hygiene 2b (owner-directed 19.11): per-IP accepted-connection cap.
+    // Checked on the accept path (serve_connection entry), released by an
+    // RAII guard at function exit — no teardown-site bookkeeping.
+    static constexpr size_t kMaxConnsPerIp = 8;
+    std::map<uint32_t, uint32_t> active_per_ip_; // guarded by peers_mutex_
     // Transport-pk cache: node_id -> static pk of PROVEN SEC peers (fills
     // on every successful handshake; WARM reuses it, first contact = COLD).
     std::map<std::array<uint8_t, 32>, vx::crypto::mlkem::PublicKey> vx60_pk_cache_;
