@@ -593,6 +593,36 @@ private:
     // identity, identity-keyed enforcement wakes (the PEX dormant gate).
     bool sec_enforcement_armed_ = false;
 
+    // ── Dandelion++ M3 (owner-directed 19.11; privacy payload classes
+    // only — SGMT_REG/STEALTH; blocks/SEC/CERT never stem) ───────────────
+    // EPOCH stem channels (the "++" essence): the stem peer set is FIXED
+    // per epoch (~5-10 min), not per transaction — a Sybil cannot
+    // statistically recover the originator across a transaction series.
+    static constexpr size_t kDandelionStemPeers = 2;
+    static constexpr uint64_t kDandelionEpochMs = 5 * 60 * 1000;
+    static constexpr size_t kDandelionSeenCap = 4096;
+    static constexpr uint64_t kDandelionSeenTtlMs = 10 * 60 * 1000;
+    static constexpr uint64_t kDandelionEmbargoMs = 45 * 1000;
+    std::vector<int> dandelion_stem_fds_; // this epoch's stems
+    uint64_t dandelion_epoch_deadline_ms_ = 0;
+    // digest → { embargo deadline ms, payload }. The relay decision is a
+    // per-hop coin-flip (geometric path length); the deadline passed =
+    // self-fluff (embargo timer, the black-hole guard).
+    struct DandelionState {
+        uint64_t embargo_deadline_ms = 0;
+        // Embargo self-fluff needs the payload: a stem chain that dies at a
+        // black-hole hop must not lose the transaction (availability over
+        // privacy — the same trade as Monero's embargo timer).
+        WireMsgType type = WireMsgType::DKSAP_SGMT_REG;
+        std::vector<uint8_t> payload;
+    };
+    std::map<std::array<uint8_t, 32>, DandelionState> dandelion_state_;
+    // Seen-digest set: a digest returning to us in stem phase = a LOOP —
+    // immediate fluff (never relay a second time). Value = expiry ms.
+    std::map<std::array<uint8_t, 32>, uint64_t> dandelion_seen_;
+    // FIFO order for the seen cap (4096): evict-oldest at insertion.
+    std::deque<std::array<uint8_t, 32>> dandelion_seen_order_;
+
     /// Seals the outgoing payload in place for a secured fd. Returns false
     /// (payload untouched) when no channel exists — legacy passthrough.
     bool sec_seal_out(int fd, const WireHeader &ad_hdr, std::vector<uint8_t> &payload);
@@ -643,6 +673,20 @@ public:
     void set_loopback_candidates_allowed_for_test(bool allowed) noexcept {
         loopback_candidates_allowed_ = allowed;
     }
+
+    /// Dandelion++ M3 (owner-directed 19.11): epoch maintenance (called from
+    /// gossip_loop ticks): regenerate the stem peer set when the epoch
+    /// expires; fire embargo self-fluffs for expired stem entries.
+    void dandelion_tick();
+
+    /// The stem/fluff decision + relay for a privacy-class payload digest.
+    /// Returns true when the caller must SKIP the normal broadcast (the
+    /// payload was stemmed to one peer); false = normal broadcast (fluff
+    /// or a non-privacy type). The sender fd is excluded from relay picks.
+    /// Public: the wire dispatch sites call it; tests exercise the
+    /// decision contract directly.
+    bool dandelion_on_sidecar(int origin_fd, const std::array<uint8_t, 32> &digest,
+                              WireMsgType type, const std::vector<uint8_t> &payload);
 
 private:
     // Handshake/ADDRS helpers shared by both connection loops.

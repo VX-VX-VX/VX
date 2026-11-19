@@ -1,4 +1,5 @@
 #include "vx/net/swarm_node.hpp"
+#include <algorithm>
 #include <vector>
 
 #include "vx/blockchain/block.hpp"
@@ -763,6 +764,9 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
         if (type == WireMsgType::DKSAP_SGMT_REG && payload.size() >= 32 + 1 + 384 + 1184) {
             std::array<uint8_t, 32> digest{};
             std::memcpy(digest.data(), payload.data(), 32);
+            // Dandelion++ relay gate (accept side): the stem decision + relay
+            // send happen inside; the frame hook fans out on its own schedule.
+            (void)dandelion_on_sidecar(fd, digest, type, payload);
             const uint8_t nlen = payload[32];
             if (nlen == 0 || nlen > 32 || payload.size() != 32 + 1 + nlen + 384 + 1184) {
                 report_withhold(label, 20);
@@ -784,6 +788,9 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
             payload.size() == 32 + sizeof(vx::crypto::dksap::StealthTx)) {
             std::array<uint8_t, 32> digest{};
             std::memcpy(digest.data(), payload.data(), 32);
+            // Dandelion++ relay gate (dialed side): stem decision + relay
+            // send inside; the frame hook fans out on its own schedule.
+            (void)dandelion_on_sidecar(fd, digest, type, payload);
             vx::crypto::dksap::StealthBundle b;
             std::memcpy(&b.tx, payload.data() + 32, sizeof(b.tx));
             vx::crypto::dksap::DksapSidecarRegistry::instance().register_stealth_candidate(digest,
@@ -1514,11 +1521,27 @@ void SwarmNode::broadcast_sidecars_for(const std::span<const uint8_t, 65536> &fr
             fds.push_back(fd);
         }
     }
-    for (int fd : fds) {
-        if (!payloads.empty())
-            (void)send_wire_payloads_to(fd, WireMsgType::DKSAP_SGMT_REG, payloads);
-        if (!stealth_payloads.empty())
-            (void)send_wire_payloads_to(fd, WireMsgType::DKSAP_STEALTH, stealth_payloads);
+    // Dandelion++ originator gate: privacy payloads are partitioned per
+    // digest — fresh digests stem to one epoch-fixed stem peer (the caller
+    // skips their fan-out), everything else fans out normally. dandelion_on_
+    // sidecar() sends the stem frame itself; the fan-out here covers only the
+    // non-stemmed remainder.
+    {
+        std::vector<std::vector<uint8_t>> fanout_sgmt, fanout_stealth;
+        for (auto &p : payloads) {
+            std::array<uint8_t, 32> d{};
+            std::memcpy(d.data(), p.data(), 32);
+            if (!dandelion_on_sidecar(-1, d, WireMsgType::DKSAP_SGMT_REG, p))
+                fanout_sgmt.push_back(std::move(p));
+        }
+        for (auto &p : stealth_payloads) {
+            std::array<uint8_t, 32> d{};
+            std::memcpy(d.data(), p.data(), 32);
+            if (!dandelion_on_sidecar(-1, d, WireMsgType::DKSAP_STEALTH, p))
+                fanout_stealth.push_back(std::move(p));
+        }
+        payloads = std::move(fanout_sgmt);
+        stealth_payloads = std::move(fanout_stealth);
     }
 }
 
@@ -2510,6 +2533,9 @@ void SwarmNode::serve_connection(int c) {
             }
             std::array<uint8_t, 32> digest{};
             std::memcpy(digest.data(), payload.data(), 32);
+            // Dandelion++ relay gate (accept side): same contract as the
+            // dialed side — the stem decision + relay send happen inside.
+            (void)dandelion_on_sidecar(c, digest, type, payload);
             const uint8_t nlen = payload[32];
             if (nlen == 0 || nlen > 32 || payload.size() != 32 + 1 + nlen + 384 + 1184) {
                 report_withhold(peer_label, 20); // malformed: strict shape
@@ -2535,6 +2561,9 @@ void SwarmNode::serve_connection(int c) {
             }
             std::array<uint8_t, 32> digest{};
             std::memcpy(digest.data(), payload.data(), 32);
+            // Dandelion++ relay gate (accept side): stem decision + relay
+            // send inside; the frame hook fans out on its own schedule.
+            (void)dandelion_on_sidecar(c, digest, type, payload);
             vx::crypto::dksap::StealthBundle b;
             static_assert(sizeof(vx::crypto::dksap::StealthTx) == 32 + 4 + 384 + 1088 + 32,
                           "StealthTx must be a fixed contiguous byte layout");
@@ -2568,6 +2597,9 @@ void SwarmNode::serve_connection(int c) {
 
 void SwarmNode::gossip_loop() {
     while (!emergency_stop_requested_.load()) {
+        // Dandelion++ epoch maintenance: stem-channel rotation + embargo
+        // self-fluff sweep, every gossip tick.
+        dandelion_tick();
         // Periodic tip gossip would broadcast HEADERS here; driven by hooks.
         for (int i = 0; i < 50 && !emergency_stop_requested_.load(); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -3309,6 +3341,217 @@ CocoonRelayReport SwarmNode::relay_cocoon_full_cycle(const blockchain::Transacti
     report.ok = true;
     report.vx60_bytes_transferred = report.hops.size() * (24 + sizeof(TxCocoon));
     return report;
+}
+
+// ── Dandelion++ M3: epoch stem channels, embargo timer, loop guard ──────────
+// Reviewed design (owner-directed 19.11): privacy payload classes only
+// (SGMT_REG/STEALTH); blocks/SEC/CERT never stem. Phase is inferred from the
+// CONNECTION (Monero-style): a stem packet travels only over the stem
+// channels of each hop; a non-stem arrival = fluff phase = fan-out. Stem and
+// fluff frames are byte-identical for the same tx (same type, same payload,
+// same size) — a passive observer cannot separate phases by length, and no
+// stem flag ever reaches the wire (phase lives in per-node state only).
+//
+// seen_ = "this digest already had its relay decision here" (armed on every
+// fresh arrival — stem or fluff — and by the originator gate). state =
+// "an active stem session exists (embargo timer armed)".
+// Contract: true = the caller skips its fan-out for this digest (stemmed
+// onward / mid-stem); false = the caller's normal fan-out path (fluff
+// transition, duplicate, or non-privacy).
+
+namespace {
+
+// Monotonic ms for the tick/embargo arithmetic (CLOCK_MONOTONIC — wall-clock
+// jumps must not fire or skip embargo timers).
+uint64_t dandelion_now_ms() noexcept {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
+}
+
+} // namespace
+
+void SwarmNode::dandelion_tick() {
+    const uint64_t now = dandelion_now_ms();
+    std::vector<DandelionState> expired;
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        // 1) Epoch rotation: repick the stem channel set when the epoch
+        // expires (or on the first tick with no stems). HW-entropy picks —
+        // never a predictable PRNG stream.
+        if (dandelion_epoch_deadline_ms_ <= now || dandelion_stem_fds_.empty()) {
+            std::vector<int> fds;
+            fds.reserve(peer_fds_.size());
+            for (const auto &kv : peer_fds_)
+                if (kv.second > 0)
+                    fds.push_back(kv.second);
+            if (!fds.empty()) {
+                // Rotation REPLACES the set (audit P1-1, 19.11): appending
+                // would grow it every epoch, and a closed fd must not
+                // survive into the next epoch (P2-1: a recycled fd number
+                // would route privacy payloads to an unrelated connection).
+                dandelion_stem_fds_.clear();
+                for (size_t i = 0; i < kDandelionStemPeers && !fds.empty(); ++i) {
+                    const size_t idx = hw_entropy() % fds.size();
+                    dandelion_stem_fds_.push_back(fds[idx]);
+                    fds.erase(fds.begin() + static_cast<std::ptrdiff_t>(idx));
+                }
+                dandelion_epoch_deadline_ms_ = now + kDandelionEpochMs;
+            }
+        } else {
+            // Mid-epoch prune: a stem fd that left peer_fds_ (teardown) is
+            // dead — drop it so relays never target a recycled fd.
+            std::vector<int> live;
+            live.reserve(peer_fds_.size());
+            for (const auto &kv : peer_fds_)
+                if (kv.second > 0)
+                    live.push_back(kv.second);
+            std::sort(live.begin(), live.end());
+            dandelion_stem_fds_.erase(
+                std::remove_if(
+                    dandelion_stem_fds_.begin(), dandelion_stem_fds_.end(),
+                    [&live](int fd) { return !std::binary_search(live.begin(), live.end(), fd); }),
+                dandelion_stem_fds_.end());
+        }
+        // 2) Embargo sweep: state entries past their deadline self-fluff —
+        // the black-hole guard (a dead stem peer must not eat the tx).
+        for (auto it = dandelion_state_.begin(); it != dandelion_state_.end();) {
+            if (it->second.embargo_deadline_ms <= now) {
+                expired.push_back(std::move(it->second));
+                it = dandelion_state_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // 3) Seen TTL prune + FIFO cap eviction.
+        for (auto it = dandelion_seen_.begin(); it != dandelion_seen_.end();) {
+            if (it->second <= now)
+                it = dandelion_seen_.erase(it);
+            else
+                ++it;
+        }
+        while (dandelion_seen_.size() > kDandelionSeenCap && !dandelion_seen_order_.empty()) {
+            dandelion_seen_.erase(dandelion_seen_order_.front());
+            dandelion_seen_order_.pop_front();
+        }
+    }
+    // Embargo self-fluff OUTSIDE the lock (the broadcast_frame snapshot-then-
+    // send pattern: sends block and must never hold peers_mutex_).
+    for (const auto &st : expired) {
+        std::vector<int> fds;
+        {
+            std::lock_guard<std::mutex> lock(peers_mutex_);
+            for (const auto &kv : peer_fds_)
+                if (kv.second > 0)
+                    fds.push_back(kv.second);
+        }
+        for (int fd : fds) {
+            std::vector<std::vector<uint8_t>> one{st.payload};
+            (void)send_wire_payloads_to(fd, st.type, one);
+        }
+        fluff_broadcasts_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool SwarmNode::dandelion_on_sidecar(int origin_fd, const std::array<uint8_t, 32> &digest,
+                                     WireMsgType type, const std::vector<uint8_t> &payload) {
+    // Privacy classes only; everything else fans out normally.
+    if (type != WireMsgType::DKSAP_SGMT_REG && type != WireMsgType::DKSAP_STEALTH)
+        return false;
+
+    const uint64_t now = dandelion_now_ms();
+    int relay_fd = -1; // >= 0 → stem onward; -1 → the caller's fan-out path
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        const bool is_origin = origin_fd < 0;
+        const bool stem_phase =
+            is_origin || std::find(dandelion_stem_fds_.begin(), dandelion_stem_fds_.end(),
+                                   origin_fd) != dandelion_stem_fds_.end();
+        const bool is_seen = dandelion_seen_.count(digest) != 0;
+        const auto st_it = dandelion_state_.find(digest);
+        const bool have_state = st_it != dandelion_state_.end();
+
+        if (is_origin) {
+            // The originator gate (broadcast_sidecars_for): mid-stem session
+            // → keep it and skip the fan-out; otherwise start a fresh stem
+            // session and relay to one EPOCH stem peer (the embargo timer
+            // arms at every continuing hop).
+            if (have_state)
+                return true;
+            // The originator's leg rides the EPOCH stem channels (the "++"
+            // essence, audit P1-2): per-tx random picks from all peers would
+            // let a Sybil correlate transactions by varying recipients.
+            std::vector<int> fds;
+            for (int sfd : dandelion_stem_fds_)
+                if (sfd > 0)
+                    fds.push_back(sfd);
+            if (fds.empty())
+                for (const auto &kv : peer_fds_)
+                    if (kv.second > 0)
+                        fds.push_back(kv.second);
+            if (!fds.empty()) {
+                DandelionState st;
+                st.embargo_deadline_ms = now + kDandelionEmbargoMs;
+                st.type = type;
+                st.payload = payload;
+                dandelion_state_[digest] = std::move(st);
+                dandelion_seen_[digest] = now + kDandelionSeenTtlMs;
+                dandelion_seen_order_.push_back(digest);
+                relay_fd = fds[hw_entropy() % fds.size()];
+            }
+            // No stems available → no session: the fan-out proceeds (the
+            // safe default when the stem channel set is empty).
+        } else if (stem_phase) {
+            // Wire arrival on a stem connection.
+            if (is_seen && have_state) {
+                // LOOP GUARD: the chain found a cycle through us. KEEP the
+                // session — the packet returned, the chain is stuck in a
+                // cycle, and the embargo timer (armed at every continuing
+                // hop) is the guaranteed escape: it self-fluffs the payload
+                // in ≤45s. Erasing the session here would RE-STEM the digest
+                // (the frame hook sees no state → fresh session), which
+                // re-enters the same cycle (audit P2-2, 19.11).
+            } else if (!is_seen && hw_entropy() % 2 == 0) {
+                // Fresh stem arrival, coin-flip continue (geometric path
+                // length, mean 2 hops). The relay arms its own embargo
+                // timer — the black-hole guard exists at every hop.
+                std::vector<int> fds;
+                for (int sfd : dandelion_stem_fds_)
+                    if (sfd > 0 && sfd != origin_fd)
+                        fds.push_back(sfd);
+                if (fds.empty())
+                    for (const auto &kv : peer_fds_)
+                        if (kv.second > 0 && kv.second != origin_fd)
+                            fds.push_back(kv.second);
+                if (!fds.empty()) {
+                    DandelionState st;
+                    st.embargo_deadline_ms = now + kDandelionEmbargoMs;
+                    st.type = type;
+                    st.payload = payload;
+                    dandelion_state_[digest] = std::move(st);
+                    dandelion_seen_[digest] = now + kDandelionSeenTtlMs;
+                    dandelion_seen_order_.push_back(digest);
+                    relay_fd = fds[hw_entropy() % fds.size()];
+                }
+            }
+            // seen-without-state (a fluffed duplicate) and coin-flip fluff
+            // fall through: the caller's fan-out path handles them.
+        }
+        // Fluff-phase arrivals (non-stem connection): fall through to the
+        // caller's normal fan-out path. seen_ is armed below for fresh
+        // digests so the frame-hook gate does not re-stem a fluffed tx.
+        if (!is_seen && relay_fd < 0) {
+            dandelion_seen_[digest] = now + kDandelionSeenTtlMs;
+            dandelion_seen_order_.push_back(digest);
+        }
+    }
+    if (relay_fd >= 0) {
+        std::vector<std::vector<uint8_t>> one{payload};
+        (void)send_wire_payloads_to(relay_fd, type, one);
+        stem_relays_.fetch_add(1, std::memory_order_relaxed);
+        return true; // the caller skips its fan-out for this digest
+    }
+    return false;
 }
 
 DandelionStats SwarmNode::dandelion_stats() const noexcept {

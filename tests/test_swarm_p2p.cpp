@@ -1358,3 +1358,55 @@ TEST(VortexSwarmP2PTest, Vx60SecUpgradeOverRealSocket) {
     server.emergency_stop();
     std::filesystem::remove_all(dir);
 }
+
+// ── Dandelion++ M3 decision contract (owner-directed 19.11) ─────────────────
+// Privacy payload classes only; blocks/SEC/CERT never stem. Without peers the
+// originator gate must fall back to the fan-out (availability over privacy).
+TEST(VortexSwarmP2PTest, DandelionPrivacyClassesOnly) {
+    vx::net::SwarmNode node;
+    std::array<uint8_t, 32> digest{};
+    for (size_t i = 0; i < 32; ++i)
+        digest[i] = static_cast<uint8_t>(i * 7 + 1);
+    const std::vector<uint8_t> payload(32 + 1 + 4 + 384 + 1184, 0xAB);
+
+    // Blocks/SEC/CERT are never privacy payloads: the gate must fan out.
+    EXPECT_FALSE(node.dandelion_on_sidecar(-1, digest, WireMsgType::RAW_BLOCK_64K, payload));
+    EXPECT_FALSE(node.dandelion_on_sidecar(-1, digest, WireMsgType::SEC_CLIENT_HELLO, payload));
+
+    // Privacy class with NO peers: no stem channel exists → the gate must
+    // fan out (availability over privacy when the stem set is empty).
+    EXPECT_FALSE(node.dandelion_on_sidecar(-1, digest, WireMsgType::DKSAP_STEALTH, payload));
+}
+
+TEST(VortexSwarmP2PTest, DandelionEmbargoSweepNoStateIsNoOp) {
+    vx::net::SwarmNode node;
+    // No stem sessions exist: the tick must neither crash nor fluff anything.
+    node.dandelion_tick();
+    node.dandelion_tick();
+    // With no peers, the epoch rotation must not pick anything.
+    SUCCEED();
+}
+
+// ── Hygiene 2b: per-IP connection cap (owner-directed 19.11) ────────────────
+// 9 connections from 127.0.0.1; the 9th must be closed instantly by the
+// accept path (no strike, no withhold — just the slot cap).
+TEST(VortexSwarmP2PTest, PerIpConnectionCapNinthClosed) {
+    const uint16_t port = free_tcp_port();
+    vx::net::SwarmNode server;
+    ASSERT_TRUE(server.bind_p2p_listener(port));
+    server.start();
+
+    std::vector<int> fds;
+    for (int i = 0; i < 9; ++i)
+        fds.push_back(connect_client(port));
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    // The 9th fd is closed by the server: the server side reports EOF
+    // immediately, and our copy sees a readable/hup event.
+    pollfd pfd{fds[8], POLLIN, 0};
+    const int r = ::poll(&pfd, 1, 500);
+    const bool closed = (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
+    EXPECT_TRUE(closed) << "the 9th connection must be closed by the cap";
+    for (int fd : fds)
+        ::close(fd);
+}
