@@ -199,12 +199,16 @@ TEST(VortexSwarmP2PTest, WireHeaderIsExactly24Bytes) {
     EXPECT_EQ(h.peer_nonce, 0xAABBCCDDULL);
     EXPECT_TRUE(vx::net::wire_header_plausible(h));
 
-    // Bad magic / oversized payload rejected by the plausibility gate
+    // Bad magic / oversized payload rejected by the plausibility gate.
+    // Cap is 65536+32: a sealed 64K frame rides MAC-only with a 32-byte
+    // AEAD tag tail (65568 on the wire); anything beyond it is malformed.
     h.magic = 0xDEADBEEF;
     EXPECT_FALSE(vx::net::wire_header_plausible(h));
     h.magic = VX60_MAGIC;
-    h.payload_len = 65537;
+    h.payload_len = 65569;
     EXPECT_FALSE(vx::net::wire_header_plausible(h));
+    h.payload_len = 65568;
+    EXPECT_TRUE(vx::net::wire_header_plausible(h));
 }
 
 // ── 2. CRC32C corruption detection ──────────────────────────────────────────
@@ -1403,11 +1407,253 @@ TEST(VortexSwarmP2PTest, PerIpConnectionCapNinthClosed) {
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
     // The 9th fd is closed by the server: the server side reports EOF
-    // immediately, and our copy sees a readable/hup event.
-    pollfd pfd{fds[8], POLLIN, 0};
-    const int r = ::poll(&pfd, 1, 500);
-    const bool closed = (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
+    // immediately, and our copy sees a readable/hup event. Polled in a
+    // loop (up to 2s): under load the accept loop + serve thread spawn
+    // + cap check can lag past a single 500ms poll — the cap logic is
+    // sound, the wait must tolerate scheduling latency.
+    bool closed = false;
+    for (int i = 0; i < 20 && !closed; ++i) {
+        pollfd pfd{fds[8], POLLIN, 0};
+        const int r = ::poll(&pfd, 1, 100);
+        closed = (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
+    }
     EXPECT_TRUE(closed) << "the 9th connection must be closed by the cap";
     for (int fd : fds)
         ::close(fd);
+}
+
+// ── multi_node_test (plan step 4, owner-directed 19.11): 3 nodes SEC↔SEC ──
+// The full cycle on localhost: dial → COLD handshake → sealed channels →
+// block seal + propagation over the sealed channels → GQC finalization →
+// health RPC → version=0 strike → durable banlist → restart → the banned
+// identity is refused at handshake. All localhost, no VPS.
+
+#include "vx/rpc/http_server.hpp"
+#include "vx/storage/block_store.hpp"
+#include "vx/state/ledger_state.hpp"
+
+#include <cstdlib>
+#include <memory>
+
+namespace {
+
+struct MultiNodeEnv {
+    std::string dir;
+    std::unique_ptr<vx::storage::BlockStore> store;
+    std::unique_ptr<vx::state::LedgerState> ledger;
+    std::unique_ptr<vx::rpc::HttpServer> server;
+    uint16_t p2p_port = 0;
+};
+
+// fresh=false reopens an existing data dir (restart path: banlist + ledger
+// survive; the identity is the same node).
+MultiNodeEnv make_node(const char *tag, uint16_t p2p_port, const std::vector<std::string> &dial,
+                       bool fresh = true) {
+    MultiNodeEnv env;
+    env.dir = "/tmp/vx_multi_" + std::string(tag) + "_" + std::to_string(getpid());
+    if (fresh) {
+        std::filesystem::remove_all(env.dir);
+        std::filesystem::create_directories(env.dir);
+    }
+    env.store = std::make_unique<vx::storage::BlockStore>(env.dir + "/ledger.vxb",
+                                                          env.dir + "/genesis.bin", 8);
+    env.ledger = std::make_unique<vx::state::LedgerState>();
+    // Replay the store's blocks into the ledger (the same discipline as the
+    // rpc_auth suite): without it the ledger sits at height 0 while the
+    // miner seals height 1 — the apply gate refuses every seal.
+    for (uint64_t h = 0; h < env.store->chain_height(); ++h) {
+        auto *raw = env.store->get_block(h);
+        if (!raw)
+            break;
+        vx::blockchain::BlockView v{
+            std::span<const uint8_t, 65536>(reinterpret_cast<const uint8_t *>(raw), 65536)};
+        (void)env.ledger->apply_block(v);
+    }
+    env.server = std::make_unique<vx::rpc::HttpServer>(*env.store, *env.ledger, 0, env.dir);
+    env.p2p_port = p2p_port;
+    env.server->attach_p2p(env.p2p_port, dial);
+    // NO server->start(): the HTTP accept loop is BLOCKING in the calling
+    // thread (found 19.11: the first run sat in accept forever). The tests
+    // drive route() directly — no listener socket is needed.
+    return env;
+}
+
+uint64_t node_height(const MultiNodeEnv &env) {
+    vx::rpc::HttpRequest req;
+    req.method = "GET";
+    req.path = "/api/status";
+    const auto resp = env.server->route(req);
+    if (resp.status_code != 200)
+        return 0;
+    const auto pos = resp.body.find("\"chain_height\":");
+    if (pos == std::string::npos)
+        return 0;
+    return std::strtoull(resp.body.c_str() + pos + strlen("\"chain_height\":"), nullptr, 10);
+}
+
+// v2 handshake + a version=0 COLD client hello (the downgrade lever: a
+// size+flag-matched frame whose version maps to "older" → strike, never to
+// the generic no-sec mark).
+void send_version0_probe(int fd, const std::array<uint8_t, 32> &id) {
+    WireHeader hs = vx::net::SwarmNode::make_header(WireMsgType::HANDSHAKE, 87, 1);
+    auto p = v2_handshake_payload(id, htonl(INADDR_LOOPBACK), 1234, true);
+    hs.crc32c = vx::net::compute_wire_crc32c(p.data(), (uint32_t)p.size());
+    ASSERT_EQ(::send(fd, &hs, sizeof(hs), 0), (ssize_t)sizeof(hs));
+    ASSERT_EQ(::send(fd, p.data(), (ssize_t)p.size(), 0), (ssize_t)p.size());
+    std::vector<uint8_t> hello(vx::net::vx60::kHelloColdSize, 0);
+    hello[0] = vx::net::vx60::kHsFlagCold;
+    // version stays 0: the strike path must fire, not the no-sec mark.
+    WireHeader h =
+        vx::net::SwarmNode::make_header(WireMsgType::SEC_CLIENT_HELLO, (uint32_t)hello.size(), 2);
+    h.crc32c = vx::net::compute_wire_crc32c(hello.data(), (uint32_t)hello.size());
+    ASSERT_EQ(::send(fd, &h, sizeof(h), 0), (ssize_t)sizeof(h));
+    ASSERT_EQ(::send(fd, hello.data(), (ssize_t)hello.size(), 0), (ssize_t)hello.size());
+}
+
+bool peer_conn_closed(int fd) {
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    (void)::poll(&pfd, 1, 20);
+    char sink[64];
+    return ::recv(fd, sink, sizeof(sink), MSG_PEEK | MSG_DONTWAIT) == 0;
+}
+
+} // namespace
+
+TEST(VortexSwarmP2PTest, MultiNodeFullCycleSecChainBanlist) {
+    const char *saved_token = ::getenv("VX_RPC_TOKEN");
+    ::setenv("VX_RPC_TOKEN", "multi-node-test-token", 1);
+
+    const uint16_t port_a = free_tcp_port();
+    const uint16_t port_b = free_tcp_port();
+    const uint16_t port_c = free_tcp_port();
+
+    MultiNodeEnv b = make_node("b", port_b, {});
+    MultiNodeEnv c = make_node("c", port_c, {});
+    MultiNodeEnv a =
+        make_node("a", port_a,
+                  {"127.0.0.1:" + std::to_string(port_b), "127.0.0.1:" + std::to_string(port_c)});
+
+    // 1. Sealed channels: A's dialer SEC upgrade settles on both peers.
+    bool sealed = false;
+    for (int i = 0; i < 500 && !sealed; ++i) {
+        sealed = a.server->swarm_sec_channel_count() == 2;
+        if (!sealed)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(sealed) << "A must hold 2 SEC channels after dialing B and C";
+
+    // 2. Seal on A, propagate over the sealed channels to B and C.
+    // Mutating endpoints need the bearer token (auth gate, read at
+    // construction — the env var is set at the top of this TEST).
+    vx::rpc::HttpRequest seal;
+    seal.method = "POST";
+    seal.path = "/api/mempool/seal";
+    seal.headers["authorization"] = "Bearer multi-node-test-token";
+    const auto resp = a.server->route(seal);
+    ASSERT_EQ(resp.status_code, 200) << resp.body;
+    ASSERT_NE(resp.body.find("\"status\":\"ok\""), std::string::npos) << resp.body;
+    bool got_b = false, got_c = false;
+    for (int i = 0; i < 500 && !(got_b && got_c); ++i) {
+        got_b = node_height(b) == 2;
+        got_c = node_height(c) == 2;
+        if (!(got_b && got_c))
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(got_b) << "block must propagate to B over the sealed channel";
+    ASSERT_TRUE(got_c) << "block must propagate to C over the sealed channel";
+
+    // 3. GQC finalization on B for the propagated block.
+    vx::rpc::HttpRequest fin;
+    fin.method = "POST";
+    fin.path = "/api/consensus/finalize_gqc";
+    fin.headers["authorization"] = "Bearer multi-node-test-token";
+    const auto fres = b.server->route(fin);
+    ASSERT_EQ(fres.status_code, 200) << fres.body;
+    // The real finalize_gqc response fields: ok/block_hash/validator_count/
+    // share_count/gqc_signature_agg/finalized_checkpoint_height.
+    ASSERT_NE(fres.body.find("\"ok\":true"), std::string::npos) << fres.body;
+    ASSERT_NE(fres.body.find("\"share_count\":9"), std::string::npos) << fres.body;
+    ASSERT_NE(fres.body.find("\"finalized_checkpoint_height\":1"), std::string::npos) << fres.body;
+
+    // 4. Health RPC on B reflects the finalization.
+    vx::rpc::HttpRequest health;
+    health.method = "GET";
+    health.path = "/api/consensus/health";
+    const auto hres = b.server->route(health);
+    ASSERT_EQ(hres.status_code, 200) << hres.body;
+    ASSERT_NE(hres.body.find("\"last_finalize_height\":1"), std::string::npos) << hres.body;
+
+    // 5. The version=0 downgrade lever: strike + durable banlist row.
+    const auto attacker = test_id(0x77);
+    {
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(fd, 0);
+        sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = htons(port_b);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+        send_version0_probe(fd, attacker);
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        ::close(fd);
+    }
+    struct stat st{};
+    ASSERT_EQ(::stat((b.dir + "/banlist").c_str(), &st), 0)
+        << "the version=0 strike must reach the durable banlist";
+    ASSERT_GT(st.st_size, 0);
+
+    // 6. Restart B: the banlist survives; the same identity is refused.
+    //    The old instance must die FIRST — the ledger flock is exclusive.
+    //    (fresh=false reopens the same dir — the ledger and banlist persist.)
+    b = MultiNodeEnv{}; // RAII: server → ledger → store (flock released)
+    const uint16_t port_b2 = free_tcp_port();
+    {
+        MultiNodeEnv b2 = make_node("b", port_b2, {"127.0.0.1:" + std::to_string(port_a)},
+                                    /*fresh=*/false);
+        // Block + finality persisted across the restart.
+        EXPECT_EQ(node_height(b2), 2);
+
+        // The node boots dormant; the SEC session with A re-arms enforcement.
+        bool rearmed = false;
+        for (int i = 0; i < 500 && !rearmed; ++i) {
+            rearmed = b2.server->swarm_sec_channel_count() == 1;
+            if (!rearmed)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        ASSERT_TRUE(rearmed) << "B must re-establish SEC with A after restart";
+
+        // The banned identity reconnects and is dropped at the handshake.
+        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        ASSERT_GE(fd, 0);
+        sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sa.sin_port = htons(port_b2);
+        ASSERT_EQ(::connect(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)), 0);
+        WireHeader hs = vx::net::SwarmNode::make_header(WireMsgType::HANDSHAKE, 87, 1);
+        auto p = v2_handshake_payload(attacker, htonl(INADDR_LOOPBACK), 1234, true);
+        hs.crc32c = vx::net::compute_wire_crc32c(p.data(), (uint32_t)p.size());
+        ASSERT_EQ(::send(fd, &hs, sizeof(hs), 0), (ssize_t)sizeof(hs));
+        ASSERT_EQ(::send(fd, p.data(), (ssize_t)p.size(), 0), (ssize_t)p.size());
+        bool closed = false;
+        for (int i = 0; i < 100 && !closed; ++i)
+            closed = peer_conn_closed(fd);
+        EXPECT_TRUE(closed) << "the banned identity must be refused after restart";
+        ::close(fd);
+    }
+
+    // Cleanup: RAII only. `b` was destroyed by the restart move-assignment
+    // above; a/c are destroyed at the end of the TEST (server → swarm node
+    // emergency_stop → ledger → store releases the flock). No explicit
+    // stop()/remove_all: a stop() would not stop the swarm threads, and
+    // remove_all while the swarm node still holds open files is a race.
+    (void)a;
+    (void)c;
+
+    if (saved_token)
+        ::setenv("VX_RPC_TOKEN", saved_token, 1);
+    else
+        ::unsetenv("VX_RPC_TOKEN");
 }

@@ -143,6 +143,10 @@ public:
     void attach_p2p(uint16_t p2p_port, const std::vector<std::string> &peer_endpoints,
                     const std::vector<std::string> &seed_hosts = {});
 
+    // multi_node_test (plan step 4): live SEC-channel count on the swarm
+    // node (0 when P2P is not attached).
+    size_t swarm_sec_channel_count() const;
+
     // Apply a block frame that arrived over VX60. Accepts a frame only when
     // it extends the current tip (height == chain_height and prev_block_hash
     // == tip hash); anything else is dropped. On success the frame is

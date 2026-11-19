@@ -166,7 +166,11 @@ bool wire_header_plausible(const WireHeader &h) noexcept {
         return false;
     if (h.reserved != 0)
         return false;
-    if (h.payload_len > 65536)
+    // +32: the MAC-only AEAD tag tail of a sealed 64K frame (RAW_BLOCK_64K
+    // rides MAC-only over SEC channels — public consensus data, no
+    // encryption). 65536+32 is the wire maximum; anything beyond it is a
+    // malformed header.
+    if (h.payload_len > 65536 + 32)
         return false;
     const uint8_t t = h.msg_type;
     // 0x0D = ADDRS (peer discovery, one-shot push after the v2 handshake);
@@ -1113,21 +1117,12 @@ bool SwarmNode::send_frame_to_peer(int fd, const std::span<const uint8_t, 65536>
     WireHeader hdr = make_header(WireMsgType::RAW_BLOCK_64K, 65536, session_nonce_.fetch_add(1),
                                  WIRE_FLAG_ZERO_COPY);
     hdr.crc32c = compute_wire_crc32c(frame.data(), frame.size());
-    ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-    if (n != static_cast<ssize_t>(sizeof(hdr)))
-        return false;
-    size_t off = 0;
-    while (off < frame.size()) {
-        n = ::send(fd, frame.data() + off, frame.size() - off, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR)
-                continue;
-            return false;
-        }
-        off += static_cast<size_t>(n);
-    }
-    vx60_bytes_transferred_.fetch_add(sizeof(hdr) + frame.size());
-    return true;
+    // Route through send_packet, NOT raw ::send: on a SEC fd the frame goes
+    // out MAC-only sealed (tag appended, payload_len 65536+32) — a raw send
+    // would ship unauthenticated bytes over a secured channel and the peer
+    // would drop the connection on its first open attempt. On a legacy fd
+    // send_packet is a byte-identical passthrough.
+    return send_packet(fd, hdr, frame.data()) != 0;
 }
 
 void SwarmNode::broadcast_frame(const std::span<const uint8_t, 65536> &frame) {
@@ -1257,19 +1252,10 @@ bool SwarmNode::send_id_list_to(int fd, WireMsgType type,
     WireHeader hdr =
         make_header(type, static_cast<uint32_t>(payload.size()), session_nonce_.fetch_add(1));
     hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
-    if (::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(hdr)))
-        return false;
-    size_t off = 0;
-    while (off < payload.size()) {
-        const ssize_t n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR)
-                continue;
-            return false;
-        }
-        off += static_cast<size_t>(n);
-    }
-    return true;
+    // Route through send_packet: on a SEC fd the id list rides sealed —
+    // raw ::send would ship unauthenticated bytes and the peer would drop
+    // the connection on its first open attempt. Legacy fds: passthrough.
+    return send_packet(fd, hdr, payload.data()) != 0;
 }
 
 // Sends FULL certificate records (the ROLLOVER_CERT payload layout) on one
@@ -1285,18 +1271,9 @@ bool SwarmNode::send_cert_payloads_to(
             make_header(WireMsgType::ROLLOVER_CERT, static_cast<uint32_t>(payload.size()),
                         session_nonce_.fetch_add(1));
         hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
-        if (::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL) != static_cast<ssize_t>(sizeof(hdr)))
+        // send_packet: sealed on SEC fds (see send_id_list_to).
+        if (send_packet(fd, hdr, payload.data()) == 0)
             return false;
-        size_t off = 0;
-        while (off < payload.size()) {
-            const ssize_t n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR)
-                    continue;
-                return false;
-            }
-            off += static_cast<size_t>(n);
-        }
     }
     return true;
 }
@@ -1404,19 +1381,9 @@ bool SwarmNode::send_payloads_to(
         WireHeader hdr = make_header(WireMsgType::PQ_WITNESS, static_cast<uint32_t>(payload.size()),
                                      session_nonce_.fetch_add(1));
         hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
-        ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-        if (n != static_cast<ssize_t>(sizeof(hdr)))
+        // send_packet: sealed on SEC fds (see send_id_list_to).
+        if (send_packet(fd, hdr, payload.data()) == 0)
             return false;
-        size_t off = 0;
-        while (off < payload.size()) {
-            n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR)
-                    continue;
-                return false;
-            }
-            off += static_cast<size_t>(n);
-        }
     }
     return true;
 }
@@ -1448,19 +1415,9 @@ void SwarmNode::broadcast_rollover_cert(const vx::crypto::pq::PqRolloverCert &ce
             make_header(WireMsgType::ROLLOVER_CERT, static_cast<uint32_t>(payload.size()),
                         session_nonce_.fetch_add(1));
         hdr.crc32c = compute_wire_crc32c(payload.data(), payload.size());
-        ssize_t n = ::send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-        if (n != static_cast<ssize_t>(sizeof(hdr)))
-            continue;
-        size_t off = 0;
-        while (off < payload.size()) {
-            n = ::send(fd, payload.data() + off, payload.size() - off, MSG_NOSIGNAL);
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR)
-                    continue;
-                break;
-            }
-            off += static_cast<size_t>(n);
-        }
+        // send_packet: sealed on SEC fds (see send_id_list_to); fire-and-
+        // forget for a broadcast — a failed send just skips this peer.
+        (void)send_packet(fd, hdr, payload.data());
     }
 }
 

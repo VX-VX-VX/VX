@@ -22,7 +22,6 @@
 #include <cstring>
 #include <deque>
 #include <functional>
-#include <iostream>
 #include <map>
 #include <mutex>
 #include <netinet/in.h>
@@ -365,6 +364,13 @@ public:
     }
     uint64_t vx60_bytes_transferred() const noexcept {
         return vx60_bytes_transferred_.load();
+    }
+    // multi_node_test (plan step 4, owner-directed 19.11): live SEC session
+    // observability — the multi-node full-cycle test polls this to pin that
+    // block propagation rode SEALED channels, not the legacy path.
+    size_t sec_channel_count() const {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        return sec_channels_.size();
     }
     uint32_t wire_magic() const noexcept {
         return VX60_MAGIC;

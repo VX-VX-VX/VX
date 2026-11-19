@@ -275,6 +275,12 @@ void HttpServer::stop() {
 // listener, relay verified inbound block frames into the ledger (tip-extending
 // frames only), and broadcast locally mined blocks to peers.
 
+size_t HttpServer::swarm_sec_channel_count() const {
+    if (!swarm_node_)
+        return 0;
+    return swarm_node_->sec_channel_count();
+}
+
 void HttpServer::attach_p2p(uint16_t p2p_port, const std::vector<std::string> &peer_endpoints,
                             const std::vector<std::string> &seed_hosts) {
     // Peer discovery: the durable node identity must exist before the first
