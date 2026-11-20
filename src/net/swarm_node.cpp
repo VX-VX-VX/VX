@@ -1054,6 +1054,17 @@ bool SwarmNode::send_block_zero_copy(int socket_fd, int ledger_fd, uint64_t bloc
                                      const uint8_t *block_data) {
     if (socket_fd < 0)
         return false;
+    // VX60-SEC M3: a raw sendfile send cannot append the AEAD tag, so on a
+    // SEC fd this raw path would ship unauthenticated bytes and the peer
+    // would drop the connection on its first open attempt. Fail-closed: SEC
+    // fds must route through send_packet (MAC-only sealed). No caller today,
+    // but the method is public — the guard turns the landmine into an
+    // explicit refusal.
+    {
+        std::lock_guard<std::mutex> lock(peers_mutex_);
+        if (sec_channels_.count(socket_fd) != 0)
+            return false;
+    }
 
     WireHeader hdr = make_header(WireMsgType::RAW_BLOCK_64K, 65536, session_nonce_.fetch_add(1),
                                  WIRE_FLAG_ZERO_COPY);
