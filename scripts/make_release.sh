@@ -12,7 +12,10 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 ref="${2:-HEAD}"
-short="$(git rev-parse --short "$ref")"
+# Resolve to the commit: a tag ref would otherwise name the archive after
+# the tag OBJECT hash, which nobody can find with git log. The commit hash
+# is the canonical bind (the tag signature still authenticates it).
+short="$(git rev-parse --short "${ref}^{commit}")"
 out="$1"; mkdir -p "$out"
 zipname="vx-main-${short}.zip"
 
