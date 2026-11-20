@@ -56,7 +56,12 @@ void fuzz_wire(Rng& rng, uint64_t mutations, ChaosReport& rep) {
                 break;
             }
             case 1: { // payload_len overflow beyond the 64K frame budget
-                h.payload_len = WIRE_PAYLOAD + 1 + static_cast<uint32_t>(rng.next() % 4096);
+                // +32: the MAC-only AEAD tag tail (RAW_BLOCK_64K seals to
+                // 65536+32 on the wire — a LEGAL budget since the VX60-SEC
+                // wire audit). Overflow must start BEYOND the real budget,
+                // or the chaos test would count legitimately-sized sealed
+                // headers as "accepted corruption".
+                h.payload_len = WIRE_PAYLOAD + 32 + 1 + static_cast<uint32_t>(rng.next() % 4096);
                 break;
             }
             case 2: { // forged magic
