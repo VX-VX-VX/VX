@@ -18,7 +18,7 @@ independent verification, which remains not performed.
 
 | Version | Supported |
 |---|---|
-| `main` (v0.0.1-alpha) | ✅ |
+| `main` (v0.1.8-beta) | ✅ |
 | anything older | ❌ |
 
 ## Reporting a vulnerability
@@ -46,14 +46,21 @@ In scope:
 - post-quantum signature layer: WOTS+ (w=16) one-time keys, XMSS (H=4)
   trees, detached 2376-byte witnesses — forgeries, malleability,
   nonce-reuse;
+- VX60-SEC transport: ML-KEM-768 handshake, sealed channels, the MAC-only
+  mode for public block bodies — handshake downgrades, channel-state
+  confusion, tag/banlist bypasses, per-IP cap circumvention;
 - 3-Trunk Vortex Attractor and GQC consensus stamping — coordinate
   manipulation, deterministic-derivation breakage;
+- GQC epoch committee — share-pool injection by non-members, whitelist
+  signature malleability, quorum-threshold manipulation;
 - vault memory core — key material leaking outside locked arenas,
   burn/lifecycle bypasses;
+- SVA-8192 vault derivation — leaf-reuse, Merkle-path forgery,
+  counter-desync;
 - ledger state machine — double-spend, balance bypass, reward
   over-mint, genesis forgery;
 - RPC HTTP server and VX60 wire protocol — memory safety, request
-  smuggling, unauthenticated state mutation.
+  smuggling, unauthenticated state mutation, RPC auth-token bypass.
 
 Out of scope:
 

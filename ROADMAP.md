@@ -5,7 +5,7 @@ go, in what order, and — just as importantly — what is deliberately *not*
 promised. No dates are attached: items move when they are done and
 verified, not before.
 
-## Shipped — v0.0.1-alpha (current)
+## Shipped — v0.1.8-beta (current)
 
 - 3-Trunk Vortex Attractor (3072-bit, Solinas prime fields, CRT synthesis)
 - Deterministic in-core genesis derivation from a published seed vector
@@ -37,6 +37,31 @@ verified, not before.
   surface behind a public `route()` catch-all; oversized numerals on the
   transfer/audit paths no longer throw out of the RPC, and CI runs the
   target for 200k fixed-seed execs
+- VX60-SEC encrypted transport (BIP-324-analog) — ML-KEM-768 (FIPS 203,
+  ACVP-KAT-verified) WARM/COLD handshake, sealed channels, MAC-only mode
+  for public block bodies, per-IP connection caps, fail-closed SEC-channel
+  guard on the raw block path, identity strikes and a durable banlist
+- Multi-node full-cycle test — 3 nodes SEC↔SEC on localhost: dial, sealed
+  handshake, block seal + propagation, GQC finalization, version strike,
+  durable banlist, restart refusal
+- Dandelion++ epoch stem channels for privacy sidecars
+- GQC genesis epoch committee — the first-epoch quorum set is a
+  master-signed whitelist in the deterministic genesis config; share
+  collection is gated on committee membership
+- SVA-8192 Sovereign Vault crypto core — the cold-custody address class
+  (Merkle-counter over 256 one-time leaves on the tree's own sponge);
+  ledger wiring is the next item
+- Chaos fuzzer for the VX60 wire path; 53/53 test suites with assert,
+  AddressSanitizer and ThreadSanitizer lanes
+
+## Next — 0.2.x queue
+
+- SVA-8192 vault ledger wiring (spend path, counter atomicity, undo)
+- SLH-DSA (FIPS 205) signature backend with ACVP test vectors
+- Bitmasked m-of-n XMSS GQC committee (n ≤ 64, accountable BFT)
+- PQ-threshold finality (checkpoint gadget over verified XMSS quorum)
+- QRNG beacon for the epoch seed
+- Timelocks (TLMK/MSRK/EK streaming) and the C1-C5 contract phases
 
 ## Mid term — earning the right to be called a protocol
 
@@ -45,14 +70,16 @@ verified, not before.
    attractor's collision behavior. See whitepaper §15 — this is the single
    most important item on the list.
 4. **Signature backend as an interface** — pluggable hash-based schemes
-   (e.g. SPHINCS+ or LMS/HSS) behind the same witness API, so the custom
-   sponge dependency can be reduced or removed without touching the frame
-   format.
+   behind the same witness API. SLH-DSA (FIPS 205, SPHINCS+) is the first
+   candidate, next in the 0.2.x queue; the custom sponge dependency can
+   then be reduced or removed without touching the frame format.
 5. **Formal collision analysis of the address derivation** — including the
    documented 18-bit prefix drop in the NFA payload.
-6. **GQC validator-set formation** — economics and admission logic for
-    the quorum set; today the threshold gadget exists, the set-formation
-    story is research-grade (whitepaper §15, open item 4).
+6. **GQC validator-set formation** — the epoch-1 committee ships as a
+   master-signed whitelist in the deterministic genesis config; the
+   economics and admission logic for later epochs (VRF-weighted selection,
+   age/reputation gates) remain research-grade (whitepaper §15, open
+   item 4).
 
 ## Long term — conditional on everything above
 
