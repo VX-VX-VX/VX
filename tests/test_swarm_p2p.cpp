@@ -1412,7 +1412,7 @@ TEST(VortexSwarmP2PTest, PerIpConnectionCapNinthClosed) {
     // + cap check can lag past a single 500ms poll — the cap logic is
     // sound, the wait must tolerate scheduling latency.
     bool closed = false;
-    for (int i = 0; i < 20 && !closed; ++i) {
+    for (int i = 0; i < 40 && !closed; ++i) {
         pollfd pfd{fds[8], POLLIN, 0};
         const int r = ::poll(&pfd, 1, 100);
         closed = (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
@@ -1574,7 +1574,10 @@ TEST(VortexSwarmP2PTest, MultiNodeFullCycleSecChainBanlist) {
     // The real finalize_gqc response fields: ok/block_hash/validator_count/
     // share_count/gqc_signature_agg/finalized_checkpoint_height.
     ASSERT_NE(fres.body.find("\"ok\":true"), std::string::npos) << fres.body;
-    ASSERT_NE(fres.body.find("\"share_count\":9"), std::string::npos) << fres.body;
+    // share_count = the genesis epoch committee size (4, plan step 3) — not
+    // the old simulated 9.
+    ASSERT_NE(fres.body.find("\"share_count\":4"), std::string::npos) << fres.body;
+    ASSERT_NE(fres.body.find("\"validator_count\":4"), std::string::npos) << fres.body;
     ASSERT_NE(fres.body.find("\"finalized_checkpoint_height\":1"), std::string::npos) << fres.body;
 
     // 4. Health RPC on B reflects the finalization.

@@ -1,4 +1,5 @@
 #include "vx/consensus/gqc_finality.hpp"
+#include "vx/blockchain/genesis.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/state/galois_trie.hpp" // gf256_mul over GF(2^8), 0x11B
 #include <algorithm>
@@ -75,6 +76,13 @@ void GqcFinality::collect_share(uint64_t block_height,
                                 const std::array<uint8_t, 32>& block_hash,
                                 uint16_t validator_id,
                                 const std::array<uint8_t, 32>& share) {
+    // Epoch-committee membership gate (plan step 3): a share from a
+    // validator_id outside the genesis whitelist is FORGED — it must never
+    // pool into a quorum. Refused silently (the caller has no ack path;
+    // the refuser-side observability is the pending_quorum_height staying
+    // flat while the tip advances).
+    if (!blockchain::gqc_epoch_committee_contains(validator_id))
+        return;
     // Bound to the exact block: votes for different blocks at the same
     // height never mix into one quorum.
     share_pools_[block_height][block_hash][validator_id] = share;

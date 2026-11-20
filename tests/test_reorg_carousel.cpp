@@ -532,12 +532,14 @@ void certify_common_prefix(Carousel& c, const char* what) {
             << what << ": certification on a diverged node";
         const std::array<uint8_t, 32> bh = block_hash(target);
         vx::consensus::GqcFinality gqc(*n->undo, *n->store);
-        for (uint16_t v = 0; v < 9; ++v) {
-            gqc.collect_share(target, bh, v,
-                              vx::consensus::GqcFinality::derive_validator_share(
-                                  bh, target, v));
+        for (const auto &m : vx::blockchain::gqc_epoch_committee().members) {
+            gqc.collect_share(
+                target, bh, m.validator_id,
+                vx::consensus::GqcFinality::derive_validator_share(bh, target, m.validator_id));
         }
-        const auto cert = gqc.finalize_block(target, bh, 9);
+        const auto cert = gqc.finalize_block(
+            target, bh,
+            static_cast<uint32_t>(vx::blockchain::gqc_epoch_committee().members.size()));
         ASSERT_TRUE(cert.certified) << what << ": " << cert.error;
         ASSERT_GE(n->undo->finalized_checkpoint_height(), target)
             << what << ": the cement did not move up";

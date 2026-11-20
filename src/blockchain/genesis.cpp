@@ -235,4 +235,82 @@ const std::vector<PqSeedBinding>& pq_seed_bindings() {
     return table;
 }
 
+// ── GQC epoch committee (plan step 3) ────────────────────────────────────────
+//
+// The first-epoch GQC validator whitelist: a protocol constant every node
+// derives identically at boot. localhost topology (owner decision 18.11,
+// "try it locally"): 4 deterministic test node_ids; the P4/VPS phase swaps
+// in the real machine node_ids and the real master key's signature (the sk
+// never ships).
+//
+// HONEST LIMIT (vx-audit 20.11): while the signature is DERIVED here (the
+// master sk is a published test vector), the boot self-check is NOT
+// authority — it only guards sign/verify implementation drift and root
+// coherence. It becomes a real fail-closed gate at the P4 phase, when the
+// (list, sig) pair ships as constants and an edited list breaks the check
+// against the PINNED root. The whitelist's fork-resistance today is the
+// source constant itself, not the signature.
+
+namespace {
+
+std::array<uint8_t, 32> epoch_node_id(uint16_t id) {
+    // "VX_GQC_EPOCH1_VALIDATOR_<id>_NODEID_V1" → the deterministic test
+    // transport identity of validator <id>.
+    std::string tag = "VX_GQC_EPOCH1_VALIDATOR_" + std::to_string(id) + "_NODEID_V1";
+    std::array<uint8_t, 32> out{};
+    VortexSponge256::compute(reinterpret_cast<const uint8_t *>(tag.data()), tag.size(), out.data());
+    return out;
+}
+
+} // namespace
+
+std::array<uint8_t, 32> gqc_epoch_whitelist_msg(const std::vector<GqcEpochMember> &members) {
+    VortexSponge256 s;
+    const char tag[] = "VX_GQC_EPOCH1_WHITELIST_V1";
+    s.absorb(reinterpret_cast<const uint8_t *>(tag), sizeof(tag) - 1);
+    // Byte-order contract: validator_id is hashed as 2 raw little-endian
+    // bytes. This is a hash input, not a wire field — LE is the canonical
+    // choice here; a third-party implementation must pack the same order.
+    for (const auto &m : members) {
+        s.absorb(reinterpret_cast<const uint8_t *>(&m.validator_id), sizeof(m.validator_id));
+        s.absorb(m.node_id.data(), m.node_id.size());
+    }
+    std::array<uint8_t, 32> out{};
+    s.finalize(out.data());
+    return out;
+}
+
+const GqcEpochConfig &gqc_epoch_committee() {
+    static const GqcEpochConfig cfg = [] {
+        GqcEpochConfig c;
+        // localhost topology (owner decision 18.11): 4 deterministic test
+        // node_ids; the P4/VPS phase swaps in the real machine node_ids and
+        // the real master key's signature (the sk never ships).
+        for (uint16_t id = 0; id < 4; ++id)
+            c.members.push_back(GqcEpochMember{id, epoch_node_id(id)});
+        const std::array<uint8_t, 32> msg = gqc_epoch_whitelist_msg(c.members);
+        std::array<uint8_t, 32> master_sk{};
+        VortexSponge256::compute(reinterpret_cast<const uint8_t *>("VX_GQC_EPOCH1_MASTER_SK_V1"),
+                                 26, master_sk.data());
+        const auto pub_seed = vx::crypto::pq::pub_seed_from_sk(master_sk);
+        c.master_sig = vx::crypto::pq::pq_sign_message(0, 0, master_sk, pub_seed, msg);
+        c.master_root = vx::crypto::pq::xmss_root(master_sk, pub_seed);
+        // Boot self-check: the sign/verify pipeline and root coherence must
+        // hold (see the honest-limit comment above — authority comes at the
+        // P4 phase when the pair ships as constants).
+        if (!vx::crypto::pq::pq_verify_wots_xmss(msg, c.master_sig) ||
+            c.master_sig.pq_pubkey_root != c.master_root)
+            throw std::runtime_error("genesis: GQC epoch committee signature fails self-check");
+        return c;
+    }();
+    return cfg;
+}
+
+bool gqc_epoch_committee_contains(uint16_t validator_id) {
+    for (const auto &m : gqc_epoch_committee().members)
+        if (m.validator_id == validator_id)
+            return true;
+    return false;
+}
+
 } // namespace vx::blockchain

@@ -17,6 +17,7 @@
 #include "vx/state/galois_trie.hpp"
 #include "vx/vm/vortex_vm.hpp"
 #include "vx/blockchain/block.hpp"
+#include "vx/blockchain/genesis.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/blockchain/emission.hpp"
 #include "vx/crypto/pq_signature.hpp"
@@ -3512,14 +3513,17 @@ HttpResponse HttpServer::handle_consensus_finalize_gqc(const HttpRequest& req) {
     std::array<uint8_t, 32> block_hash{};
     std::memcpy(block_hash.data(), tip, 32);
 
-    // Simulated quorum set: 9 validators, each evaluates its GF(2^8) share.
-    constexpr uint32_t kValidators = 9; // 2/3 quorum needs 6 shares
-    for (uint16_t v = 0; v < kValidators; ++v) {
+    // The genesis epoch committee (plan step 3): the quorum set is the
+    // master-signed whitelist from the deterministic genesis config — not a
+    // simulated constant. Every member evaluates its GF(2^8) share.
+    const auto &committee = vx::blockchain::gqc_epoch_committee();
+    const uint32_t validator_count = static_cast<uint32_t>(committee.members.size());
+    for (const auto &m : committee.members) {
         gqc_finality_->collect_share(
-            target, block_hash, v,
-            consensus::GqcFinality::derive_validator_share(block_hash, target, v));
+            target, block_hash, m.validator_id,
+            consensus::GqcFinality::derive_validator_share(block_hash, target, m.validator_id));
     }
-    const auto cert = gqc_finality_->finalize_block(target, block_hash, kValidators);
+    const auto cert = gqc_finality_->finalize_block(target, block_hash, validator_count);
 
     std::ostringstream oss;
     oss << "{\"ok\":" << (cert.certified ? "true" : "false") << ","

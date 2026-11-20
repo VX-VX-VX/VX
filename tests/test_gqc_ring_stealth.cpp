@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "vx/consensus/gqc_finality.hpp"
+#include "vx/blockchain/genesis.hpp"
 #include "vx/core/ring_pipeline.hpp"
 #include "vx/crypto/zk_key_matrix.hpp"
 
@@ -26,6 +27,44 @@ using vx::core::RingPipeline;
 using vx::blockchain::Transaction;
 
 // ── 1. GQC finality ─────────────────────────────────────────────────────────
+
+// Plan step 3: the genesis epoch committee is a protocol constant — two
+// invocations must return byte-identical data (deterministic derivation).
+TEST(VortexGqcRingStealthTest, GqcEpochCommitteeDeterministic) {
+    const auto &a = vx::blockchain::gqc_epoch_committee();
+    const auto &b = vx::blockchain::gqc_epoch_committee();
+    ASSERT_EQ(&a, &b) << "the committee config must be a process-wide singleton";
+    ASSERT_EQ(a.members.size(), 4u) << "localhost topology: 4 validators";
+    for (size_t i = 0; i < a.members.size(); ++i)
+        EXPECT_EQ(a.members[i].validator_id, i);
+    // The whitelist message must be a pure function of the member list.
+    const auto msg1 = vx::blockchain::gqc_epoch_whitelist_msg(a.members);
+    const auto msg2 = vx::blockchain::gqc_epoch_whitelist_msg(b.members);
+    EXPECT_EQ(msg1, msg2);
+    // Membership gate: every member is contained, a foreign id is not.
+    for (const auto &m : a.members)
+        EXPECT_TRUE(vx::blockchain::gqc_epoch_committee_contains(m.validator_id));
+    EXPECT_FALSE(vx::blockchain::gqc_epoch_committee_contains(a.members.size()));
+    EXPECT_FALSE(vx::blockchain::gqc_epoch_committee_contains(9999));
+}
+
+// Plan step 3: the architect's master key signs the whitelist. The shipped
+// (list, sig) pair must verify against the pinned master root — and the
+// signature must bind EXACTLY this list (a mutated member list breaks it).
+TEST(VortexGqcRingStealthTest, GqcEpochCommitteeMasterSigVerifies) {
+    const auto &cfg = vx::blockchain::gqc_epoch_committee();
+    const auto msg = vx::blockchain::gqc_epoch_whitelist_msg(cfg.members);
+    EXPECT_TRUE(vx::crypto::pq::pq_verify_wots_xmss(msg, cfg.master_sig))
+        << "the shipped (list, sig) pair must verify against the master root";
+    EXPECT_EQ(cfg.master_sig.pq_pubkey_root, cfg.master_root)
+        << "the witness root must equal the pinned master root";
+    // Tamper check: a single flipped validator id must break the signature.
+    auto mutated = cfg.members;
+    mutated[0].validator_id = 99;
+    const auto bad_msg = vx::blockchain::gqc_epoch_whitelist_msg(mutated);
+    EXPECT_FALSE(vx::crypto::pq::pq_verify_wots_xmss(bad_msg, cfg.master_sig))
+        << "an edited list must fail verification (fail-closed self-check)";
+}
 
 TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     const std::string tmp_dir = (std::filesystem::temp_directory_path() / ("vx_gqc_test_" + std::to_string(::getpid()))).string();
@@ -70,15 +109,16 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     std::array<uint8_t, 32> block_hash{};
     std::memcpy(block_hash.data(), tip, 32);
 
-    // Collect shares from 9 validators, finalize the tip.
-    constexpr uint32_t kValidators = 9;
-    for (uint16_t v = 0; v < kValidators; ++v) {
-        gqc.collect_share(tip_h, block_hash, v,
-                          GqcFinality::derive_validator_share(block_hash, tip_h, v));
+    // Collect shares from the genesis epoch committee, finalize the tip.
+    const auto &committee = vx::blockchain::gqc_epoch_committee();
+    const uint32_t kValidators = static_cast<uint32_t>(committee.members.size());
+    for (const auto &m : committee.members) {
+        gqc.collect_share(tip_h, block_hash, m.validator_id,
+                          GqcFinality::derive_validator_share(block_hash, tip_h, m.validator_id));
     }
     const auto cert = gqc.finalize_block(tip_h, block_hash, kValidators);
     ASSERT_TRUE(cert.certified) << cert.error;
-    EXPECT_EQ(cert.share_count, 9u);
+    EXPECT_EQ(cert.share_count, committee.members.size());
     EXPECT_EQ(cert.gqc_signature_agg.size(), 32u);
     EXPECT_EQ(gqc.finalized_checkpoint_height(), tip_h);
     EXPECT_EQ(undo.finalized_checkpoint_height(), tip_h);
@@ -105,9 +145,13 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     store.tip_hash(tip2);
     std::array<uint8_t, 32> h2{};
     std::memcpy(h2.data(), tip2, 32);
-    for (uint16_t v = 0; v < 2; ++v) { // 2/9 < 2/3
-        gqc2.collect_share(tip_h, h2, v + 100,
-                           GqcFinality::derive_validator_share(h2, tip_h, v));
+    // 2 of the 4 committee members < 2/3 quorum (3 needed).
+    uint16_t collected = 0;
+    for (const auto &m : vx::blockchain::gqc_epoch_committee().members) {
+        if (collected++ >= 2)
+            break;
+        gqc2.collect_share(tip_h, h2, m.validator_id,
+                           GqcFinality::derive_validator_share(h2, tip_h, m.validator_id));
     }
     const auto cert2 = gqc2.finalize_block(tip_h, h2, kValidators);
     EXPECT_FALSE(cert2.certified);
@@ -165,11 +209,14 @@ TEST(VortexGqcRingStealthTest, GqcCheckpointSurvivesRestart) {
         store.tip_hash(tip);
         std::array<uint8_t, 32> block_hash{};
         std::memcpy(block_hash.data(), tip, 32);
-        for (uint16_t v = 0; v < 9; ++v) {
-            gqc.collect_share(tip_h, block_hash, v,
-                              GqcFinality::derive_validator_share(block_hash, tip_h, v));
+        for (const auto &m : vx::blockchain::gqc_epoch_committee().members) {
+            gqc.collect_share(
+                tip_h, block_hash, m.validator_id,
+                GqcFinality::derive_validator_share(block_hash, tip_h, m.validator_id));
         }
-        const auto cert = gqc.finalize_block(tip_h, block_hash, 9);
+        const auto cert = gqc.finalize_block(
+            tip_h, block_hash,
+            static_cast<uint32_t>(vx::blockchain::gqc_epoch_committee().members.size()));
         ASSERT_TRUE(cert.certified) << cert.error;
         EXPECT_EQ(undo.finalized_checkpoint_height(), tip_h);
     }
@@ -235,11 +282,12 @@ TEST(VortexGqcRingStealthTest, GqcQuorumForgeableFromPublicDataOnly) {
     std::array<uint8_t, 32> block_hash{};
     std::memcpy(block_hash.data(), tip, 32);
 
-    // Attack: derive every validator's share from public data alone.
-    constexpr uint32_t kValidators = 9;
-    for (uint16_t v = 0; v < kValidators; ++v) {
-        gqc.collect_share(tip_h, block_hash, v,
-                          GqcFinality::derive_validator_share(block_hash, tip_h, v));
+    // Attack: derive every COMMITTEE validator's share from public data alone.
+    const auto &committee = vx::blockchain::gqc_epoch_committee();
+    const uint32_t kValidators = static_cast<uint32_t>(committee.members.size());
+    for (const auto &m : committee.members) {
+        gqc.collect_share(tip_h, block_hash, m.validator_id,
+                          GqcFinality::derive_validator_share(block_hash, tip_h, m.validator_id));
     }
     const auto cert = gqc.finalize_block(tip_h, block_hash, kValidators);
 
@@ -247,13 +295,12 @@ TEST(VortexGqcRingStealthTest, GqcQuorumForgeableFromPublicDataOnly) {
     // can be produced by anyone who knows (block hash, height, validator
     // count) and holds no validator secret at all.
     ASSERT_TRUE(cert.certified) << cert.error;
-    EXPECT_EQ(cert.share_count, 9u);
+    EXPECT_EQ(cert.share_count, committee.members.size());
     std::cout << "  [documented gap] GQC quorum forged from public data only: "
               << cert.share_count << "/" << kValidators
               << " shares, zero secrets used. Validator authentication is a"
               << " BACKLOG 0.4/2.4 item; until then cryptographic finality is"
               << " NOT claimed.\n";
-
     std::filesystem::remove_all(tmp_dir);
 }
 

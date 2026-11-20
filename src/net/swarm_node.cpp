@@ -859,10 +859,13 @@ void SwarmNode::disconnect_from_peer(const PeerInfo &peer) {
     std::lock_guard<std::mutex> lock(peers_mutex_);
     auto it = peer_fds_.find(peer.address);
     if (it != peer_fds_.end()) {
-        if (it->second >= 0)
-            ::close(it->second);
+        // Save the fd BEFORE erase: erasing invalidates the iterator, and
+        // reading it->second afterwards is a heap-use-after-free (SAN lane).
+        const int fd = it->second;
+        if (fd >= 0)
+            ::close(fd);
         peer_fds_.erase(it);
-        sec_channels_.erase(it->second);
+        sec_channels_.erase(fd);
     }
 }
 
@@ -1859,9 +1862,13 @@ void SwarmNode::report_id_strike(const std::array<uint8_t, 32> &id, int score_in
             if (fit != peer_fds_.end()) {
                 // shutdown only: the owning reader/serve thread closes the
                 // fd exactly once (same discipline as health_loop).
-                fds_to_drop.push_back(fit->second);
+                // Save the fd BEFORE erase — erase(fit) frees the node and
+                // reading fit->second afterwards is a heap-use-after-free
+                // (caught by the SAN lane, ASan thread T94).
+                const int fd = fit->second;
+                fds_to_drop.push_back(fd);
                 peer_fds_.erase(fit);
-                sec_channels_.erase(fit->second);
+                sec_channels_.erase(fd);
             }
             id_conn_labels_.erase(lit);
         }

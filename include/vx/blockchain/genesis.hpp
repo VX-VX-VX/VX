@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vx/blockchain/block.hpp"
+#include "vx/crypto/pq_signature.hpp"
 #include <array>
 #include <string>
 #include <vector>
@@ -60,6 +61,38 @@ const std::string& demo_spender_seed_hex();   // Address #2 (spender)
 const std::string& demo_receiver_seed_hex();  // Address #3 (target)
 std::string demo_spender_address_nfa();       // "NFA_V6_..." (deterministic)
 std::string demo_receiver_address_nfa();      // "NFA_V6_..." (deterministic)
+
+// ── GQC epoch committee (plan step 3) ────────────────────────────────────────
+// The first-epoch GQC validator whitelist: a protocol constant every node
+// derives identically at boot. localhost topology (owner decision 18.11:
+// "try it locally"): 4 deterministic test node_ids; the P4/VPS phase swaps
+// in the real machine node_ids and the real master key's signature (the sk
+// never ships).
+struct GqcEpochMember {
+    uint16_t validator_id;
+    std::array<uint8_t, 32> node_id;
+};
+
+struct GqcEpochConfig {
+    std::vector<GqcEpochMember> members;
+    vx::crypto::pq::PqSignatureWitness master_sig; // the architect's master key signs the whitelist
+    std::array<uint8_t, 32> master_root;           // the root the sig must verify against
+};
+
+/// The deterministic first-epoch committee: 4 localhost validators (ids 0..3)
+/// with deterministic test node_ids, master-signed and self-checked at boot
+/// (fail-closed: an edited list breaks the self-check at node start).
+const GqcEpochConfig &gqc_epoch_committee();
+
+/// The domain-separated whitelist message the master signature commits to:
+/// sponge("VX_GQC_EPOCH1_WHITELIST_V1" ‖ Σ validator_id(2 LE) ‖ node_id(32)).
+/// Exposed so the node (and tests) verify the shipped (list, sig) pair
+/// without re-deriving the tag.
+std::array<uint8_t, 32> gqc_epoch_whitelist_msg(const std::vector<GqcEpochMember> &members);
+
+/// True when `validator_id` is a member of the first-epoch committee.
+/// The GQC share-collection gate: a share from a non-member id is forged.
+bool gqc_epoch_committee_contains(uint16_t validator_id);
 
 // ── The one-time secondary genesis mint (review round 5, P1) ────────────────
 // The mint's authorization used to be the keyless cocoon digest with only a
