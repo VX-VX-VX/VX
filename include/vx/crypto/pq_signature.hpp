@@ -18,6 +18,7 @@
 #include "vx/blockchain/block.hpp"
 
 #include <array>
+#include <unordered_set>
 #include <bitset>
 #include <vector>
 #include <cstdint>
@@ -357,6 +358,19 @@ public:
     // Number of consumed leaves for this key (0..16).
     size_t used_count(const std::array<uint8_t, 32> &key_root) const;
 
+    // Phase D (0.2.3) rollover discipline: after a tree is rolled over, it
+    // must NEVER sign again — every further reservation for it (tx leaves
+    // AND the cert leaf) fails closed. The dead mark is durable: a marker
+    // record (leaf byte 0xFF) in the log; older parsers refuse such a log
+    // fail-closed (documented honest-limit).
+    bool mark_tree_dead(const std::array<uint8_t, 32> &key_root);
+    bool is_tree_dead(const std::array<uint8_t, 32> &key_root) const;
+    // True when the durable log validated (false = memory-only or the log
+    // is corrupt — reserve() refuses forever either way).
+    bool durable_ok() const {
+        return durable_ok_;
+    }
+
 private:
     bool parse_log_locked(); // rebuilds used_ from the file; false = corrupt
     bool append_locked(const std::array<uint8_t, 32> &key_root, unsigned leaf);
@@ -367,6 +381,8 @@ private:
 
     mutable std::mutex mu_;
     std::unordered_map<std::array<uint8_t, 32>, std::bitset<kLeaves>, PqArrayHash> used_;
+    // Phase D: trees that rolled over — no further reservations, ever.
+    std::unordered_set<std::array<uint8_t, 32>, PqArrayHash> dead_;
     std::string path_;
     int fd_ = -1;
     // memory_only_: no path was requested — in-process history is the

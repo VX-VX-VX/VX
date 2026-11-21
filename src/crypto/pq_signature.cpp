@@ -803,6 +803,7 @@ bool PqLeafLedger::parse_log_locked() {
     }
 
     used_.clear();
+    dead_.clear();
     // Complete records only: a trailing partial record can only be a torn
     // append from a crash, which we treat as unconsumed (fail-closed for
     // that leaf happens at append time, not parse time).
@@ -812,6 +813,13 @@ bool PqLeafLedger::parse_log_locked() {
         std::array<uint8_t, 32> key{};
         std::memcpy(key.data(), rec, 32);
         const unsigned leaf = rec[32];
+        if (leaf == 0xFF) {
+            // Phase D rollover marker: the tree is dead — no further
+            // reservations, ever. Fail-closed for old parsers is an
+            // accepted honest-limit (documented in the header).
+            dead_.insert(key);
+            continue;
+        }
         if (leaf >= kLeaves)
             return false; // tampered record -> fail closed
         used_[key].set(leaf);
@@ -841,6 +849,43 @@ size_t PqLeafLedger::used_count(const std::array<uint8_t, 32> &key_root) const {
     return (it == used_.end()) ? 0u : it->second.count();
 }
 
+bool PqLeafLedger::mark_tree_dead(const std::array<uint8_t, 32> &key_root) {
+    std::lock_guard<std::mutex> guard(mu_);
+    if (!memory_only_) {
+        if (!durable_ok_ || fd_ < 0)
+            return false;
+        if (::flock(fd_, LOCK_EX) != 0)
+            return false;
+        if (!parse_log_locked()) {
+            durable_ok_ = false; // fail closed from here on
+            ::flock(fd_, LOCK_UN);
+            return false;
+        }
+    }
+    if (dead_.count(key_root) != 0) {
+        if (!memory_only_)
+            ::flock(fd_, LOCK_UN);
+        return true; // idempotent
+    }
+    // The durable record lands BEFORE the in-memory mark (the same
+    // fail-closed ordering as every leaf reservation: a crash between the
+    // append and the in-memory mark costs at most one re-append).
+    if (!memory_only_ && !append_locked(key_root, 0xFF)) {
+        durable_ok_ = false; // fail closed from here on
+        ::flock(fd_, LOCK_UN);
+        return false;
+    }
+    dead_.insert(key_root);
+    if (!memory_only_)
+        ::flock(fd_, LOCK_UN);
+    return true;
+}
+
+bool PqLeafLedger::is_tree_dead(const std::array<uint8_t, 32> &key_root) const {
+    std::lock_guard<std::mutex> guard(mu_);
+    return dead_.count(key_root) != 0;
+}
+
 // Shared reservation core: `allowed` masks which leaves may be assigned.
 // requested_leaf must be inside `allowed` or the call fails without
 // burning anything; the lowest-free search visits only allowed leaves.
@@ -867,6 +912,12 @@ int PqLeafLedger::reserve_impl(const std::array<uint8_t, 32> &key_root, unsigned
             ::flock(fd_, LOCK_UN);
         return result;
     };
+
+    // Phase D: a dead tree (post-rollover) refuses every reservation —
+    // checked AFTER the durable refresh (parse_log_locked rebuilds the
+    // dead set from disk), fail-closed.
+    if (dead_.count(key_root) != 0)
+        return finish(-1);
 
     std::bitset<kLeaves> &bits = used_[key_root];
     if (requested_leaf >= kLeaves || (allowed_mask & (1u << requested_leaf)) == 0) {
