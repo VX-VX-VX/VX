@@ -139,6 +139,7 @@ add_library(vx_core STATIC
     src/core/memory_vault.cpp
     src/core/rt_scheduler.cpp
     src/crypto/pq_signature.cpp
+    src/crypto/slh_dsa.cpp
 )
 
 target_include_directories(vx_core PUBLIC
@@ -368,6 +369,11 @@ add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)
 target_link_libraries(test_ml_kem_kat PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexMlKem768KatTest COMMAND test_ml_kem_kat)
 
+# SLH-DSA-SHAKE-128s (FIPS 205) — the committee/threshold track's stateless
+# signature (Phase B, 0.2.x), ACVP-KAT-gated: keyGen + sigVer internalProjection.
+add_executable(test_slh_dsa_acvp tests/test_slh_dsa_acvp.cpp)
+target_link_libraries(test_slh_dsa_acvp PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexSlhDsa128sKatTest COMMAND test_slh_dsa_acvp)
 
 # DKSAP-Galois stealth-nickname core (track 3/3) + SGMT layer: compiled
 # INTO vx_core (the header-only ledger apply_block and the RPC SGMT surface
@@ -439,7 +445,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             # Later additions (external review 2026-11-15): the KAT/DKSAP
             # wire suites were missing from the guard — their assert() calls
             # would silently no-op under the Release -DNDEBUG flag.
-            test_fips202_kat test_ml_kem_kat
+            test_fips202_kat test_ml_kem_kat test_slh_dsa_acvp
             test_dksap test_dksap_sgmt test_sgmt_wiring
             # 2026-11-21: the SVA witness suites shipped without the guard —
             # their assert() calls would silently no-op under Release NDEBUG.
