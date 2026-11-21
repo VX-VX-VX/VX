@@ -138,6 +138,7 @@ add_library(vx_core STATIC
     src/consensus/gqc_checkpoint.cpp
     src/consensus/qrng_beacon.cpp
     src/consensus/timelocks.cpp
+    src/consensus/contract_wire.cpp
     src/core/rdtsc_profiler.cpp
     src/security/chaos_fuzzer.cpp
     src/core/memory_vault.cpp
@@ -304,6 +305,9 @@ add_test(NAME VortexQrngBeaconTest COMMAND test_qrng_beacon)
 add_executable(test_timelocks tests/test_timelocks.cpp)
 target_link_libraries(test_timelocks PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexTimelocksTest COMMAND test_timelocks)
+add_executable(test_contract_wire tests/test_contract_wire.cpp)
+target_link_libraries(test_contract_wire PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexContractWireTest COMMAND test_contract_wire)
 
 add_executable(test_vault_htlc tests/test_vault_htlc.cpp)
 target_link_libraries(test_vault_htlc PRIVATE vx_core gtest gtest_main)
@@ -448,7 +452,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
             test_gqc_votes test_gqc_checkpoint test_pq_leaf_dead
-            test_qrng_beacon test_timelocks
+            test_qrng_beacon test_timelocks test_contract_wire
             test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
             test_chain_stress test_boundary_torture test_crash_torture
             test_wal_marker
