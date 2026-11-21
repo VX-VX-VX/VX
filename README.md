@@ -367,6 +367,17 @@ cmake --build build -j
 cd build && ctest --output-on-failure
 ```
 
+**One-command alternative:** `scripts/build.sh` wraps configure + build +
+optional tests (auto-installs dependencies with `--deps`, handles the
+Vault edition and stale build dirs):
+
+```bash
+scripts/build.sh              # Public Core, Release
+scripts/build.sh tests        # ... + full ctest suite
+scripts/build.sh vault        # Nakamoto Vault edition
+scripts/build.sh --deps       # install build dependencies (sudo)
+```
+
 The Nakamoto Vault edition is the same, with `-DVX_BUILD_VAULT=ON` and a
 separate build directory (the two editions never share a `build/` dir).
 
