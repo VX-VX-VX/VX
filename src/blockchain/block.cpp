@@ -1,9 +1,9 @@
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/blockchain/genesis.hpp"
+#include "vx/blockchain/sva_witness.hpp"
 #include "vx/crypto/pq_signature.hpp"
 #include <array>
 #include <cstring>
-#include <iostream>
 #include <vector>
 
 namespace vx::blockchain {
@@ -314,6 +314,22 @@ WitnessRootStatus verify_witness_merkle(const RawBlock &raw, BoundRootOf bound_r
 bool consensus_witness_root(const Transaction &tx, BoundRootOf bound_root_of,
                             std::array<uint8_t, 32> &out_root) noexcept {
     const Address sender = tx_address(tx.sender_nfa);
+
+    // SVA-8192 vault spends (0.2.x): the vault is keyless — the witness
+    // binding is the REVEALED LEAF commitment, not a PQ root. The registry
+    // entry must derive this sender's encoding (verify-before-store made
+    // sure at registration; the ledger re-checks at apply). A vault spend
+    // whose sidecar is absent contributes no binding — the block that
+    // claims it is refused at the witness-root gate.
+    if (is_sva_address(sender)) {
+        sva::SvaWitnessEntry entry{};
+        if (!sva::SvaWitnessRegistry::instance().lookup(vx::crypto::pq::tx_msg_digest(tx),
+                                                        tx.sender_nfa, entry))
+            return false;
+        out_root = sva::sva_leaf_commit(entry.preimage, static_cast<uint8_t>(entry.spend_index));
+        return true;
+    }
+
     const std::function<bool(const Address &, std::array<uint8_t, 32> &)> oracle = bound_root_of;
 
     // 1. Ledger-bound root: the address was bound by an accepted block (or
@@ -426,7 +442,6 @@ bool verify_transaction_proof(const Transaction& tx) noexcept {
     // recomputes the checksum — it cannot produce the WOTS+ chains (Winternitz
     // checksum barrier) nor match the registered XMSS root.
     if (vx::crypto::pq::PqWitnessRegistry::instance().is_pq_sender(tx.sender_nfa)) {
-        const auto msg = vx::crypto::pq::tx_msg_digest(tx);
         vx::crypto::pq::PqSignatureWitness w;
         // Math-audit F7: use the consensus lookup, not the first candidate.
         // An attacker can register a SELF-CONSISTENT witness (own root) for
@@ -489,6 +504,40 @@ void derive_pq_address(const uint8_t root[32], uint8_t out_addr[42]) noexcept {
         }
     }
     while (oi < 42) out_addr[oi++] = static_cast<uint8_t>(kAlpha[0]);
+}
+
+bool is_sva_address(const Address &a) noexcept {
+    return std::memcmp(a.data(), "SVA", 3) == 0;
+}
+
+void derive_sva_address(const uint8_t vault_root[32], uint8_t out_addr[42]) noexcept {
+    // Same shape as the PQ class: "SVA" + 39 base64url chars of
+    // Sponge("VXSVAADDRV1" || vault_root) = 234 bits of the 256-bit
+    // commitment (the documented 18-bit prefix drop; the vault root is
+    // fully committed by the spend witness, so the truncation never
+    // weakens authorization — see block.hpp).
+    std::memcpy(out_addr, "SVA", 3);
+    uint8_t buf[43]; // 11-byte tag + 32-byte root
+    std::memcpy(buf, "VXSVAADDRV1", 11);
+    std::memcpy(buf + 11, vault_root, 32);
+    uint8_t d[32];
+    VortexSponge256::compute(buf, sizeof(buf), d);
+
+    static constexpr char kAlpha[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t oi = 3;
+    for (size_t i = 0; i < sizeof(d) && oi < 42; ++i) {
+        acc = (acc << 8) | d[i];
+        bits += 8;
+        while (bits >= 6 && oi < 42) {
+            bits -= 6;
+            out_addr[oi++] = static_cast<uint8_t>(kAlpha[(acc >> bits) & 0x3F]);
+        }
+    }
+    while (oi < 42)
+        out_addr[oi++] = static_cast<uint8_t>(kAlpha[0]);
 }
 
 bool verify_pq_witness(const Transaction& tx,

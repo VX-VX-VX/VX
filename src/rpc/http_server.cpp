@@ -101,6 +101,10 @@ HttpServer::HttpServer(storage::BlockStore& store, state::LedgerState& ledger, u
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(store.path() + ".pqw");
     // Rollover certs (v0.0.18): replay the durable cert sidecar too.
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_cert_log(store.path() + ".pqr");
+    // SVA-8192 (0.2.x): the vault spend witness rides beside the ledger —
+    // a restart re-applies its own history and must not orphan a vault
+    // spend already in the chain.
+    vx::blockchain::sva::SvaWitnessRegistry::instance().attach_durable_log(store.path() + ".svaw");
     // Initialize swarm node
     swarm_node_ = std::make_unique<vx::net::SwarmNode>();
     // SSE push (v0.0.8): the miner fires on_block_sealed inside its seal

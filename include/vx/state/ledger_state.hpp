@@ -3,6 +3,7 @@
 #include "vx/blockchain/block.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/blockchain/emission.hpp"
+#include "vx/blockchain/sva_witness.hpp"
 #include "vx/blockchain/vesting.hpp"
 #include "vx/blockchain/genesis.hpp"
 #include "vx/core/ct_equal.hpp"
@@ -11,6 +12,8 @@
 #include "vx/crypto/dksap_sgmt.hpp"
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/state/galois_trie.hpp"
+
+#include <unordered_set>
 
 #include <array>
 #include <cstdint>
@@ -60,6 +63,16 @@ struct ApplyResult {
     // them to record_sgmt_undo, and the registry persistence rides the
     // commit phase via commit_sgmt_record (never the gossip intake).
     std::vector<std::pair<std::array<uint8_t, 32>, vx::crypto::dksap::SgmtRecord>> sgmt_committed;
+    // SVA-8192 (0.2.x phase A): every vault spend this block committed,
+    // with the pre-block counter — the undo journal (record_sva_undo)
+    // appends them to the block's record so a reorg rollback restores the
+    // exact pre-block counter.
+    struct SvaSpendUndo {
+        Address vault{};
+        uint64_t prev_counter = 0;
+        bool existed = false;
+    };
+    std::vector<SvaSpendUndo> sva_undo;
 };
 
 /**
@@ -166,6 +179,17 @@ public:
             vx::crypto::dksap::SgmtRecord record{};
         };
         std::vector<NewSgmtLeaf> new_sgmt_leaves_;
+        // SVA-8192 (0.2.x phase A): vaults already spent IN THIS BLOCK —
+        // the counter advances once per block per vault, so a second spend
+        // would race on the stale counter.
+        std::unordered_set<Address, AddressHash> sva_spent_in_block_;
+        // Commit-phase counter undo: the pre-block counter of every vault
+        // this block spends, restored by rollback_commit (a failed commit
+        // or integrity check must leave the counter byte-identical).
+        // Same shape as ApplyResult::SvaSpendUndo (the undo journal's
+        // record type) — handed over at the end of the commit phase.
+        using SvaCounterUndo = ApplyResult::SvaSpendUndo;
+        std::vector<SvaCounterUndo> sva_counter_undo;
 
         // Legacy Genesis v1 exemption (fee=0/nonce=0 skips nonce accounting)
         // is scoped to the actual genesis replay window. Unscoped, ANY user
@@ -269,6 +293,82 @@ public:
                     res.error = "tx " + std::to_string(i) + ": invalid cocoon_proof";
                     return res;
                 }
+            } else if (blockchain::is_sva_address(sender)) {
+                // ── SVA-8192 Sovereign Vault spend path (0.2.x phase A) ──
+                // The vault is keyless: authorization is the revealed
+                // preimage, which must re-derive the vault's Merkle root
+                // byte-for-byte and land exactly on the vault's current
+                // spend counter — leaf i spends ONLY as spend #i, and after
+                // 256 spends the vault is a TOMBSTONE. Fault policy: a
+                // wrong preimage, foreign path, out-of-order index,
+                // tombstone or missing sidecar REJECTS the transaction
+                // (never a node FAULT) — the witness is untrusted input.
+                const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+                blockchain::sva::SvaWitnessEntry entry{};
+                if (!blockchain::sva::SvaWitnessRegistry::instance().lookup(digest, sender.data(),
+                                                                            entry)) {
+                    res.error = "tx " + std::to_string(i) +
+                                ": no SVA spend witness for this transaction"
+                                " (backfill before apply)";
+                    return res;
+                }
+                // The witness must derive exactly this vault's encoding —
+                // a witness for a different vault cannot authorize it.
+                Address chk{};
+                blockchain::derive_sva_address(entry.root.data(), chk.data());
+                if (chk != sender) {
+                    res.error =
+                        "tx " + std::to_string(i) + ": SVA witness derives a different vault";
+                    return res;
+                }
+                // Full cryptographic re-verification at apply time (the
+                // registry is a transport cache, never a trusted oracle).
+                if (!blockchain::sva::sva_verify_spend(entry.root, entry.spend_index,
+                                                       entry.preimage, entry.path)) {
+                    res.error =
+                        "tx " + std::to_string(i) + ": SVA spend witness fails Merkle verification";
+                    return res;
+                }
+                // Counter binding: the witness must spend the NEXT leaf.
+                const auto cit = sva_counters_.find(sender);
+                const uint64_t counter = (cit == sva_counters_.end()) ? 0 : cit->second;
+                if (counter >= blockchain::sva::kSvaMaxSpends) {
+                    res.error =
+                        "tx " + std::to_string(i) + ": SVA vault tombstone (all 256 leaves spent)";
+                    return res;
+                }
+                if (entry.spend_index != counter) {
+                    res.error = "tx " + std::to_string(i) + ": SVA spend out of order (counter " +
+                                std::to_string(counter) + ", witness index " +
+                                std::to_string(entry.spend_index) + ")";
+                    return res;
+                }
+                // Intra-block discipline: one spend per vault per block —
+                // the commit loop advances the counter once; a second spend
+                // in the same block would race on the stale counter.
+                if (!sva_spent_in_block_.insert(sender).second) {
+                    res.error =
+                        "tx " + std::to_string(i) + ": second SVA spend of one vault in one block";
+                    return res;
+                }
+                // Burn-fee gate (owner plan, phase A): a vault spend pays a
+                // minimum fee — the standard TDI split (50% burn / 50%
+                // producer) applies on top, so half the fee is destroyed
+                // regardless of who relays.
+                if (fee < blockchain::sva::kSvaSpendFeeAtoms) {
+                    res.error = "tx " + std::to_string(i) + ": SVA spend fee below the minimum";
+                    return res;
+                }
+                // Witness commitment: the revealed leaf joins the header's
+                // witness tree — the header commits the EXACT witness used
+                // (the PQ tree binds a key root; the SVA tree binds the
+                // spent leaf position).
+                blockchain::WitnessBinding wb;
+                wb.tx_index = i;
+                wb.sender = sender;
+                wb.pq_root = blockchain::sva::sva_leaf_commit(
+                    entry.preimage, static_cast<uint8_t>(entry.spend_index));
+                witness_bindings_.push_back(wb);
             } else {
                 vx::crypto::pq::PqSignatureWitness w;
                 std::array<uint8_t, 32> canonical_root{};
@@ -474,6 +574,16 @@ public:
                 }
                 if (balance < total_cost) {
                     res.error = "tx " + std::to_string(i) + ": insufficient funds";
+                    return res;
+                }
+                // SVA minimum-balance gate (owner plan, phase A): the vault
+                // class is cold custody — a vault below the 1000 VX minimum
+                // cannot move value at all (anti-dust gate on the class;
+                // the final tombstone spend drains the vault whole, the
+                // gate binds the PRE-debit balance).
+                if (blockchain::is_sva_address(sender) &&
+                    balance < U128(blockchain::sva::kSvaMinBalanceVx * blockchain::ATOMS_PER_VX)) {
+                    res.error = "tx " + std::to_string(i) + ": vault below the 1000 VX minimum";
                     return res;
                 }
                 // Founder-vesting gate: the genesis allocation may leave the
@@ -763,6 +873,13 @@ public:
                     nonces_.erase(it->addr);
                 }
             }
+            for (auto it = sva_counter_undo.rbegin(); it != sva_counter_undo.rend(); ++it) {
+                if (it->existed) {
+                    sva_counters_[it->vault] = it->prev_counter;
+                } else {
+                    sva_counters_.erase(it->vault);
+                }
+            }
             burned_supply_ = burned_before;
             issued_supply_ = issued_before;
         };
@@ -800,6 +917,19 @@ public:
                 if (!(legacy_window && blockchain::is_genesis_v1_tx(tx))) {
                     record_nonce(sender);
                     set_next_nonce(sender, blockchain::tx_nonce(tx) + 1);
+                }
+                // SVA-8192 counter advance (0.2.x phase A): ATOMIC in the
+                // commit phase — journaled with the pre-block value so
+                // rollback_commit (and the undo journal) can restore the
+                // exact counter. The pre-check bound the spend to the
+                // counter and refused intra-block duplicates, so this is
+                // the sole writer.
+                if (blockchain::is_sva_address(sender)) {
+                    const auto cit = sva_counters_.find(sender);
+                    sva_counter_undo.push_back({sender,
+                                                cit == sva_counters_.end() ? 0 : cit->second,
+                                                cit != sva_counters_.end()});
+                    sva_counters_[sender] = (cit == sva_counters_.end()) ? 1 : cit->second + 1;
                 }
             }
             // SGMTLEAF receivers hold no value (the registration leaf is not
@@ -904,6 +1034,11 @@ public:
         }
         new_sgmt_leaves_.clear();
 
+        // SVA-8192 (0.2.x phase A): the counters are committed — hand the
+        // undo journal the pre-block values (the caller records them via
+        // record_sva_undo, so a reorg rollback restores the exact counter).
+        res.sva_undo = std::move(sva_counter_undo);
+
         res.ok = true;
         res.transfers = n;
         res.fees_burned = burned;
@@ -925,6 +1060,34 @@ public:
     /// Set next expected nonce for an address
     void set_next_nonce(const Address &a, uint32_t nonce) {
         nonces_[a] = nonce;
+    }
+
+    /// The SVA-8192 vault spend counter (0.2.x phase A): how many leaves
+    /// the vault has burned. 0 for a vault that never spent (leaf 0 is the
+    /// next spend).
+    uint64_t sva_counter_of(const Address &a) const {
+        const auto it = sva_counters_.find(a);
+        return it == sva_counters_.end() ? 0 : it->second;
+    }
+
+    /// Exact reorg reversal for the SVA counter (undo journal): restore
+    /// the counter the rolled-back block replaced — set it back, or erase
+    /// the entry the block created. Returns false when the map and the
+    /// journal disagree (corruption signal, same discipline as
+    /// sgmt_restore).
+    bool revert_sva_counter(const Address &a, uint64_t prev, bool existed) {
+        if (!existed) {
+            const auto it = sva_counters_.find(a);
+            if (it == sva_counters_.end())
+                return false;
+            sva_counters_.erase(it);
+            return true;
+        }
+        const auto it = sva_counters_.find(a);
+        if (it == sva_counters_.end() || it->second != prev + 1)
+            return false;
+        it->second = prev;
+        return true;
     }
 
     uint64_t applied_height() const noexcept {
@@ -1115,6 +1278,9 @@ private:
     std::unordered_map<Address, U128, AddressHash> balances_;
     std::unordered_map<Address, uint32_t, AddressHash> nonces_;
     std::unordered_map<Address, std::array<uint8_t, 32>, AddressHash> pq_roots_;
+    // SVA-8192 (0.2.x phase A): vault spend counters. Advances ONLY in the
+    // apply_block commit phase (journaled); 256 = tombstone.
+    std::unordered_map<Address, uint64_t, AddressHash> sva_counters_;
     vx::state::GaloisTrie sgmt_trie_;
     U128 burned_supply_{0};
     // Cumulative issuance under the 7,000,000,000 VX hard cap. Mutated

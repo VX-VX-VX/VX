@@ -45,15 +45,19 @@ constexpr char kUndoMagic[8] = {'V', 'X', 'U', 'N', 'D', 'O', 'J', 'L'};
 // v3: + sgmt_undo (DKSAP wire integration) — key(32) + prev_leaf(32) +
 // existed(1) per registration. A pre-v3 journal is discarded by the
 // reject-or-migrate policy and rebuilt from live block application.
-constexpr uint32_t kUndoVersion = 3;
+// v4: + sva_undo (SVA-8192, 0.2.x) — vault(42) + prev_counter(8) +
+// existed(1) per vault spend. Same reject-or-migrate policy.
+constexpr uint32_t kUndoVersion = 4;
 constexpr size_t kUndoHeaderSize = 12;
 constexpr size_t kUndoTxSize = 42 + 42 + 16 + 16 + 4;
 constexpr size_t kUndoSgmtSize = 32 + 32 + 1;
+constexpr size_t kUndoSvaSize = 42 + 8 + 1;
 // A zero-tx record: the smallest possible complete record (height, time,
-// tip, supply, accounts count, zero tx count, zero created addresses, and
-// — v3 — a zero sgmt-undo count). Fewer bytes than this at the end of a
-// file cannot start a valid record — that is a torn tail, not corruption.
-constexpr size_t kMinRecordSize = 96;
+// tip, supply, accounts count, zero tx count, zero created addresses,
+// v3 — a zero sgmt-undo count, and v4 — a zero sva-undo count). Fewer
+// bytes than this at the end of a file cannot start a valid record — that
+// is a torn tail, not corruption.
+constexpr size_t kMinRecordSize = 104;
 // A safety cap on replay input, not a real limit: 64 MiB covers roughly
 // 400k single-tx records; larger files are treated as malformed.
 constexpr size_t kUndoFileCap = 64ULL * 1024 * 1024;
@@ -91,7 +95,8 @@ void put_bytes(std::vector<uint8_t>& out, const uint8_t* p, size_t n) {
 
 size_t record_bytes(const UndoRecord& r) {
     return 8 + 8 + 32 + 16 + 8 + 8 + r.transactions.size() * kUndoTxSize + 8 +
-           r.created_addresses.size() * 42 + 8 + r.sgmt_undo.size() * kUndoSgmtSize;
+           r.created_addresses.size() * 42 + 8 + r.sgmt_undo.size() * kUndoSgmtSize + 8 +
+           r.sva_undo.size() * kUndoSvaSize;
 }
 void serialize_record(const UndoRecord& r, std::vector<uint8_t>& out) {
     put_u64(out, r.height);
@@ -128,6 +133,13 @@ void serialize_record(const UndoRecord& r, std::vector<uint8_t>& out) {
     for (const auto &s : r.sgmt_undo) {
         put_bytes(out, s.key.data(), 32);
         put_bytes(out, s.prev_leaf.data(), 32);
+        out.push_back(s.existed ? 1 : 0);
+    }
+    // v4: SVA-8192 vault spend-counter effects.
+    put_u64(out, r.sva_undo.size());
+    for (const auto &s : r.sva_undo) {
+        put_bytes(out, s.vault.data(), 42);
+        put_u64(out, s.prev_counter);
         out.push_back(s.existed ? 1 : 0);
     }
 }
@@ -231,6 +243,28 @@ bool parse_record(ByteReader& r, UndoRecord& out) {
         if (!r.ok)
             return false;
         out.sgmt_undo.push_back(std::move(s));
+    }
+    const uint64_t sva_count = r.get_u64();
+    if (!r.ok)
+        return false;
+    // A block spends at most one vault leaf per vault per tx — the tx
+    // count is the honest bound.
+    if (sva_count > blockchain::MAX_TX_PER_BLOCK)
+        return false;
+    for (uint64_t j = 0; j < sva_count; ++j) {
+        UndoRecord::SvaSpendUndo s;
+        const uint8_t *vault;
+        if (!r.take(42, &vault))
+            return false;
+        std::memcpy(s.vault.data(), vault, 42);
+        s.prev_counter = r.get_u64();
+        const uint8_t *existed;
+        if (!r.take(1, &existed))
+            return false;
+        s.existed = existed[0] != 0;
+        if (!r.ok)
+            return false;
+        out.sva_undo.push_back(std::move(s));
     }
     return r.ok;
 }
@@ -363,6 +397,31 @@ void UndoEngine::record_sgmt_undo(uint64_t height,
     // trie effects would be reversed by nothing — the coverage guard makes
     // the rollback refuse instead of silently dropping them.
     std::fprintf(stderr, "[UNDO] no journal record for height %llu: SGMT undo dropped\n",
+                 static_cast<unsigned long long>(height));
+}
+
+void UndoEngine::record_sva_undo(uint64_t height,
+                                 const std::vector<ApplyResult::SvaSpendUndo> &entries) {
+    if (entries.empty())
+        return;
+    // The block that just applied has the newest record for the height —
+    // append there so the rollback's newest-first traversal restores the
+    // oldest snapshot last (same discipline as record_sgmt_undo).
+    for (auto it = undo_journal_.rbegin(); it != undo_journal_.rend(); ++it) {
+        if (it->height != height)
+            continue;
+        for (const auto &s : entries) {
+            UndoRecord::SvaSpendUndo u;
+            u.vault = s.vault;
+            u.prev_counter = s.prev_counter;
+            u.existed = s.existed;
+            it->sva_undo.push_back(std::move(u));
+        }
+        return;
+    }
+    std::fprintf(stderr,
+                 "[UNDO] no journal record for height %llu: SVA counter undo"
+                 " not recorded (coverage guard will refuse the rollback)\n",
                  static_cast<unsigned long long>(height));
 }
 
@@ -683,6 +742,17 @@ bool UndoEngine::rollback_to_height(uint64_t target_height) {
             if (!ledger_.sgmt_restore(s.key, s.prev_leaf, s.existed)) {
                 std::fprintf(stderr,
                              "[UNDO] state/journal mismatch: SGMT leaf restore at height %llu\n",
+                             static_cast<unsigned long long>(record.height));
+                last_error_ = "ERR_UNDO_STATE_MISMATCH";
+                return false;
+            }
+        }
+        // SVA-8192 (0.2.x): restore the vault spend counters. The commit
+        // phase advanced them; the journal holds the pre-block values.
+        for (const auto &s : record.sva_undo) {
+            if (!ledger_.revert_sva_counter(s.vault, s.prev_counter, s.existed)) {
+                std::fprintf(stderr,
+                             "[UNDO] state/journal mismatch: SVA counter restore at height %llu\n",
                              static_cast<unsigned long long>(record.height));
                 last_error_ = "ERR_UNDO_STATE_MISMATCH";
                 return false;

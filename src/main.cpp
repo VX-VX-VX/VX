@@ -299,6 +299,10 @@ int main(int argc, char* argv[]) {
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_log(ledger_path + ".pqw");
     // Rollover certs (v0.0.18): replay the durable cert sidecar too.
     vx::crypto::pq::PqWitnessRegistry::instance().attach_durable_cert_log(ledger_path + ".pqr");
+    // SVA-8192 (0.2.x): the vault spend witness rides beside the ledger —
+    // a restart re-applies its own history and must not orphan a vault
+    // spend already in the chain.
+    vx::blockchain::sva::SvaWitnessRegistry::instance().attach_durable_log(ledger_path + ".svaw");
     // DKSAP wire integration: the SGMT registration records are consensus-
     // visible — a node re-applying its own history refuses any SGMTLEAF
     // tx whose record is missing, so the durable log must be attached

@@ -760,6 +760,31 @@ void SwarmNode::peer_reader_loop(int fd, std::string label) {
                 witness_callback_(digest);
             continue;
         }
+        if (type == WireMsgType::SVA_WITNESS &&
+            payload.size() == blockchain::sva::kSvaWitnessWireSize) {
+            // SVA-8192 (0.2.x phase A): the vault spend witness rides beside
+            // the frame like PQ_WITNESS — verify-before-store (the registry
+            // only accepts a witness that derives the claimed vault
+            // encoding), then the dependent block applies once the sidecar
+            // is in place.
+            std::array<uint8_t, 32> digest{};
+            std::memcpy(digest.data(), payload.data(), 32);
+            blockchain::sva::SvaPreimage preimage{};
+            blockchain::sva::SvaMerklePath path{};
+            uint32_t idx = 0;
+            std::memcpy(preimage.data(), payload.data() + 74, blockchain::sva::kSvaPreimageSize);
+            std::memcpy(path.data(), payload.data() + 74 + blockchain::sva::kSvaPreimageSize,
+                        blockchain::sva::kSvaMerkleLevels * 32);
+            std::memcpy(&idx,
+                        payload.data() + 74 + blockchain::sva::kSvaPreimageSize +
+                            blockchain::sva::kSvaMerkleLevels * 32,
+                        4);
+            blockchain::sva::SvaWitnessRegistry::instance().register_witness_bytes(
+                digest, payload.data() + 32, preimage, path, idx);
+            if (witness_callback_)
+                witness_callback_(digest);
+            continue;
+        }
         if (type == WireMsgType::ROLLOVER_CERT) {
             handle_rollover_cert_payload(payload);
             continue;
@@ -1169,6 +1194,33 @@ void SwarmNode::set_peer_connected_callback(PeerConnectedCallback cb) {
     peer_connected_callback_ = std::move(cb);
 }
 
+// SVA-8192 (0.2.x phase A): build the digest-keyed SVA witness payloads for
+// a frame's vault spends — the same out-of-band sidecar model as the PQ
+// witness relay. The witness is only relayed when THIS node holds it
+// (backfill-before-apply discipline: a peer that lacks the sidecar refuses
+// the dependent block, never guesses). Payload = digest(32) + sender(42) +
+// preimage(1024) + path(256) + index(4) = 1358 B.
+static void build_sva_witness_payloads(const blockchain::RawBlock *raw, uint32_t count,
+                                       std::vector<std::vector<uint8_t>> &out) {
+    for (uint32_t i = 0; i < count; ++i) {
+        const blockchain::Transaction &tx = raw->transactions[i];
+        if (!blockchain::is_sva_address(blockchain::tx_address(tx.sender_nfa)))
+            continue; // vault spends only — system senders carry no witness
+        const auto digest = vx::crypto::pq::tx_msg_digest(tx);
+        blockchain::sva::SvaWitnessEntry e;
+        if (!blockchain::sva::SvaWitnessRegistry::instance().lookup(digest, tx.sender_nfa, e))
+            continue; // nothing to relay for this tx
+        std::vector<uint8_t> p(blockchain::sva::kSvaWitnessWireSize);
+        std::memcpy(p.data(), digest.data(), 32);
+        std::memcpy(p.data() + 32, tx.sender_nfa, 42);
+        std::memcpy(p.data() + 74, e.preimage.data(), e.preimage.size());
+        std::memcpy(p.data() + 74 + e.preimage.size(), e.path.data(), e.path.size() * 32);
+        const uint32_t idx = e.spend_index;
+        std::memcpy(p.data() + 74 + e.preimage.size() + e.path.size() * 32, &idx, 4);
+        out.push_back(std::move(p));
+    }
+}
+
 bool SwarmNode::send_witnesses_to(const std::string &peer_label,
                                   const std::span<const uint8_t, 65536> &frame) {
     auto *raw = reinterpret_cast<const blockchain::RawBlock *>(frame.data());
@@ -1210,6 +1262,12 @@ bool SwarmNode::send_witnesses_to(const std::string &peer_label,
             return false;
     }
     const bool ok = send_payloads_to(fd, payloads);
+    // SVA-8192: relay the frame's vault-spend witnesses on the same dup'd
+    // fd (the fd-dup discipline above applies identically).
+    std::vector<std::vector<uint8_t>> sva_payloads;
+    build_sva_witness_payloads(raw, count, sva_payloads);
+    if (!sva_payloads.empty())
+        send_wire_payloads_to(fd, WireMsgType::SVA_WITNESS, sva_payloads);
     ::close(fd);
     return ok;
 }
@@ -1245,8 +1303,14 @@ void SwarmNode::broadcast_witnesses_for(const std::span<const uint8_t, 65536> &f
             fds.push_back(fd);
         }
     }
-    for (int fd : fds)
+    // SVA-8192: relay the frame's vault-spend witnesses to every peer.
+    std::vector<std::vector<uint8_t>> sva_payloads;
+    build_sva_witness_payloads(raw, count, sva_payloads);
+    for (int fd : fds) {
         send_payloads_to(fd, payloads);
+        if (!sva_payloads.empty())
+            send_wire_payloads_to(fd, WireMsgType::SVA_WITNESS, sva_payloads);
+    }
 }
 
 // BACKLOG 1.5 P0 GATE: cert backfill plumbing ────────────────────────────────
@@ -2779,8 +2843,10 @@ struct SimNode {
                 reinterpret_cast<const uint8_t *>(g), SB_BLOCK_BYTES)};
             const auto r = ledger->apply_block(v);
             undo->apply_block(v);
-            if (r.ok)
+            if (r.ok) {
                 undo->record_sgmt_undo(v.header().block_height, r.sgmt_undo);
+                undo->record_sva_undo(v.header().block_height, r.sva_undo);
+            }
         }
     }
 
@@ -2840,8 +2906,10 @@ struct SimNode {
             BlockView v{std::span<const uint8_t, SB_BLOCK_BYTES>(frame.data(), SB_BLOCK_BYTES)};
             undo->apply_block(v);
             const auto r = ledger->apply_block(v);
-            if (r.ok)
+            if (r.ok) {
                 undo->record_sgmt_undo(v.header().block_height, r.sgmt_undo);
+                undo->record_sva_undo(v.header().block_height, r.sva_undo);
+            }
             cumulative_pogw = work_of_heights(height());
         }
         return cumulative_pogw;
@@ -3144,6 +3212,7 @@ SplitBrainReport SwarmNode::simulate_live_split_brain_reorg() {
                     // block committed (the undo journal is keyed by the trie
                     // key — the sidecar is invisible to the undo layer).
                     node_a.undo->record_sgmt_undo(v.header().block_height, r.sgmt_undo);
+                    node_a.undo->record_sva_undo(v.header().block_height, r.sva_undo);
                     node_a.undo->commit_undo_point();
                     node_a.store->append_block(b_frames[h - 1]);
                     ++report.blocks_resynced;

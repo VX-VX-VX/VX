@@ -281,6 +281,23 @@ using Address    = std::array<uint8_t, 42>;               // NFA payload without
 bool is_pq_address(const Address& a) noexcept;
 void derive_pq_address(const uint8_t root[32], uint8_t out_addr[42]) noexcept;
 
+// ── SVA-8192 Sovereign Vault addresses (0.2.x phase A) ──────────────────────
+//
+// The cold-custody address class: the payload is "SVA" followed by 39
+// base64url characters of Sponge("VXSVAADDRV1" || vault_root), where
+// vault_root is the 32-byte Merkle commitment the vault's 256 one-time
+// leaves collapse to (include/vx/blockchain/sva_vault.hpp). The 18-bit
+// truncation is the same documented drop as the PQ class — the vault
+// root is fully committed by the spend witness (the revealed preimage
+// re-derives the root and the encoding is re-checked byte-for-byte at
+// apply time), so the truncation never weakens authorization.
+//
+// Spending from an "SVA" address requires the SVA spend witness (the
+// revealed preimage + Merkle path + spend counter), NOT a PQ witness:
+// the ledger routes "SVA" senders through the vault path exclusively.
+bool is_sva_address(const Address &a) noexcept;
+void derive_sva_address(const uint8_t vault_root[32], uint8_t out_addr[42]) noexcept;
+
 /// The protocol's own senders - GENESIS mints and MINER_ coinbases - carry
 /// no PQ witness and are excluded from the witness merkle set (BACKLOG 2.11).
 /// One definition shared by apply_block, the intake gate and the witness

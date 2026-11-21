@@ -5,6 +5,11 @@ go, in what order, and — just as importantly — what is deliberately *not*
 promised. No dates are attached: items move when they are done and
 verified, not before.
 
+Every code change passes the standing process: adversarial review
+(`vx-audit`) as a gate before commit, a periodic full-tree zero-day hunt
+(`vx-zeroday`) as a background CVE-hunt loop, the three-lane suite
+(assert / ASan / TSan) before every tag, and UTC/GPG-signed commits.
+
 ## Shipped — v0.1.8-beta (current)
 
 - 3-Trunk Vortex Attractor (3072-bit, Solinas prime fields, CRT synthesis)
@@ -17,26 +22,15 @@ verified, not before.
 - Vault memory core (mlock arenas, page lifecycle, burn paths)
 - 7-tier key matrix, Shamir 2-of-3 recovery, proof-of-life
 - VSDPV mempool pre-filter, VX60 wire protocol, JSON RPC, web console
-- 16/16 test suites, CI on Arch (GCC + Clang, C++26)
+- 16/16 test suites, CI on Arch (GCC + C++26)
 - Sanitizer CI — ASan + UBSan test pass as a separate job; the pass exposed
   and fixed four real defects (uninitialized vault page pool, literal-length
   NFA field overreads, a 64-bit rotation UB, a use-after-free across a
   ledger reopen in the reorg path)
 - libFuzzer targets for block-frame parsing, WOTS+/XMSS witness
-  verification and VX60 wire ingest, wired into CI (`fuzz/`, deterministic
-  seeds)
+  verification, VX60 wire ingest and RPC input (fuzz/), wired into CI
 - CodeQL static analysis on the C++ core and the web console
-- RPC cookbook (`docs/RPC_COOKBOOK.md`) — task-oriented recipes for the
-  JSON RPC with live-captured responses: transfers, PQ signing, guard
-  replays, VM traces
-- Multi-node runbook (`docs/MULTI_NODE_RUNBOOK.md`) — live VX60 testnet:
-  3-node block propagation with tip convergence, garbage-packet
-  resistance, in-process split-brain reorg; plus the P2P wiring that made
-  it real (`--p2p`/`--peer` now bind, handshake, relay and gossip)
-- RPC input fuzzing (`fuzz/fuzz_rpc.cpp`) — the whole 34-endpoint JSON
-  surface behind a public `route()` catch-all; oversized numerals on the
-  transfer/audit paths no longer throw out of the RPC, and CI runs the
-  target for 200k fixed-seed execs
+- RPC cookbook and multi-node runbook (docs/)
 - VX60-SEC encrypted transport (BIP-324-analog) — ML-KEM-768 (FIPS 203,
   ACVP-KAT-verified) WARM/COLD handshake, sealed channels, MAC-only mode
   for public block bodies, per-IP connection caps, fail-closed SEC-channel
@@ -49,45 +43,90 @@ verified, not before.
   master-signed whitelist in the deterministic genesis config; share
   collection is gated on committee membership
 - SVA-8192 Sovereign Vault crypto core — the cold-custody address class
-  (Merkle-counter over 256 one-time leaves on the tree's own sponge);
-  ledger wiring is the next item
-- Chaos fuzzer for the VX60 wire path; 53/53 test suites with assert,
-  AddressSanitizer and ThreadSanitizer lanes
+  (Merkle-counter over 256 one-time leaves on the tree's Authorization =
+  revealed preimage; 256 one-time leaves → tombstone after the 256th spend;
+  the wallet physically cannot spend a 257th time)
+- 53/53 test suites across assert, ASan and TSan lanes
 
 ## Next — 0.2.x queue
 
-- SVA-8192 vault ledger wiring (spend path, counter atomicity, undo)
-- SLH-DSA (FIPS 205) signature backend with ACVP test vectors
-- Bitmasked m-of-n XMSS GQC committee (n ≤ 64, accountable BFT)
-- PQ-threshold finality (checkpoint gadget over verified XMSS quorum)
-- QRNG beacon for the epoch seed
-- Timelocks (TLMK/MSRK/EK streaming) and the C1-C5 contract phases
+The 0.2.x line is a fixed sequence of phases. The order is deliberate:
+standard primitives first (B), then the committee machinery that depends on
+them (C), then the world-first composite (D), then the research-heavy tail
+(E–G). Phases are not reordered, and none of them is skipped.
 
-## Mid term — earning the right to be called a protocol
+- **0.2.0 — Phase A: SVA-8192 vault ledger wiring** (in progress; the
+  8/8 wiring suite is green and pending the audit gate + commit). The
+  cold-custody address class becomes spendable: spend path through the
+  ledger, counter atomicity under concurrent blocks, undo/reorg rollback of
+  the one-time-leaf counter, tombstone after the 256th spend in every code
+  path, witness sidecar durability, and the vault entry lifecycle
+  (active → spent → tombstone) enforced ledger-side.
+- **0.2.1 — Phase B: SLH-DSA (FIPS 205) signature backend** with ACVP
+  test vectors. The witness API becomes pluggable behind the same frame
+  format, reducing the custom-sponge dependency for the signature layer.
+  Bit-exact against ACVP (internalProjection.json) vectors — a KAT failure
+  is a shipped bug, never a tolerance issue.
+- **0.2.2 — Phase C: Bitmasked m-of-n XMSS GQC committee** (n ≤ 64,
+  accountable BFT). The genesis whitelist committee graduates from a
+  fixed quorum to accountable m-of-n: bitmasked share attribution, per-member
+  accountability, no DKG (deliberately rejected — DKG breaks liveness and
+  costs tens of thousands of lines; the bitmask construction avoids it).
+- **0.2.3 — Phase D: PQ-threshold finality** — the checkpoint gadget over
+  a verified XMSS quorum. Threshold signatures on stateful post-quantum
+  trees: on ECDSA this is settled science (MuSig/FROST); on stateful XMSS
+  it has no prior art we are aware of, enabled by the one-shot leaf ledger
+  and rollover certificates. This is the flagship item of the 0.2.x line.
+- **0.2.4 — Phase E: QRNG beacon for the epoch seed** — the epoch seed
+  stops being master-signed and starts being QRNG-fed (external beacon
+  verification, fail-closed on beacon absence).
+- **0.2.5 — Phase F: Timelocks** (TLMK/MSRK/EK streaming) — vault entries
+  with time-bound spend windows, and the EK streaming track.
+- **0.2.6–0.2.10 — Phase G: C1–C5 contract phases** — one version per
+  phase, each behind the K1–K10 spec gate (see the contracts spec C0):
+  calldata/ABI, final gas table, FAULT policy, producer/verifier gas
+  discrepancy class, and the contract lifecycle. C0 ratification by the
+  owner is a hard precondition for every Phase G item.
 
-3. **Independent cryptographic review** — priority order: VortexSponge256,
-   the WOTS+/XMSS wiring and key-lifecycle state machine, then the
-   attractor's collision behavior. See whitepaper §15 — this is the single
-   most important item on the list.
-4. **Signature backend as an interface** — pluggable hash-based schemes
-   behind the same witness API. SLH-DSA (FIPS 205, SPHINCS+) is the first
-   candidate, next in the 0.2.x queue; the custom sponge dependency can
-   then be reduced or removed without touching the frame format.
-5. **Formal collision analysis of the address derivation** — including the
-   documented 18-bit prefix drop in the NFA payload.
-6. **GQC validator-set formation** — the epoch-1 committee ships as a
-   master-signed whitelist in the deterministic genesis config; the
-   economics and admission logic for later epochs (VRF-weighted selection,
-   age/reputation gates) remain research-grade (whitepaper §15, open
-   item 4).
+## Mid term — 0.3.x
 
-## Long term — conditional on everything above
+The 0.3.x line turns the protocol into a platform. None of it starts
+before the 0.2.x line is tagged and its audit trail is complete.
 
-7. **Public testnet** — real PoGW economics, external validators, live
-    ASERT under adversarial load.
-8. **Mainnet criteria** — published, explicit, and gated on the audit
-    outcome: no mainnet before (4) and (5) conclude, whatever the calendar
-    says.
+- **Contracts C0 ratification** — the K1–K10 spec (contracts spec C0)
+  needs owner ratification; every Phase G item is gated on it. C0
+  ratification is scheduled to start the 0.3.x window.
+- **VX60-SEC M2–M5** — the remaining VX60-SEC milestones (1-RTT KEM, PFS
+  hardening, channel resumption, release-hunt of the transport itself).
+- **DKSAP-Galois stealth nicknames** — the owner-specced stealth address
+  class (SK/IVK/Kspend/Kview, SGMT registration, Pstealth, radar on IVK,
+  1-of-16 detection). Beta-scheduled after 0.1.8, lands in the 0.3.x window.
+- **view_tag 7x radar** — detection acceleration for the stealth track.
+- **SGMT-tx wiring** — the SGMT cell registry becomes the transaction
+  surface for vault and stealth entries.
+- **zk-cocoon / SNARK track** — an owner decision gates this: beta ships
+  before SNARK; the SNARK track is a separate major after 0.2.x. No
+  commitment before that decision.
+- **Explorer, wallet GUI, tooling** — the ecosystem layer that carries
+  most of the path to 400k+ lines: block explorer, wallet GUI (web demo
+  exists), VX VM tooling (assembler/disassembler), testnet infrastructure
+  (P4 validator list, P5 domain + VPS fleet).
+- **Citadel round 2** — mlock/DONTDUMP hardening round for the vault core.
+
+## Long term — 0.4.x and beyond
+
+- **Public testnet** — real PoGW economics, external validators, live
+  ASERT under adversarial load; P4/P5 infrastructure items resolve here.
+- **400k+ line horizon** — full-VM (C1–C5 complete, SGMT cells, calldata,
+  gas table, FAULT rollback, byte-exact verifier reproduction), the
+  ecosystem layer, and the testnet infrastructure. This is a months-long
+  roadmap, not a single branch.
+- **Mainnet criteria** — published, explicit, and gated on the audits:
+  no mainnet before the independent cryptographic review (4) and the
+  formal collision analysis (5) conclude, whatever the calendar says.
+- **External audit gate** — the vx-zeroday loop is internal discipline;
+  it does not replace the independent external audit required by the
+  mainnet gate.
 
 ## Explicitly not promised
 
@@ -98,6 +137,17 @@ verified, not before.
   VX's).
 - A token sale, presale, or any form of fundraising. VX is AGPLv3
   research software.
+
+## Open owner items
+
+- **P4** — validator list (testnet admission).
+- **P5** — domain + 4 VPS fleet (seed hosts; until then a node without
+  `--seed` starts alone — PEX/ADDRS discovery works, but needs at least
+  one seed to find the network).
+- **Melt vector** — the 300 s → 60 s melt decision (beta config, last
+  open consensus parameter).
+- **CLAUDE.md untracked** — the repo CLAUDE.md is untracked; decide
+  track/ignore.
 
 ---
 

@@ -109,6 +109,7 @@ add_library(vx_core STATIC
     src/wif/wif_matrix.cpp
     src/blockchain/block.cpp
     src/blockchain/genesis.cpp
+    src/blockchain/sva_witness.cpp
     src/storage/block_store.cpp
     src/rpc/http_server.cpp
     src/crypto/simd_accel.cpp
@@ -355,6 +356,12 @@ add_test(NAME VortexVx60SecRekeyTest COMMAND test_vx60_sec_rekey)
 add_executable(test_sva_vault tests/test_sva_vault.cpp)
 target_link_libraries(test_sva_vault PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexSvaVaultTest COMMAND test_sva_vault)
+add_executable(test_sva_wiring tests/test_sva_wiring.cpp)
+target_link_libraries(test_sva_wiring PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexSvaWiringTest COMMAND test_sva_wiring)
+add_executable(test_sva_zeroday tests/test_sva_zeroday.cpp)
+target_link_libraries(test_sva_zeroday PRIVATE vx_core gtest gtest_main)
+add_test(NAME VortexSvaZerodayTest COMMAND test_sva_zeroday)
 
 # ML-KEM-768 (FIPS 203) — the DKSAP stealth track's KEM, ACVP-KAT-gated.
 add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)

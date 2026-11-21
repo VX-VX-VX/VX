@@ -45,6 +45,15 @@ struct UndoRecord {
         bool existed = false;
     };
     std::vector<SgmtLeafUndo> sgmt_undo;
+    // SVA-8192 (0.2.x phase A): vault spend-counter effects. The commit
+    // phase advanced the vault's counter (leaf burned); the journal holds
+    // the pre-block value so a reorg rollback restores the exact counter.
+    struct SvaSpendUndo {
+        Address vault{};
+        uint64_t prev_counter = 0;
+        bool existed = false;
+    };
+    std::vector<SvaSpendUndo> sva_undo;
 };
 
 // A displaced fork block preserved by a rollback (BACKLOG 0.12): the
@@ -79,6 +88,13 @@ public:
     // record that named the trie key. Called AFTER ledger_.apply_block
     // succeeded; the newest record for the height is the target.
     void record_sgmt_undo(uint64_t height, const std::vector<ApplyResult::SgmtUndoEntry> &entries);
+
+    // SVA-8192 (0.2.x phase A): append the vault spend-counter effects of
+    // an applied block to that block's journal record. The ledger's commit
+    // phase is the only writer of the counter; the journal carries the
+    // pre-block value so a reorg rollback restores the exact counter.
+    // Called AFTER ledger_.apply_block succeeded, like record_sgmt_undo.
+    void record_sva_undo(uint64_t height, const std::vector<ApplyResult::SvaSpendUndo> &entries);
 
     // Drop the newest in-memory record: the caller recorded a pre-state
     // entry but the block did NOT enter the ledger (apply refused), so a

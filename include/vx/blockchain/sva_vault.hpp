@@ -30,9 +30,8 @@
 // 0.2.x integration commit. NO-STUB: everything here is complete.
 // ─────────────────────────────────────────────────────────────────────────────
 
-#pragma once
-
 #include "vx/blockchain/crypto_sponge.hpp"
+#include "vx/blockchain/emission.hpp"
 
 #include <array>
 #include <cstddef>
@@ -46,6 +45,11 @@ inline constexpr size_t kSvaPreimageSize = 1024;   // 8192 bits per leaf
 inline constexpr size_t kSvaMerkleLevels = 8;      // 256 = 2^8
 inline constexpr uint64_t kSvaMaxSpends = 256;     // after: tombstone
 inline constexpr uint64_t kSvaMinBalanceVx = 1000; // ledger gate (0.2.x wire)
+// 0.2.x wiring (owner plan, phase A): every vault spend carries a minimum
+// fee of 1 VX — the standard TDI split (50% burn / 50% producer) applies,
+// so each spend burns at least 0.5 VX. Priced per SPEND, not per vault.
+inline constexpr uint64_t kSvaSpendFeeVx = 1;
+inline constexpr uint64_t kSvaSpendFeeAtoms = kSvaSpendFeeVx * ATOMS_PER_VX;
 
 using SvaPreimage = std::array<uint8_t, kSvaPreimageSize>;
 using SvaAddress = std::array<uint8_t, 32>;
@@ -132,15 +136,15 @@ inline SvaMerklePath sva_path_of(const std::array<SvaPreimage, kSvaLeaves> &prei
     return path;
 }
 
-/// SPEND VERIFICATION (the ledger calls this at apply time): the revealed
-/// preimage must (a) commit to the leaf at position spend_counter, (b) walk
-/// the Merkle path to the vault address root. The counter binds the leaf
-/// order — a revealed preimage is dead after its one spend, and an
-/// out-of-order leaf is refused even with a valid path.
-inline bool sva_verify_spend(const SvaAddress &vault, uint64_t spend_counter,
-                             const SvaPreimage &preimage, const SvaMerklePath &path) noexcept {
+/// The Merkle root a SPEND WITNESS derives: leaf commit at position
+/// spend_counter, then walk the sibling path up. The registry and the
+/// ledger both call this — the root is derived from the witness alone,
+/// never taken from the wire. A tombstone position (>= kSvaMaxSpends)
+/// derives the all-zero root, which cannot equal a real vault address.
+inline SvaAddress sva_root_of(uint64_t spend_counter, const SvaPreimage &preimage,
+                              const SvaMerklePath &path) noexcept {
     if (spend_counter >= kSvaMaxSpends)
-        return false; // tombstone: the vault closed
+        return SvaAddress{}; // tombstone position: no root derives
     const uint8_t idx = static_cast<uint8_t>(spend_counter);
     std::array<uint8_t, 32> level_node = sva_leaf_commit(preimage, idx);
     // Re-derive the root: walk the sibling path up (the leaf binds to its
@@ -159,7 +163,19 @@ inline bool sva_verify_spend(const SvaAddress &vault, uint64_t spend_counter,
     }
     SvaAddress derived{};
     detail::sva_hash("VX_SVA_V1", 10, level_node.data(), 32, nullptr, 0, derived);
-    return derived == vault;
+    return derived;
+}
+
+/// SPEND VERIFICATION (the ledger calls this at apply time): the revealed
+/// preimage must (a) commit to the leaf at position spend_counter, (b) walk
+/// the Merkle path to the vault address root. The counter binds the leaf
+/// order — a revealed preimage is dead after its one spend, and an
+/// out-of-order leaf is refused even with a valid path.
+inline bool sva_verify_spend(const SvaAddress &vault, uint64_t spend_counter,
+                             const SvaPreimage &preimage, const SvaMerklePath &path) noexcept {
+    if (spend_counter >= kSvaMaxSpends)
+        return false; // tombstone: the vault closed
+    return sva_root_of(spend_counter, preimage, path) == vault;
 }
 
 } // namespace vx::blockchain::sva

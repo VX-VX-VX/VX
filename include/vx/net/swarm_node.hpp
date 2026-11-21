@@ -84,6 +84,13 @@ enum class WireMsgType : uint8_t {
     SEC_SERVER_HELLO = 0x11,
     SEC_PK_RESPONSE = 0x12,
     SEC_KEM_ROTATE = 0x13,
+    // SVA-8192 (0.2.x phase A): the vault spend witness, the same
+    // digest-keyed sidecar model as PQ_WITNESS. Payload =
+    // digest(32) + sender_nfa(42) + preimage(1024) + merkle_path(8x32) +
+    // spend_index(4) = 1358 bytes. Verify-before-store: the witness must
+    // derive the claimed vault encoding, so only the vault owner can
+    // register one (a revealed preimage is dead after its one spend).
+    SVA_WITNESS = 0x14,
 };
 
 // Wire flags
