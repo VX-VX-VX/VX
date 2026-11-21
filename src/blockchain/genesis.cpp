@@ -7,9 +7,11 @@
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/math/galois_attractor.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 
 namespace vx::blockchain {
@@ -264,6 +266,16 @@ std::array<uint8_t, 32> epoch_node_id(uint16_t id) {
 
 } // namespace
 
+std::array<uint8_t, 32> gqc_epoch_validator_sk(uint16_t id) {
+    // "VX_GQC_EPOCH1_VALIDATOR_<id>_SK_V1" → the deterministic test XMSS key
+    // of validator <id>. Independent of the node_id tag: the transport
+    // identity and the signing identity are different secrets.
+    std::string tag = "VX_GQC_EPOCH1_VALIDATOR_" + std::to_string(id) + "_SK_V1";
+    std::array<uint8_t, 32> out{};
+    VortexSponge256::compute(reinterpret_cast<const uint8_t *>(tag.data()), tag.size(), out.data());
+    return out;
+}
+
 std::array<uint8_t, 32> gqc_epoch_whitelist_msg(const std::vector<GqcEpochMember> &members) {
     VortexSponge256 s;
     const char tag[] = "VX_GQC_EPOCH1_WHITELIST_V1";
@@ -271,9 +283,12 @@ std::array<uint8_t, 32> gqc_epoch_whitelist_msg(const std::vector<GqcEpochMember
     // Byte-order contract: validator_id is hashed as 2 raw little-endian
     // bytes. This is a hash input, not a wire field — LE is the canonical
     // choice here; a third-party implementation must pack the same order.
+    // Phase C: the member's XMSS root is bound into the whitelist, so the
+    // master signature commits to exactly WHO may sign votes.
     for (const auto &m : members) {
         s.absorb(reinterpret_cast<const uint8_t *>(&m.validator_id), sizeof(m.validator_id));
         s.absorb(m.node_id.data(), m.node_id.size());
+        s.absorb(m.root.data(), m.root.size());
     }
     std::array<uint8_t, 32> out{};
     s.finalize(out.data());
@@ -286,8 +301,16 @@ const GqcEpochConfig &gqc_epoch_committee() {
         // localhost topology (owner decision 18.11): 4 deterministic test
         // node_ids; the P4/VPS phase swaps in the real machine node_ids and
         // the real master key's signature (the sk never ships).
-        for (uint16_t id = 0; id < 4; ++id)
-            c.members.push_back(GqcEpochMember{id, epoch_node_id(id)});
+        for (uint16_t id = 0; id < 4; ++id) {
+            const auto sk = gqc_epoch_validator_sk(id);
+            const auto ps = vx::crypto::pq::pub_seed_from_sk(sk);
+            c.members.push_back(
+                GqcEpochMember{id, epoch_node_id(id), vx::crypto::pq::xmss_root(sk, ps)});
+        }
+        // Canonical order: sort by root bytes. The bitmap bit of a member is
+        // its position in THIS order — every node derives the same mask.
+        std::sort(c.members.begin(), c.members.end(),
+                  [](const GqcEpochMember &a, const GqcEpochMember &b) { return a.root < b.root; });
         const std::array<uint8_t, 32> msg = gqc_epoch_whitelist_msg(c.members);
         std::array<uint8_t, 32> master_sk{};
         VortexSponge256::compute(reinterpret_cast<const uint8_t *>("VX_GQC_EPOCH1_MASTER_SK_V1"),
@@ -301,6 +324,10 @@ const GqcEpochConfig &gqc_epoch_committee() {
         if (!vx::crypto::pq::pq_verify_wots_xmss(msg, c.master_sig) ||
             c.master_sig.pq_pubkey_root != c.master_root)
             throw std::runtime_error("genesis: GQC epoch committee signature fails self-check");
+        // Phase C: a committee above 64 cannot be bitmasked — fail-closed at
+        // boot (an audit focus of the spec; the bitmap must never overflow).
+        if (c.members.size() > 64)
+            throw std::runtime_error("genesis: GQC epoch committee exceeds bitmap capacity");
         return c;
     }();
     return cfg;
@@ -311,6 +338,14 @@ bool gqc_epoch_committee_contains(uint16_t validator_id) {
         if (m.validator_id == validator_id)
             return true;
     return false;
+}
+
+size_t gqc_epoch_member_index(uint16_t validator_id) {
+    const auto &members = gqc_epoch_committee().members;
+    for (size_t i = 0; i < members.size(); ++i)
+        if (members[i].validator_id == validator_id)
+            return i;
+    return std::numeric_limits<size_t>::max();
 }
 
 } // namespace vx::blockchain

@@ -22,9 +22,47 @@
 #include <unistd.h>
 
 using vx::consensus::GqcFinality;
-using vx::consensus::GqcShare;
 using vx::core::RingPipeline;
 using vx::blockchain::Transaction;
+
+// Phase C: sign a committee member's vote with its deterministic test key.
+// One PqLeafLedger serves all members — the ledger is keyed by XMSS root.
+static vx::consensus::gqc::GqcVote member_vote(uint16_t validator_id, uint64_t height,
+                                               const std::array<uint8_t, 32> &block_hash,
+                                               vx::crypto::pq::PqLeafLedger &ledger) {
+    const auto sk = vx::blockchain::gqc_epoch_validator_sk(validator_id);
+    const auto &committee = vx::blockchain::gqc_epoch_committee();
+    return vx::consensus::gqc::sign_vote(validator_id, sk, committee.epoch, height, block_hash,
+                                         ledger);
+}
+
+// Mines one PoGW-sealed block on the current tip. Finality tests vote on
+// the tip height: the finalized-height gate refuses votes at the genesis
+// height (height 0 is implicitly final everywhere) and stamp_gqc records
+// only heights that exist in the store — so every finality test mines first.
+static bool mine_one_block(vx::storage::BlockStore &store) {
+    vx::blockchain::BlockBuilder builder;
+    builder.set_height(store.chain_height());
+    builder.set_timestamp(1'761'000'005ULL); // >= genesis ts
+    uint8_t tip0[32] = {};
+    store.tip_hash(tip0);
+    builder.set_prev_hash(tip0);
+    std::array<uint8_t, 384> coords{};
+    builder.set_attractor_coords(coords.data());
+    vx::blockchain::Transaction mint{};
+    vx::blockchain::set_nfa_field(mint.sender_nfa, "MINER_GQC_TEST_000000000000000000000000000");
+    vx::blockchain::set_nfa_field(mint.receiver_nfa, "GQC_TEST_RECV_0000000000000000000000000000");
+    vx::blockchain::tx_set_amount(mint, 1'000'000);
+    vx::blockchain::tx_set_fee(mint, 100);
+    vx::blockchain::set_coinbase_binding(mint, store.chain_height(), tip0);
+    builder.add_transaction(mint);
+    builder.finalize();
+    vx::blockchain::BlockFrame frame;
+    std::memcpy(frame.data(), builder.bytes().data(), 65536);
+    if (!vx::blockchain::seal_pogw_nonce(frame, 1))
+        return false;
+    return store.append_block(frame);
+}
 
 // ── 1. GQC finality ─────────────────────────────────────────────────────────
 
@@ -35,8 +73,12 @@ TEST(VortexGqcRingStealthTest, GqcEpochCommitteeDeterministic) {
     const auto &b = vx::blockchain::gqc_epoch_committee();
     ASSERT_EQ(&a, &b) << "the committee config must be a process-wide singleton";
     ASSERT_EQ(a.members.size(), 4u) << "localhost topology: 4 validators";
-    for (size_t i = 0; i < a.members.size(); ++i)
-        EXPECT_EQ(a.members[i].validator_id, i);
+    // The members are canonically sorted by root bytes, so the ids are not
+    // necessarily in tag order — check the SET instead.
+    uint16_t id_mask = 0;
+    for (const auto &m : a.members)
+        id_mask |= static_cast<uint16_t>(1u << m.validator_id);
+    EXPECT_EQ(id_mask, 0x0F);
     // The whitelist message must be a pure function of the member list.
     const auto msg1 = vx::blockchain::gqc_epoch_whitelist_msg(a.members);
     const auto msg2 = vx::blockchain::gqc_epoch_whitelist_msg(b.members);
@@ -73,28 +115,8 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     vx::storage::BlockStore store(tmp_dir + "/gqc_ledger.vxb", "genesis.bin", 1);
 
     // Ensure a real (non-genesis) tip exists to certify.
-    if (store.chain_height() < 2) {
-        vx::blockchain::BlockBuilder builder;
-        builder.set_height(store.chain_height());
-        builder.set_timestamp(1'761'000'005ULL); // >= genesis ts
-        uint8_t tip0[32] = {};
-        store.tip_hash(tip0);
-        builder.set_prev_hash(tip0);
-        std::array<uint8_t, 384> coords{};
-        builder.set_attractor_coords(coords.data());
-        vx::blockchain::Transaction mint{};
-        vx::blockchain::set_nfa_field(mint.sender_nfa, "MINER_GQC_TEST_000000000000000000000000000");
-        vx::blockchain::set_nfa_field(mint.receiver_nfa, "GQC_TEST_RECV_0000000000000000000000000000");
-        vx::blockchain::tx_set_amount(mint, 1'000'000);
-        vx::blockchain::tx_set_fee(mint, 100);
-        vx::blockchain::set_coinbase_binding(mint, store.chain_height(), tip0);
-        builder.add_transaction(mint);
-        builder.finalize();
-        vx::blockchain::BlockFrame frame;
-        std::memcpy(frame.data(), builder.bytes().data(), 65536);
-        ASSERT_TRUE(vx::blockchain::seal_pogw_nonce(frame, 1)) << "PoGW seal failed";
-        ASSERT_TRUE(store.append_block(frame)) << "test block rejected";
-    }
+    if (store.chain_height() < 2)
+        ASSERT_TRUE(mine_one_block(store)) << "test block rejected";
 
     vx::state::LedgerState ledger;
     vx::state::UndoEngine undo(tmp_dir, store, ledger);
@@ -109,12 +131,27 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
     std::array<uint8_t, 32> block_hash{};
     std::memcpy(block_hash.data(), tip, 32);
 
-    // Collect shares from the genesis epoch committee, finalize the tip.
+    // Collect votes from the genesis epoch committee, finalize the tip.
     const auto &committee = vx::blockchain::gqc_epoch_committee();
     const uint32_t kValidators = static_cast<uint32_t>(committee.members.size());
+    vx::crypto::pq::PqLeafLedger vote_ledger;
+    // Quorum threshold first: 2 of the 4 members < 2/3 (3 needed) — no
+    // certification, no lock. Then the remaining votes complete the quorum.
+    uint16_t collected = 0;
     for (const auto &m : committee.members) {
-        gqc.collect_share(tip_h, block_hash, m.validator_id,
-                          GqcFinality::derive_validator_share(block_hash, tip_h, m.validator_id));
+        if (collected++ >= 2)
+            break;
+        gqc.collect_vote(tip_h, block_hash,
+                         member_vote(m.validator_id, tip_h, block_hash, vote_ledger));
+    }
+    const auto cert_pending = gqc.finalize_block(tip_h, block_hash, kValidators);
+    EXPECT_FALSE(cert_pending.certified);
+    EXPECT_NE(cert_pending.error.find("quorum"), std::string::npos);
+    EXPECT_EQ(gqc.finalized_checkpoint_height(), 0u) << "a failed quorum must not cement";
+
+    for (const auto &m : committee.members) {
+        gqc.collect_vote(tip_h, block_hash,
+                         member_vote(m.validator_id, tip_h, block_hash, vote_ledger));
     }
     const auto cert = gqc.finalize_block(tip_h, block_hash, kValidators);
     ASSERT_TRUE(cert.certified) << cert.error;
@@ -138,28 +175,6 @@ TEST(VortexGqcRingStealthTest, GqcFinalizedReorgBlocked) {
         EXPECT_FALSE(undo.rollback_to_height(h));
         EXPECT_EQ(undo.last_error(), "ERR_FINALIZED_BY_GQC") << "height " << h;
     }
-
-    // Quorum not met -> no certification, no lock.
-    GqcFinality gqc2(undo, store);
-    uint8_t tip2[32];
-    store.tip_hash(tip2);
-    std::array<uint8_t, 32> h2{};
-    std::memcpy(h2.data(), tip2, 32);
-    // 2 of the 4 committee members < 2/3 quorum (3 needed).
-    uint16_t collected = 0;
-    for (const auto &m : vx::blockchain::gqc_epoch_committee().members) {
-        if (collected++ >= 2)
-            break;
-        gqc2.collect_share(tip_h, h2, m.validator_id,
-                           GqcFinality::derive_validator_share(h2, tip_h, m.validator_id));
-    }
-    const auto cert2 = gqc2.finalize_block(tip_h, h2, kValidators);
-    EXPECT_FALSE(cert2.certified);
-    EXPECT_NE(cert2.error.find("quorum"), std::string::npos);
-    // BACKLOG 0.13: the guard is seeded from the persisted checkpoint (the
-    // undo engine restored it), so a second finality object reports the
-    // cemented height, not 0 — the quorum failure adds nothing new to it.
-    EXPECT_EQ(gqc2.finalized_checkpoint_height(), tip_h);
 
     std::filesystem::remove_all(tmp_dir);
 }
@@ -209,10 +224,10 @@ TEST(VortexGqcRingStealthTest, GqcCheckpointSurvivesRestart) {
         store.tip_hash(tip);
         std::array<uint8_t, 32> block_hash{};
         std::memcpy(block_hash.data(), tip, 32);
+        vx::crypto::pq::PqLeafLedger vote_ledger;
         for (const auto &m : vx::blockchain::gqc_epoch_committee().members) {
-            gqc.collect_share(
-                tip_h, block_hash, m.validator_id,
-                GqcFinality::derive_validator_share(block_hash, tip_h, m.validator_id));
+            gqc.collect_vote(tip_h, block_hash,
+                             member_vote(m.validator_id, tip_h, block_hash, vote_ledger));
         }
         const auto cert = gqc.finalize_block(
             tip_h, block_hash,
@@ -259,17 +274,17 @@ TEST(VortexGqcRingStealthTest, GqcCheckpointSurvivesRestart) {
     std::filesystem::remove_all(tmp_dir);
 }
 
-// Honest-gap test (external review finding): the share derivation consumes
-// ONLY public data (block hash, height, validator id) — no validator secret
-// exists yet. This test deliberately forges a full quorum without holding
-// any key and EXPECTS the attack to succeed, pinning the gap until
-// validator authentication (BACKLOG 0.4 / 2.4) ships. Flip this test when
-// shares become signature-bearing.
-TEST(VortexGqcRingStealthTest, GqcQuorumForgeableFromPublicDataOnly) {
+// Phase C: the honest-gap test from the share era is now CLOSED. A quorum
+// forged from public data alone must FAIL — every vote must verify against
+// a whitelist member's XMSS root, and public data yields no signature. The
+// forged votes are dropped by the verify-before-store gate and the
+// certificate never reaches the quorum.
+TEST(VortexGqcRingStealthTest, GqcQuorumForgeFailsClosed) {
     const std::string tmp_dir = (std::filesystem::temp_directory_path() / ("vx_gqc_forge_" + std::to_string(::getpid()))).string();
     std::filesystem::create_directories(tmp_dir);
 
-    vx::storage::BlockStore store(tmp_dir + "/gqc_forge_ledger.vxb", "genesis.bin");
+    vx::storage::BlockStore store(tmp_dir + "/gqc_forge_ledger.vxb", "genesis.bin", 1);
+    ASSERT_TRUE(mine_one_block(store)) << "test block rejected";
     vx::state::LedgerState ledger;
     vx::state::UndoEngine undo(tmp_dir, store, ledger);
     GqcFinality gqc(undo, store);
@@ -282,51 +297,161 @@ TEST(VortexGqcRingStealthTest, GqcQuorumForgeableFromPublicDataOnly) {
     std::array<uint8_t, 32> block_hash{};
     std::memcpy(block_hash.data(), tip, 32);
 
-    // Attack: derive every COMMITTEE validator's share from public data alone.
+    // Attack: feed a full quorum of WITNESS-FREE votes (default witnesses do
+    // not verify against any root). The membership gate passes — the ids are
+    // real members — but verify-before-store drops every vote.
     const auto &committee = vx::blockchain::gqc_epoch_committee();
     const uint32_t kValidators = static_cast<uint32_t>(committee.members.size());
     for (const auto &m : committee.members) {
-        gqc.collect_share(tip_h, block_hash, m.validator_id,
-                          GqcFinality::derive_validator_share(block_hash, tip_h, m.validator_id));
+        gqc.collect_vote(tip_h, block_hash, vx::consensus::gqc::GqcVote{m.validator_id, {}});
     }
     const auto cert = gqc.finalize_block(tip_h, block_hash, kValidators);
 
-    // The honest assertion: TODAY the forge succeeds. A quorum certificate
-    // can be produced by anyone who knows (block hash, height, validator
-    // count) and holds no validator secret at all.
-    ASSERT_TRUE(cert.certified) << cert.error;
-    EXPECT_EQ(cert.share_count, committee.members.size());
-    std::cout << "  [documented gap] GQC quorum forged from public data only: "
-              << cert.share_count << "/" << kValidators
-              << " shares, zero secrets used. Validator authentication is a"
-              << " BACKLOG 0.4/2.4 item; until then cryptographic finality is"
-              << " NOT claimed.\n";
+    // The closed gate: no key, no certificate. The error names the missing
+    // votes, and the checkpoint is never cemented.
+    EXPECT_FALSE(cert.certified) << "a witness-free quorum must not certify";
+    EXPECT_EQ(cert.share_count, 0u);
+    EXPECT_NE(cert.error.find("no votes"), std::string::npos);
+    EXPECT_EQ(gqc.finalized_checkpoint_height(), 0u);
     std::filesystem::remove_all(tmp_dir);
 }
 
-TEST(VortexGqcRingStealthTest, GqcAggregationDeterministic) {
-    std::array<uint8_t, 32> hash{};
-    for (size_t i = 0; i < 32; ++i) hash[i] = static_cast<uint8_t>(i * 7);
+// ── Phase C accountability: equivocation, forged-id gate, bitmap ────────────
 
-    std::vector<GqcShare> shares;
-    for (uint16_t v = 0; v < 6; ++v) {
-        shares.push_back({v, GqcFinality::derive_validator_share(hash, 5, v)});
+// Equivocation: a member that signs TWO DIFFERENT block hashes at the same
+// height is provably guilty. The proof carries both verified witnesses and
+// is recorded once (the first valid evidence); further conflicting votes
+// from the same guilty member are O(1) drops.
+TEST(VortexGqcRingStealthTest, GqcEquivocationProofRecordedAndDeduped) {
+    const std::string tmp_dir =
+        (std::filesystem::temp_directory_path() / ("vx_gqc_equiv_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(tmp_dir);
+
+    vx::storage::BlockStore store(tmp_dir + "/gqc_equiv.vxb", "genesis.bin", 1);
+    ASSERT_TRUE(mine_one_block(store)) << "test block rejected";
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(tmp_dir, store, ledger);
+    GqcFinality gqc(undo, store);
+
+    const uint64_t height = store.chain_height();
+    ASSERT_GE(height, 1u);
+    const uint64_t tip_h = height - 1;
+    uint8_t tip[32];
+    store.tip_hash(tip);
+    std::array<uint8_t, 32> hash_a{};
+    std::memcpy(hash_a.data(), tip, 32);
+    std::array<uint8_t, 32> hash_b = hash_a;
+    hash_b[0] ^= 0x01;
+
+    vx::crypto::pq::PqLeafLedger vote_ledger;
+    const auto guilty_id = vx::blockchain::gqc_epoch_committee().members[0].validator_id;
+    // Fork A: the member votes for the canonical tip.
+    gqc.collect_vote(tip_h, hash_a, member_vote(guilty_id, tip_h, hash_a, vote_ledger));
+    // Fork B: the same member votes for a DIFFERENT hash at the same height.
+    gqc.collect_vote(tip_h, hash_b, member_vote(guilty_id, tip_h, hash_b, vote_ledger));
+    // A third conflicting vote — the proof is already recorded: O(1) drop.
+    std::array<uint8_t, 32> hash_c = hash_a;
+    hash_c[1] ^= 0x01;
+    gqc.collect_vote(tip_h, hash_c, member_vote(guilty_id, tip_h, hash_c, vote_ledger));
+
+    const auto proofs = gqc.take_equivocations();
+    ASSERT_EQ(proofs.size(), 1u) << "the first valid evidence is the proof; the rest drop";
+    EXPECT_EQ(proofs[0].validator_id, guilty_id);
+    EXPECT_EQ(proofs[0].height, tip_h);
+    EXPECT_EQ(proofs[0].block_hash_a, hash_a);
+    EXPECT_EQ(proofs[0].block_hash_b, hash_b);
+    // Both witnesses are real evidence: they verify under the member root.
+    const auto member_root = vx::blockchain::gqc_epoch_committee().members[0].root;
+    EXPECT_TRUE(vx::consensus::gqc::verify_vote(member_root,
+                                                vx::blockchain::gqc_epoch_committee().epoch, tip_h,
+                                                hash_a, {guilty_id, proofs[0].witness_a}));
+    EXPECT_TRUE(vx::consensus::gqc::verify_vote(member_root,
+                                                vx::blockchain::gqc_epoch_committee().epoch, tip_h,
+                                                hash_b, {guilty_id, proofs[0].witness_b}));
+    // The pool is empty: the proof drained.
+    EXPECT_TRUE(gqc.take_equivocations().empty());
+
+    std::filesystem::remove_all(tmp_dir);
+}
+
+// The membership gate: a vote from a validator_id NOT on the whitelist is
+// forged — it never pools, so the certificate can never reach a quorum.
+TEST(VortexGqcRingStealthTest, GqcForgedIdVoteRefused) {
+    const std::string tmp_dir =
+        (std::filesystem::temp_directory_path() / ("vx_gqc_forge_id_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(tmp_dir);
+
+    vx::storage::BlockStore store(tmp_dir + "/gqc_forge_id.vxb", "genesis.bin", 1);
+    ASSERT_TRUE(mine_one_block(store)) << "test block rejected";
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(tmp_dir, store, ledger);
+    GqcFinality gqc(undo, store);
+
+    const uint64_t tip_h = store.chain_height() - 1;
+    uint8_t tip[32];
+    store.tip_hash(tip);
+    std::array<uint8_t, 32> block_hash{};
+    std::memcpy(block_hash.data(), tip, 32);
+
+    // A foreign id (9999) with a perfectly valid witness from a REAL member
+    // key: the id gate fires first — the id, not the witness, is the pool key.
+    vx::crypto::pq::PqLeafLedger vote_ledger;
+    auto forged = member_vote(0, tip_h, block_hash, vote_ledger);
+    forged.validator_id = 9999;
+    gqc.collect_vote(tip_h, block_hash, forged);
+    // A real member id with a WITNESS-FREE vote: verify-before-store drops it.
+    gqc.collect_vote(tip_h, block_hash, vx::consensus::gqc::GqcVote{0, {}});
+
+    const auto cert = gqc.finalize_block(
+        tip_h, block_hash,
+        static_cast<uint32_t>(vx::blockchain::gqc_epoch_committee().members.size()));
+    EXPECT_FALSE(cert.certified);
+    EXPECT_EQ(cert.share_count, 0u);
+    EXPECT_TRUE(gqc.take_equivocations().empty());
+    std::filesystem::remove_all(tmp_dir);
+}
+
+// The certificate records exactly WHO signed: the bitmap over the
+// canonically-ordered whitelist, and the aggregate commits to that set.
+TEST(VortexGqcRingStealthTest, GqcCertBitmapCoversFullQuorum) {
+    const std::string tmp_dir =
+        (std::filesystem::temp_directory_path() / ("vx_gqc_bitmap_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(tmp_dir);
+
+    vx::storage::BlockStore store(tmp_dir + "/gqc_bitmap.vxb", "genesis.bin", 1);
+    ASSERT_TRUE(mine_one_block(store)) << "test block rejected";
+    vx::state::LedgerState ledger;
+    vx::state::UndoEngine undo(tmp_dir, store, ledger);
+    GqcFinality gqc(undo, store);
+
+    const uint64_t tip_h = store.chain_height() - 1;
+    uint8_t tip[32];
+    store.tip_hash(tip);
+    std::array<uint8_t, 32> block_hash{};
+    std::memcpy(block_hash.data(), tip, 32);
+
+    const auto &committee = vx::blockchain::gqc_epoch_committee();
+    vx::crypto::pq::PqLeafLedger vote_ledger;
+    for (const auto &m : committee.members) {
+        gqc.collect_vote(tip_h, block_hash,
+                         member_vote(m.validator_id, tip_h, block_hash, vote_ledger));
     }
-    const auto agg_a = GqcFinality::aggregate_shares(shares, hash, 5);
-    const auto agg_b = GqcFinality::aggregate_shares(shares, hash, 5);
-    EXPECT_EQ(agg_a, agg_b);
-
-    // A different share set (one extra validator) changes the aggregate.
-    auto shares2 = shares;
-    shares2.push_back({99, GqcFinality::derive_validator_share(hash, 5, 99)});
-    const auto agg_c = GqcFinality::aggregate_shares(shares2, hash, 5);
-    EXPECT_NE(agg_a, agg_c);
-
-    // Different block hash changes the aggregate.
-    auto hash2 = hash;
-    hash2[0] ^= 1;
-    const auto agg_d = GqcFinality::aggregate_shares(shares, hash2, 5);
-    EXPECT_NE(agg_a, agg_d);
+    const auto cert =
+        gqc.finalize_block(tip_h, block_hash, static_cast<uint32_t>(committee.members.size()));
+    ASSERT_TRUE(cert.certified) << cert.error;
+    EXPECT_EQ(cert.share_count, committee.members.size());
+    // Every member is a signer: a 4-member committee sets exactly 4 bits.
+    EXPECT_EQ(cert.signers_bitmap, (1u << committee.members.size()) - 1);
+    // The aggregate is a commitment to the exact signer set: the same
+    // (height, bitmap, votes) folds deterministically, and the persisted
+    // sidecar record matches the certified aggregate.
+    uint8_t persisted[32];
+    ASSERT_TRUE(store.gqc_stamp(tip_h, persisted)) << "sidecar record missing";
+    EXPECT_EQ(std::memcmp(persisted, cert.gqc_signature_agg.data(), 32), 0);
+    std::filesystem::remove_all(tmp_dir);
 }
 
 // ── 2. Lock-free ring pipeline ──────────────────────────────────────────────

@@ -71,28 +71,46 @@ std::string demo_receiver_address_nfa();      // "NFA_V6_..." (deterministic)
 struct GqcEpochMember {
     uint16_t validator_id;
     std::array<uint8_t, 32> node_id;
+    // Phase C (0.2.2): the member's XMSS root. Every vote is verified
+    // against THIS root — never against a root carried inside the witness
+    // itself (a hostile peer cannot substitute an identity by claiming a
+    // root it controls). The list is canonically sorted by root bytes, so
+    // the bitmap bit index is deterministic across nodes.
+    std::array<uint8_t, 32> root;
 };
 
 struct GqcEpochConfig {
     std::vector<GqcEpochMember> members;
     vx::crypto::pq::PqSignatureWitness master_sig; // the architect's master key signs the whitelist
     std::array<uint8_t, 32> master_root;           // the root the sig must verify against
+    uint64_t epoch = 1;                            // bound into every vote message
 };
 
 /// The deterministic first-epoch committee: 4 localhost validators (ids 0..3)
-/// with deterministic test node_ids, master-signed and self-checked at boot
-/// (fail-closed: an edited list breaks the self-check at node start).
+/// with deterministic test node_ids and XMSS roots, master-signed and
+/// self-checked at boot (fail-closed: an edited list breaks the self-check
+/// at node start). Members are canonically sorted by root bytes.
 const GqcEpochConfig &gqc_epoch_committee();
 
 /// The domain-separated whitelist message the master signature commits to:
-/// sponge("VX_GQC_EPOCH1_WHITELIST_V1" ‖ Σ validator_id(2 LE) ‖ node_id(32)).
+/// sponge("VX_GQC_EPOCH1_WHITELIST_V1" ‖ Σ validator_id(2 LE) ‖ node_id(32) ‖ root(32)).
 /// Exposed so the node (and tests) verify the shipped (list, sig) pair
 /// without re-deriving the tag.
 std::array<uint8_t, 32> gqc_epoch_whitelist_msg(const std::vector<GqcEpochMember> &members);
 
 /// True when `validator_id` is a member of the first-epoch committee.
-/// The GQC share-collection gate: a share from a non-member id is forged.
+/// The GQC vote-collection gate: a vote from a non-member id is forged.
 bool gqc_epoch_committee_contains(uint16_t validator_id);
+
+/// The member's root, canonical member index (bitmap bit), or npos when the
+/// id is not on the whitelist. The vote verifier uses the root; the bitmap
+/// builder uses the index.
+size_t gqc_epoch_member_index(uint16_t validator_id);
+
+/// The deterministic test secret key of epoch-1 validator `id`
+/// ("VX_GQC_EPOCH1_VALIDATOR_<id>_SK_V1"). localhost topology only: the
+/// P4/VPS phase replaces these with real per-machine keys held off-repo.
+std::array<uint8_t, 32> gqc_epoch_validator_sk(uint16_t id);
 
 // ── The one-time secondary genesis mint (review round 5, P1) ────────────────
 // The mint's authorization used to be the keyless cocoon digest with only a

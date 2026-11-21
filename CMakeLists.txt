@@ -134,6 +134,7 @@ add_library(vx_core STATIC
     src/state/undo_engine.cpp
     src/state/galois_trie.cpp
     src/consensus/gqc_finality.cpp
+    src/consensus/gqc_votes.cpp
     src/core/rdtsc_profiler.cpp
     src/security/chaos_fuzzer.cpp
     src/core/memory_vault.cpp
@@ -286,6 +287,8 @@ target_link_libraries(test_landauer_vm_mev PRIVATE vx_core gtest gtest_main)
 
 add_executable(test_gqc_ring_stealth tests/test_gqc_ring_stealth.cpp)
 target_link_libraries(test_gqc_ring_stealth PRIVATE vx_core gtest gtest_main)
+add_executable(test_gqc_votes tests/test_gqc_votes.cpp)
+target_link_libraries(test_gqc_votes PRIVATE vx_core gtest gtest_main)
 
 add_executable(test_vault_htlc tests/test_vault_htlc.cpp)
 target_link_libraries(test_vault_htlc PRIVATE vx_core gtest gtest_main)
@@ -429,7 +432,8 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_mempool test_vm test_reorg test_reorg_carousel test_bifurcation
             test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
-                                    test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
+            test_gqc_votes
+                        test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
             test_chain_stress test_boundary_torture test_crash_torture
             test_wal_marker
             test_rpc_auth test_key_import

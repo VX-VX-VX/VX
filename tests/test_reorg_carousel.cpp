@@ -532,10 +532,13 @@ void certify_common_prefix(Carousel& c, const char* what) {
             << what << ": certification on a diverged node";
         const std::array<uint8_t, 32> bh = block_hash(target);
         vx::consensus::GqcFinality gqc(*n->undo, *n->store);
+        vx::crypto::pq::PqLeafLedger vote_ledger;
         for (const auto &m : vx::blockchain::gqc_epoch_committee().members) {
-            gqc.collect_share(
-                target, bh, m.validator_id,
-                vx::consensus::GqcFinality::derive_validator_share(bh, target, m.validator_id));
+            const auto sk = vx::blockchain::gqc_epoch_validator_sk(m.validator_id);
+            const auto &committee = vx::blockchain::gqc_epoch_committee();
+            gqc.collect_vote(target, bh,
+                             vx::consensus::gqc::sign_vote(m.validator_id, sk, committee.epoch,
+                                                           target, bh, vote_ledger));
         }
         const auto cert = gqc.finalize_block(
             target, bh,

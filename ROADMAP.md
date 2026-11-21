@@ -69,8 +69,12 @@ them (C), then the world-first composite (D), then the research-heavy tail
   is a shipped bug, never a tolerance issue.
 - **0.2.2 — Phase C: Bitmasked m-of-n XMSS GQC committee** (n ≤ 64,
   accountable BFT). The genesis whitelist committee graduates from a
-  fixed quorum to accountable m-of-n: bitmasked share attribution, per-member
-  accountability, no DKG (deliberately rejected — DKG breaks liveness and
+  fixed quorum to accountable m-of-n: every member signs the checkpoint
+  vote with its one-shot XMSS leaf, the aggregator verifies each vote
+  against the whitelist root (verify-before-store), the certificate
+  records the signer bitmap (accountability) and an equivocation proof
+  (two valid witnesses, one member, two fork hashes at one height) is
+  recorded. No DKG (deliberately rejected — DKG breaks liveness and
   costs tens of thousands of lines; the bitmask construction avoids it).
 - **0.2.3 — Phase D: PQ-threshold finality** — the checkpoint gadget over
   a verified XMSS quorum. Threshold signatures on stateful post-quantum

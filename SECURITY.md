@@ -51,7 +51,7 @@ In scope:
   confusion, tag/banlist bypasses, per-IP cap circumvention;
 - 3-Trunk Vortex Attractor and GQC consensus stamping — coordinate
   manipulation, deterministic-derivation breakage;
-- GQC epoch committee — share-pool injection by non-members, whitelist
+- GQC epoch committee — vote injection by non-members, whitelist
   signature malleability, quorum-threshold manipulation;
 - vault memory core — key material leaking outside locked arenas,
   burn/lifecycle bypasses;

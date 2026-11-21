@@ -20,6 +20,7 @@
 #include "vx/blockchain/genesis.hpp"
 #include "vx/blockchain/crypto_sponge.hpp"
 #include "vx/blockchain/emission.hpp"
+#include "vx/consensus/gqc_votes.hpp"
 #include "vx/crypto/pq_signature.hpp"
 #include "vx/core/rdtsc_profiler.hpp"
 #include "vx/security/chaos_fuzzer.hpp"
@@ -3519,13 +3520,19 @@ HttpResponse HttpServer::handle_consensus_finalize_gqc(const HttpRequest& req) {
 
     // The genesis epoch committee (plan step 3): the quorum set is the
     // master-signed whitelist from the deterministic genesis config — not a
-    // simulated constant. Every member evaluates its GF(2^8) share.
+    // simulated constant. Phase C: every member signs the vote message with
+    // its one-shot XMSS leaf (localhost topology: the node signs for the
+    // deterministic test keys; the P4/VPS phase swaps in real per-machine
+    // keys). The leaf ledger is memory-only here — the durable per-node
+    // ledger wires at P4 alongside the real keys.
     const auto &committee = vx::blockchain::gqc_epoch_committee();
     const uint32_t validator_count = static_cast<uint32_t>(committee.members.size());
+    static vx::crypto::pq::PqLeafLedger vote_ledger;
     for (const auto &m : committee.members) {
-        gqc_finality_->collect_share(
-            target, block_hash, m.validator_id,
-            consensus::GqcFinality::derive_validator_share(block_hash, target, m.validator_id));
+        const auto sk = vx::blockchain::gqc_epoch_validator_sk(m.validator_id);
+        const auto vote = vx::consensus::gqc::sign_vote(m.validator_id, sk, committee.epoch, target,
+                                                        block_hash, vote_ledger);
+        gqc_finality_->collect_vote(target, block_hash, vote);
     }
     const auto cert = gqc_finality_->finalize_block(target, block_hash, validator_count);
 
@@ -3535,10 +3542,13 @@ HttpResponse HttpServer::handle_consensus_finalize_gqc(const HttpRequest& req) {
         << "\"block_hash\":\"" << hex_bytes(cert.block_hash.data(), 32) << "\","
         << "\"validator_count\":" << cert.validator_count << ","
         << "\"share_count\":" << cert.share_count << ","
+        << "\"signers_bitmap\":\"0x" << std::hex << cert.signers_bitmap << std::dec << "\","
         << "\"gqc_signature_agg\":\"" << hex_bytes(cert.gqc_signature_agg.data(), 32) << "\","
         << "\"stamped_tail_offset\":65464,"
         << "\"finalized_checkpoint_height\":" << gqc_finality_->finalized_checkpoint_height() << ","
-        << "\"undo_lock\":\"" << (cert.certified ? "ERR_FINALIZED_BY_GQC active below this height" : "not locked") << "\","
+        << "\"undo_lock\":\""
+        << (cert.certified ? "ERR_FINALIZED_BY_GQC active below this height" : "not locked")
+        << "\","
         << "\"error\":" << (cert.error.empty() ? "null" : "\"" + cert.error + "\"") << "}";
     return HttpResponse::json(200, oss.str());
 }

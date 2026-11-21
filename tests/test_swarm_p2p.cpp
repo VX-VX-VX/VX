@@ -1406,18 +1406,25 @@ TEST(VortexSwarmP2PTest, PerIpConnectionCapNinthClosed) {
         fds.push_back(connect_client(port));
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
-    // The 9th fd is closed by the server: the server side reports EOF
-    // immediately, and our copy sees a readable/hup event. Polled in a
-    // loop (up to 2s): under load the accept loop + serve thread spawn
-    // + cap check can lag past a single 500ms poll — the cap logic is
-    // sound, the wait must tolerate scheduling latency.
-    bool closed = false;
-    for (int i = 0; i < 40 && !closed; ++i) {
-        pollfd pfd{fds[8], POLLIN, 0};
-        const int r = ::poll(&pfd, 1, 100);
-        closed = (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)));
+    // The cap closes exactly ONE connection — whichever serve thread runs
+    // the check 9th under the mutex, NOT necessarily the 9th fd the client
+    // connected (thread scheduling order is arbitrary; under sanitizers it
+    // is effectively random). Poll ALL fds: exactly one must report EOF.
+    bool closed[9] = {};
+    int closed_count = 0;
+    for (int i = 0; i < 40 && closed_count < 1; ++i) {
+        for (int j = 0; j < 9; ++j) {
+            if (closed[j])
+                continue;
+            pollfd pfd{fds[j], POLLIN, 0};
+            const int r = ::poll(&pfd, 1, 10);
+            if (r > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+                closed[j] = true;
+                ++closed_count;
+            }
+        }
     }
-    EXPECT_TRUE(closed) << "the 9th connection must be closed by the cap";
+    EXPECT_EQ(closed_count, 1) << "the cap closes exactly one connection";
     for (int fd : fds)
         ::close(fd);
 }
