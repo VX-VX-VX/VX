@@ -383,8 +383,13 @@ TEST(VortexSvaWiringTest, ExhaustionTombstone) {
     EXPECT_EQ(c.ledger->balance_of(v.addr), U128(50'000 * VX_ATOMS - 256 * 21 * VX_ATOMS));
 
     // A further spend re-using the LAST leaf's witness: the counter gate
-    // fires first — the tombstone.
-    const std::string err = c.apply_spend_block(v, receiver, kSpendAmount, sva::kSvaMaxSpends,
+    // fires first — the tombstone. The probe tx is byte-identical to the
+    // 256th spend (nonce 255, leaf 255): a fresh nonce would mint a fresh
+    // digest whose witness registration is refused by the per-sender cap
+    // (256) before the ledger's tombstone gate is ever reached. The
+    // identical tx dedups in the registry (same digest, same content), so
+    // the lookup hits the existing entry and the tombstone gate fires.
+    const std::string err = c.apply_spend_block(v, receiver, kSpendAmount, sva::kSvaMaxSpends - 1,
                                                 sva::kSvaMaxSpends - 1, kSpendFee);
     EXPECT_NE(err.find("tombstone"), std::string::npos) << err;
     EXPECT_EQ(c.ledger->sva_counter_of(v.addr), 256u);

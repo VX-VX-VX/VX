@@ -280,10 +280,20 @@ JournalLayout scan_journal(const std::vector<uint8_t>& d) {
         const uint64_t sgmt = u64_le(d.data() + sgmt_pos);
         if (sgmt > MAX_TX_PER_BLOCK)
             break;
+        // v4 layout (SVA-8192): after the sgmt-undo array comes the
+        // sva-undo count (8 B) and the sva entries (vault 42 + prev_counter
+        // 8 + existed 1 = 51 B each).
+        const size_t sva_pos = sgmt_pos + 8 + sgmt * 65;
+        if (sva_pos + 8 > d.size())
+            break;
+        const uint64_t sva = u64_le(d.data() + sva_pos);
+        if (sva > MAX_TX_PER_BLOCK)
+            break;
         // Record size (UndoEngine::record_bytes): 88 fixed bytes, which
         // already include the created-count field, plus the tx array, the
-        // created-address list, and (v3) the sgmt-undo array.
-        const size_t rec = 88 + tx * kUndoTxSize + created * 42 + 8 + sgmt * 65;
+        // created-address list, the (v3) sgmt-undo array, and the (v4)
+        // sva-undo array.
+        const size_t rec = 88 + tx * kUndoTxSize + created * 42 + 8 + sgmt * 65 + 8 + sva * 51;
         if (off + rec > d.size()) break;
         L.heights.push_back(u64_le(d.data() + off));
         L.tx_counts.push_back(tx);

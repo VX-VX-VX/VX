@@ -368,6 +368,7 @@ add_executable(test_ml_kem_kat tests/test_ml_kem_kat.cpp)
 target_link_libraries(test_ml_kem_kat PRIVATE vx_core gtest gtest_main)
 add_test(NAME VortexMlKem768KatTest COMMAND test_ml_kem_kat)
 
+
 # DKSAP-Galois stealth-nickname core (track 3/3) + SGMT layer: compiled
 # INTO vx_core (the header-only ledger apply_block and the RPC SGMT surface
 # reference them), so the tests link vx_core.
@@ -422,7 +423,7 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             test_mempool test_vm test_reorg test_reorg_carousel test_bifurcation
             test_vault_memory test_zk_matrix test_tensor_v6 test_swarm_p2p
             test_galois_trie test_landauer_vm_mev test_gqc_ring_stealth
-            test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
+                                    test_vault_htlc test_chaos_fuzzer test_pq_signatures test_retarget
             test_chain_stress test_boundary_torture test_crash_torture
             test_wal_marker
             test_rpc_auth test_key_import
@@ -439,7 +440,10 @@ foreach(tgt test_vortex crypto_deep_tests test_block test_documented_gaps
             # wire suites were missing from the guard — their assert() calls
             # would silently no-op under the Release -DNDEBUG flag.
             test_fips202_kat test_ml_kem_kat
-            test_dksap test_dksap_sgmt test_sgmt_wiring)
+            test_dksap test_dksap_sgmt test_sgmt_wiring
+            # 2026-11-21: the SVA witness suites shipped without the guard —
+            # their assert() calls would silently no-op under Release NDEBUG.
+            test_sva_wiring test_sva_zeroday)
     target_compile_options(${tgt} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -466,6 +470,7 @@ add_test(NAME VortexSwarmP2PTest COMMAND test_swarm_p2p)
 add_test(NAME VortexGaloisTrieTest COMMAND test_galois_trie)
 add_test(NAME VortexLandauerMevTest COMMAND test_landauer_vm_mev)
 add_test(NAME VortexGqcRingStealthTest COMMAND test_gqc_ring_stealth)
+add_test(NAME VortexGqcVotesTest COMMAND test_gqc_votes)
 add_test(NAME VortexVaultHtlcTest COMMAND test_vault_htlc)
 add_test(NAME VortexChaosFuzzerTest COMMAND test_chaos_fuzzer)
 add_test(NAME VortexPqSignatureTest COMMAND test_pq_signatures)
